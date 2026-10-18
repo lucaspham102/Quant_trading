@@ -8,12 +8,15 @@ import pandas as pd
 import pytest
 
 from src.backtester import BacktestReport
+from src.config import TradingConfig
 from src.research import generate_synthetic_ohlcv
 from src.walkforward import (
     Candidate,
     DEFAULT_CANDIDATES,
+    FEE_SCENARIOS,
     WalkForwardWindow,
     WindowResult,
+    apply_fee_scenario,
     generate_walkforward_windows,
     make_candidate_config,
     run_walkforward,
@@ -134,6 +137,27 @@ def test_run_walkforward_synthetic_returns_frames():
     assert 0.0 <= pct_pos <= 100.0
 
 
+def test_apply_fee_scenario_sets_expected_costs():
+    """apply_fee_scenario gán đúng phí/slippage cho zero/real/double và báo lỗi khi sai tên."""
+    base = TradingConfig()
+    zero = apply_fee_scenario(base, "zero")
+    assert (zero.taker_fee, zero.maker_fee, zero.slippage) == (0.0, 0.0, 0.0)
+
+    real = apply_fee_scenario(base, "real")
+    assert (real.taker_fee, real.maker_fee, real.slippage) == FEE_SCENARIOS["real"]
+
+    double = apply_fee_scenario(base, "double")
+    assert double.taker_fee == 2 * real.taker_fee
+    assert double.maker_fee == 2 * real.maker_fee
+    assert double.slippage == 2 * real.slippage
+
+    # Các thuộc tính khác phải được giữ nguyên
+    assert double.use_fee_aware_sizing == base.use_fee_aware_sizing
+
+    with pytest.raises(ValueError):
+        apply_fee_scenario(base, "khong_ton_tai")
+
+
 def test_cli_writes_outputs(tmp_path, monkeypatch):
     """Kiểm tra CLI run_walkforward xuất đầy đủ file CSV và Markdown."""
     import run_walkforward
@@ -154,6 +178,8 @@ def test_cli_writes_outputs(tmp_path, monkeypatch):
             "BTC/USDT:USDT",
             "--days",
             "365",
+            "--fee-scenarios",
+            "real",
             "--out-csv",
             str(csv_file),
             "--out-md",
@@ -167,6 +193,8 @@ def test_cli_writes_outputs(tmp_path, monkeypatch):
     df_csv = pd.read_csv(csv_file)
     assert not df_csv.empty
     assert "symbol" in df_csv.columns
+    assert "fee_scenario" in df_csv.columns
+    assert (df_csv["fee_scenario"] == "real").all()
     assert len(md_file.read_text(encoding="utf-8")) > 0
 
 

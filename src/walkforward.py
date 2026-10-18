@@ -124,6 +124,24 @@ def make_candidate_config(
     )
 
 
+# Bộ (taker_fee, maker_fee, slippage) theo từng kịch bản phí.
+FEE_SCENARIOS: dict[str, tuple[float, float, float]] = {
+    "zero": (0.0, 0.0, 0.0),
+    "real": (0.0005, 0.0002, 0.0002),
+    "double": (0.001, 0.0004, 0.0004),
+}
+
+
+def apply_fee_scenario(base: TradingConfig, fee_scenario: str) -> TradingConfig:
+    """Trả bản sao config đã áp phí/slippage của kịch bản `zero` / `real` / `double`."""
+    if fee_scenario not in FEE_SCENARIOS:
+        raise ValueError(
+            f"fee_scenario không hợp lệ: {fee_scenario!r}; chọn trong {sorted(FEE_SCENARIOS)}"
+        )
+    taker, maker, slip = FEE_SCENARIOS[fee_scenario]
+    return dataclasses.replace(base, taker_fee=taker, maker_fee=maker, slippage=slip)
+
+
 def _slice_window(feat: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Cắt cửa sổ nửa mở [start, end) kèm đúng 1 nến ngay trước start để khớp lệnh biên."""
     if len(feat) == 0:
@@ -358,8 +376,10 @@ def run_walkforward(
 __all__ = [
     "Candidate",
     "DEFAULT_CANDIDATES",
+    "FEE_SCENARIOS",
     "WalkForwardWindow",
     "WindowResult",
+    "apply_fee_scenario",
     "generate_walkforward_windows",
     "make_candidate_config",
     "run_walkforward",
