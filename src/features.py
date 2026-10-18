@@ -35,6 +35,20 @@ FEATURE_COLUMNS = [
     *MICROSTRUCTURE_COLUMNS,
 ]
 
+REGIME_STRATEGY_COLUMNS = [
+    "ema_20",
+    "ema_fast_slope",
+    "ema_slow_slope",
+    "adx",
+    "plus_di",
+    "minus_di",
+    "bb_mid",
+    "bb_upper",
+    "bb_lower",
+    "bb_pct_b",
+]
+
+
 
 def compute_ema(series: pd.Series, period: int) -> pd.Series:
     """EMA: ewm(span=period, adjust=False, min_periods=period). Chỉ dùng dữ liệu [0..t]."""
@@ -191,6 +205,74 @@ def compute_time_cyclical(index: pd.DatetimeIndex) -> pd.DataFrame:
     )
 
 
+def compute_ema_slope(ema_series: pd.Series, lookback: int = 5) -> pd.Series:
+    """Độ dốc tương đối: (EMA_t - EMA_{t-lb}) / EMA_{t-lb}; mẫu số 0 -> NaN. Chỉ dùng t và t-lb."""
+    e = ema_series.astype("float64")
+    prev = e.shift(lookback)
+    slope = (e - prev) / prev.replace(0.0, np.nan)
+    slope.name = "ema_slope"
+    return slope.astype("float64")
+
+
+def compute_bollinger_bands(
+    df: "pd.DataFrame | pd.Series",
+    window: int = 20,
+    std_mult: float = 2.0,
+) -> pd.DataFrame:
+    """Bollinger Bands (SMA, std ddof=1) và %B. Biên phẳng (sau warmup) -> bb_pct_b = 0.5."""
+    close = df["close"].astype("float64") if isinstance(df, pd.DataFrame) else df.astype("float64")
+    mid = close.rolling(window=window, min_periods=window).mean()
+    std = close.rolling(window=window, min_periods=window).std(ddof=1)
+    upper = mid + std_mult * std
+    lower = mid - std_mult * std
+    width = upper - lower
+    flat = mid.notna() & (width.abs() <= 1e-12 * np.maximum(mid.abs(), 1.0))
+    safe_width = width.where(~flat & mid.notna(), np.nan)
+    pct_b = (close - lower) / safe_width
+    pct_b = pct_b.where(~flat, 0.5)
+    return pd.DataFrame(
+        {"bb_mid": mid, "bb_upper": upper, "bb_lower": lower, "bb_pct_b": pct_b},
+        index=close.index,
+        dtype="float64",
+    )
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """ADX/+DI/-DI chuẩn Wilder (ewm alpha=1/period, adjust=False). Nến phẳng -> 0.0."""
+    high = df["high"].astype("float64")
+    low = df["low"].astype("float64")
+    prev_close = df["close"].astype("float64").shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    up = (high - high.shift(1)).to_numpy()
+    down = (low.shift(1) - low).to_numpy()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0.0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0.0), down, 0.0), index=df.index)
+
+    alpha = 1.0 / period
+    atr = tr.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_rma = plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    minus_rma = minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+
+    atr_ok = atr.notna()
+    safe_atr = atr.where(atr > 0.0, np.nan)
+    plus_di = (100.0 * plus_rma / safe_atr).where(atr > 0.0, 0.0).where(atr_ok)
+    minus_di = (100.0 * minus_rma / safe_atr).where(atr > 0.0, 0.0).where(atr_ok)
+
+    di_sum = plus_di + minus_di
+    dx = (100.0 * (plus_di - minus_di).abs() / di_sum.where(di_sum > 0.0, np.nan)).where(di_sum > 0.0, 0.0)
+    dx = dx.where(atr_ok)
+    adx = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    return pd.DataFrame(
+        {"adx": adx, "plus_di": plus_di, "minus_di": minus_di},
+        index=df.index,
+        dtype="float64",
+    )
+
+
 def add_all_features(
     df: pd.DataFrame,
     config: TradingConfig = TradingConfig(),
@@ -225,6 +307,16 @@ def add_all_features(
     cyclical = compute_time_cyclical(out.index)
     for col in cyclical.columns:
         out[col] = cyclical[col]
+
+    out["ema_20"] = compute_ema(out["close"], config.ema_pullback_period)
+    out["ema_fast_slope"] = compute_ema_slope(out["ema_fast"], config.regime_slope_lookback)
+    out["ema_slow_slope"] = compute_ema_slope(out["ema_slow"], config.regime_slope_lookback)
+    adx_df = compute_adx(out, config.adx_period)
+    for col in adx_df.columns:
+        out[col] = adx_df[col]
+    bb_df = compute_bollinger_bands(out["close"], config.bb_window, config.bb_std_mult)
+    for col in bb_df.columns:
+        out[col] = bb_df[col]
 
     if drop_warmup:
         # Chỉ cắt đoạn warmup ở đầu chuỗi khi các chỉ báo cốt lõi chưa đủ chu kỳ;
@@ -263,5 +355,8 @@ def add_all_features(
             out = out.iloc[0:0].copy()
         out["vol_zscore"] = out["vol_zscore"].fillna(0.0)
         out["bb_width_squeeze"] = out["bb_width_squeeze"].fillna(0.0)
+        for col in ("adx", "plus_di", "minus_di"):
+            out[col] = out[col].fillna(0.0)
+        out["bb_pct_b"] = out["bb_pct_b"].fillna(0.5)
     return out
 

@@ -20,6 +20,13 @@ from src.features import (
 )
 
 
+def _utc_ns_index(
+    periods: int, start: str = "2024-01-01", freq: str = "15min", name: str | None = None
+) -> pd.DatetimeIndex:
+    """Tạo DatetimeIndex UTC độ phân giải nanoseconds (pandas 3.x mặc định trả về 'us')."""
+    return pd.date_range(start, periods=periods, freq=freq, tz="UTC", name=name).as_unit("ns")
+
+
 def make_ohlcv(n: int, seed: int = 0, start_price: float = 100.0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     close = start_price * np.exp(np.cumsum(rng.normal(0.0, 0.005, n)))
@@ -73,7 +80,7 @@ def test_atr_wilder_formula():
 
 def test_atr_constant_range():
     n = 40
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    idx = _utc_ns_index(n)
     df = pd.DataFrame(
         {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0}, index=idx
     )
@@ -136,7 +143,7 @@ def test_volume_zscore_formula():
 
 
 def test_volume_zscore_zero_std_is_nan():
-    idx = pd.date_range("2024-01-01", periods=30, freq="15min", tz="UTC")
+    idx = _utc_ns_index(30)
     df = pd.DataFrame({"volume": np.full(30, 5.0)}, index=idx)
     z = compute_volume_zscore(df, 20)
     assert z.isna().all()
@@ -145,7 +152,7 @@ def test_volume_zscore_zero_std_is_nan():
 
 def test_regime_filter_states():
     n = 400
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    idx = _utc_ns_index(n)
     up = pd.DataFrame({"close": np.linspace(100.0, 500.0, n)}, index=idx)
     down = pd.DataFrame({"close": np.linspace(500.0, 100.0, n)}, index=idx)
     flat = pd.DataFrame({"close": np.full(n, 100.0)}, index=idx)
@@ -334,3 +341,101 @@ def test_new_features_no_look_ahead_bias():
         assert np.allclose(a, b, equal_nan=True), f"Look-ahead bias ở cột mới {col}"
         assert np.array_equal(np.isnan(a), np.isnan(b)), f"Vị trí NaN khác nhau ở cột mới {col}"
 
+
+
+def test_adx_bollinger_pct_b_and_ema20_formulas_and_no_lookahead():
+    from src.features import (
+        REGIME_STRATEGY_COLUMNS,
+        compute_adx,
+        compute_bollinger_bands,
+        compute_ema_slope,
+    )
+
+    df = make_ohlcv(400, seed=5)
+    cfg = TradingConfig()
+
+    # ---- ADX / +DI / -DI chuẩn Wilder ----
+    adx_df = compute_adx(df, 14)
+    high, low = df["high"].to_numpy(), df["low"].to_numpy()
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1).to_numpy()
+    up = np.concatenate([[np.nan], high[1:] - high[:-1]])
+    down = np.concatenate([[np.nan], low[:-1] - low[1:]])
+    plus_dm = np.where((up > down) & (up > 0.0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0.0), down, 0.0)
+    atr_ref = wilder_reference(tr, 14)
+    pdi_ref = 100.0 * wilder_reference(plus_dm, 14) / atr_ref
+    mdi_ref = 100.0 * wilder_reference(minus_dm, 14) / atr_ref
+    dx_ref = 100.0 * np.abs(pdi_ref - mdi_ref) / (pdi_ref + mdi_ref)
+    adx_ref = np.full(len(df), np.nan)
+    adx_ref[13:] = wilder_reference(dx_ref[13:], 14)
+    np.testing.assert_allclose(adx_df["plus_di"].to_numpy(), pdi_ref, equal_nan=True, rtol=1e-9)
+    np.testing.assert_allclose(adx_df["minus_di"].to_numpy(), mdi_ref, equal_nan=True, rtol=1e-9)
+    np.testing.assert_allclose(adx_df["adx"].to_numpy(), adx_ref, equal_nan=True, rtol=1e-9)
+    valid_adx = adx_df["adx"].dropna()
+    assert ((valid_adx >= 0.0) & (valid_adx <= 100.0)).all()
+
+    # ---- Bollinger %B ----
+    bb = compute_bollinger_bands(df, 20, 2.0)
+    close = df["close"]
+    mid = close.rolling(20).mean()
+    sd = close.rolling(20).std(ddof=1)
+    np.testing.assert_allclose(bb["bb_mid"].to_numpy(), mid.to_numpy(), equal_nan=True)
+    np.testing.assert_allclose(bb["bb_upper"].to_numpy(), (mid + 2.0 * sd).to_numpy(), equal_nan=True)
+    np.testing.assert_allclose(bb["bb_lower"].to_numpy(), (mid - 2.0 * sd).to_numpy(), equal_nan=True)
+    expected_pct_b = (close - (mid - 2.0 * sd)) / (4.0 * sd)
+    np.testing.assert_allclose(bb["bb_pct_b"].to_numpy(), expected_pct_b.to_numpy(), equal_nan=True)
+    assert bb["bb_pct_b"].iloc[:19].isna().all()
+    # Series đầu vào cho kết quả giống DataFrame
+    bb_s = compute_bollinger_bands(close, 20, 2.0)
+    np.testing.assert_allclose(bb_s["bb_pct_b"].to_numpy(), bb["bb_pct_b"].to_numpy(), equal_nan=True)
+
+    # ---- EMA20 & slope ----
+    feats = add_all_features(df, cfg, drop_warmup=False)
+    for col in REGIME_STRATEGY_COLUMNS:
+        assert col in feats.columns
+    np.testing.assert_allclose(
+        feats["ema_20"].to_numpy(), compute_ema(df["close"], 20).to_numpy(), equal_nan=True
+    )
+    slow = compute_ema(df["close"], cfg.ema_slow_period)
+    expected_slope = (slow - slow.shift(5)) / slow.shift(5)
+    np.testing.assert_allclose(
+        feats["ema_slow_slope"].to_numpy(), expected_slope.to_numpy(), equal_nan=True
+    )
+    assert compute_ema_slope(pd.Series([0.0, 0.0, 0.0]), 1).iloc[1:].isna().all()
+
+    # ---- Số nến warmup giữ nguyên + không NaN/inf ----
+    trimmed = add_all_features(df, cfg, drop_warmup=True)
+    first_pos = df.index.get_loc(trimmed.index[0])
+    assert first_pos == cfg.ema_slow_period - 1 + cfg.regime_slope_lookback
+    for col in REGIME_STRATEGY_COLUMNS:
+        arr = trimmed[col].to_numpy(dtype="float64")
+        assert np.isfinite(arr).all(), col
+
+    # ---- Nến phẳng ----
+    n = 80
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
+    flat = pd.DataFrame(
+        {"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 10.0}, index=idx
+    )
+    adx_flat = compute_adx(flat, 14)
+    bb_flat = compute_bollinger_bands(flat, 20, 2.0)
+    assert (adx_flat["adx"].iloc[27:] == 0.0).all()
+    assert (adx_flat["plus_di"].iloc[13:] == 0.0).all()
+    assert (bb_flat["bb_pct_b"].iloc[19:] == 0.5).all()
+    for frame in (adx_flat, bb_flat):
+        assert not np.isinf(frame.to_numpy(dtype="float64")).any()
+
+    # ---- No look-ahead: df.iloc[:T] vs df đầy đủ ----
+    T = 300
+    full = make_ohlcv(360, seed=9)
+    f_sub = add_all_features(full.iloc[:T], cfg, drop_warmup=False)
+    f_full = add_all_features(full, cfg, drop_warmup=False)
+    for col in REGIME_STRATEGY_COLUMNS:
+        a = f_sub[col].to_numpy(dtype="float64")
+        b = f_full[col].iloc[:T].to_numpy(dtype="float64")
+        assert np.allclose(a, b, equal_nan=True), f"Look-ahead bias ở cột {col}"
+        assert np.array_equal(np.isnan(a), np.isnan(b)), f"Vị trí NaN khác nhau ở cột {col}"

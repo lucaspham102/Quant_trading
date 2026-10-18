@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src import features
-from src.backtester import TradeRecord
+from src.backtester import PendingLimitOrder, TradeRecord
 from src.config import TradingConfig
 from src.data_loader import (
     DataLoader,
@@ -22,9 +22,15 @@ from src.ml_filter import (
     build_meta_dataset,
 )
 from src.notifier import TelegramNotifier
-from src.risk_manager import Position, RiskManager
+from src.risk_manager import Position, RiskManager, enforce_min_stop_distance
 from src.state_store import StateStore, _to_utc_timestamp, trade_record_from_dict
-from src.strategy import Strategy, compute_breakeven_price, is_breakeven_triggered
+from src.strategy import (
+    Strategy,
+    compute_breakeven_price,
+    compute_trailing_stop,
+    is_breakeven_triggered,
+    is_trailing_triggered,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,9 @@ class LiveExecutor:
         self.trade_history: list[TradeRecord] = [
             trade_record_from_dict(item) for item in state.trade_history
         ]
+        # Lệnh Limit pullback đang chờ (chỉ lưu trong bộ nhớ, không persist qua StateStore).
+        self.pending_limit: Optional[PendingLimitOrder] = None
+        self._bar_seq: int = 0
 
     def _get_data_loader(self) -> DataLoader:
         if self.data_loader is None:
@@ -172,6 +181,7 @@ class LiveExecutor:
             total_fee=fee,
             net_pnl=net,
             exit_reason=reason,  # type: ignore[arg-type]
+            entry_order_type=pos.entry_order_type,
         )
         self.trade_history.append(record)
         self.open_position = None
@@ -187,6 +197,7 @@ class LiveExecutor:
         ref_price: float,
         atr_val: float,
         ts: pd.Timestamp,
+        is_maker_entry: bool = False,
     ) -> Optional[Position]:
         cfg = self.config
         if (
@@ -197,16 +208,22 @@ class LiveExecutor:
         ):
             return None
 
-        if side == 1:
+        if is_maker_entry:
+            entry = ref_price  # Maker: không slippage chiều vào
+        elif side == 1:
             entry = ref_price * (1.0 + cfg.slippage)
+        else:
+            entry = ref_price * (1.0 - cfg.slippage)
+        if side == 1:
             sl = entry - cfg.sl_atr_multiple * atr_val
             tp = entry + cfg.tp_atr_multiple * atr_val
         else:
-            entry = ref_price * (1.0 - cfg.slippage)
             sl = entry + cfg.sl_atr_multiple * atr_val
             tp = entry - cfg.tp_atr_multiple * atr_val
 
-        pos = self.risk_manager.build_position(side, entry, sl, tp, ts)
+        pos = self.risk_manager.build_position(
+            side, entry, sl, tp, ts, is_maker_entry=is_maker_entry
+        )
         if pos is None:
             return None
 
@@ -223,17 +240,58 @@ class LiveExecutor:
                     else:
                         new_sl = fill_px + cfg.sl_atr_multiple * atr_val
                         new_tp = fill_px - cfg.tp_atr_multiple * atr_val
+                    if cfg.min_stop_distance_pct > 0.0:
+                        adjusted = enforce_min_stop_distance(side, fill_px, new_sl, new_tp, cfg)
+                        if adjusted is not None:
+                            new_sl, new_tp = adjusted
                     pos.entry_price = fill_px
                     pos.stop_loss = new_sl
                     pos.initial_sl = new_sl
                     pos.take_profit = new_tp
                     pos.notional = pos.qty * fill_px
-                    pos.entry_fee = pos.notional * cfg.taker_fee
+                    fee_rate = cfg.maker_fee if is_maker_entry else cfg.taker_fee
+                    pos.entry_fee = pos.notional * fee_rate
+                    pos.highest_price_since_entry = fill_px
+                    pos.lowest_price_since_entry = fill_px
 
         self.open_position = pos
         self.save_state()
         self.notifier.notify_trade_open(pos, mode=self.mode)
         return pos
+
+    # ------------------------------------------------------------------
+    def _position_desc(self) -> str:
+        pos = self.open_position
+        if pos is None:
+            return "FLAT"
+        label = "LONG" if pos.side == 1 else "SHORT"
+        return (
+            f"{label} qty={pos.qty:g} entry={pos.entry_price:.4f} "
+            f"sl={pos.stop_loss:.4f} tp={pos.take_profit:.4f}"
+        )
+
+    def _log_heartbeat(
+        self,
+        status: str,
+        latest_ts: Optional[pd.Timestamp],
+        close: float = float("nan"),
+        signal: int = 0,
+    ) -> None:
+        """Ghi log chu kỳ để người vận hành biết bot vẫn đang chạy."""
+        logger.info(
+            "[Heartbeat] mode=%s | symbol=%s | tf=%s | latest_closed_ts=%s | status=%s | "
+            "close=%s | signal=%s | position=%s | equity=%.4f USDT | daily_pnl=%.4f USDT",
+            self.mode,
+            self.config.symbol,
+            self.config.timeframe,
+            latest_ts.isoformat() if latest_ts is not None else "N/A",
+            status,
+            f"{close:.4f}" if np.isfinite(close) else "N/A",
+            signal,
+            self._position_desc(),
+            float(self.risk_manager.current_equity),
+            float(self.risk_manager.daily_realized_pnl),
+        )
 
     def process_closed_candles(self, df: pd.DataFrame) -> bool:
         """Xử lý DataFrame các nến ĐÃ ĐÓNG hoàn chỉnh.
@@ -242,6 +300,7 @@ class LiveExecutor:
         """
         try:
             if df is None or len(df) == 0:
+                self._log_heartbeat("WAITING_NEXT_CANDLE", self.last_processed_candle_ts)
                 return False
 
             latest_ts = _to_utc_timestamp(df.index[-1])
@@ -249,6 +308,7 @@ class LiveExecutor:
                 self.last_processed_candle_ts is not None
                 and latest_ts <= self.last_processed_candle_ts
             ):
+                self._log_heartbeat("WAITING_NEXT_CANDLE", self.last_processed_candle_ts)
                 return False
 
             if (
@@ -286,7 +346,7 @@ class LiveExecutor:
                 raw_atr = atr_series.iloc[-1] if len(atr_series) > 0 else np.nan
             atr_val = float(raw_atr) if not pd.isna(raw_atr) else float("nan")
 
-            # 1) Quản trị vị thế đang mở (SL/TP -> Breakeven -> Time Exit -> Đảo chiều)
+            # 1) Quản trị vị thế đang mở (SL/TP -> Breakeven -> Trailing Stop -> Time Exit -> Đảo chiều)
             if self.open_position is not None:
                 pos = self.open_position
                 if pos.side == 1:
@@ -305,6 +365,13 @@ class LiveExecutor:
                 elif hit_tp:
                     self._close_position(pos, raw_tp, latest_ts, "TP")
                 else:
+                    pos.highest_price_since_entry = max(
+                        pos.highest_price_since_entry, c_high
+                    )
+                    pos.lowest_price_since_entry = min(
+                        pos.lowest_price_since_entry, c_low
+                    )
+
                     if self.config.use_breakeven and not pos.breakeven_activated:
                         if is_breakeven_triggered(pos, c_high, c_low, self.config):
                             be_sl = compute_breakeven_price(
@@ -316,6 +383,19 @@ class LiveExecutor:
                                 pos.stop_loss = min(pos.stop_loss, be_sl)
                             pos.breakeven_activated = True
 
+                    if (
+                        self.config.use_trailing_stop
+                        and np.isfinite(atr_val)
+                        and atr_val > 0.0
+                    ):
+                        if pos.trailing_activated or is_trailing_triggered(
+                            pos, c_high, c_low, self.config
+                        ):
+                            pos.trailing_activated = True
+                            pos.stop_loss = compute_trailing_stop(
+                                pos, c_high, c_low, atr_val, self.config
+                            )
+
                     pos.bars_held += 1
                     if (
                         self.config.max_holding_bars > 0
@@ -325,7 +405,34 @@ class LiveExecutor:
                     elif sig in (1, -1) and sig == -pos.side:
                         self._close_position(pos, c_close, latest_ts, "SIGNAL_REVERSE")
 
-            # 2) Mở vị thế mới nếu đang flat và có tín hiệu hợp lệ
+            # 2) Mở vị thế mới
+            self._bar_seq += 1
+            limit_mode = self.config.entry_mode == "limit_pullback"
+
+            if limit_mode:
+                if self.pending_limit is not None and self.open_position is None:
+                    pend = self.pending_limit
+                    touched = False
+                    fill_px = pend.limit_price
+                    if pend.side == 1 and c_low <= pend.limit_price:
+                        touched = True
+                        fill_px = min(c_open, pend.limit_price)
+                    elif pend.side == -1 and c_high >= pend.limit_price:
+                        touched = True
+                        fill_px = max(c_open, pend.limit_price)
+
+                    if touched:
+                        self._try_open_position(
+                            pend.side,
+                            fill_px,
+                            pend.atr_at_signal,
+                            latest_ts,
+                            is_maker_entry=True,
+                        )
+                        self.pending_limit = None
+                    elif self._bar_seq >= pend.expires_bar:
+                        self.pending_limit = None
+
             if self.open_position is None and sig in (1, -1):
                 allow_open = True
                 if self.config.use_ml:
@@ -350,10 +457,44 @@ class LiveExecutor:
                     allow_open = bool(self.ml_filter.should_take(last_row))
                 if allow_open and self.risk_manager.can_open_trade(latest_ts):
                     side_lit: Literal[1, -1] = 1 if sig == 1 else -1
-                    self._try_open_position(side_lit, c_close, atr_val, latest_ts)
+                    if not limit_mode:
+                        self._try_open_position(side_lit, c_close, atr_val, latest_ts)
+                    else:
+                        if (
+                            self.pending_limit is not None
+                            and sig == -self.pending_limit.side
+                        ):
+                            self.pending_limit = None
+                        if (
+                            self.pending_limit is None
+                            and np.isfinite(atr_val)
+                            and atr_val > 0.0
+                        ):
+                            lp = (
+                                float(last_row["limit_price"])
+                                if "limit_price" in last_row.index
+                                and np.isfinite(last_row["limit_price"])
+                                else float("nan")
+                            )
+                            if not np.isfinite(lp):
+                                lp = (
+                                    c_close - self.config.limit_pullback_atr_mult * atr_val
+                                    if sig == 1
+                                    else c_close + self.config.limit_pullback_atr_mult * atr_val
+                                )
+                            if lp > 0.0:
+                                self.pending_limit = PendingLimitOrder(
+                                    side=side_lit,
+                                    limit_price=lp,
+                                    atr_at_signal=atr_val,
+                                    created_bar=self._bar_seq,
+                                    expires_bar=self._bar_seq
+                                    + int(self.config.limit_order_ttl_bars),
+                                )
 
             self.last_processed_candle_ts = latest_ts
             self.save_state()
+            self._log_heartbeat("NEW_CANDLE_PROCESSED", latest_ts, c_close, sig)
             return True
         except Exception as exc:  # noqa: BLE001
             logger.exception("LiveExecutor.process_closed_candles failed: %s", exc)

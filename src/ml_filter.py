@@ -8,8 +8,13 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 from src import features
 from src.config import TradingConfig
-from src.risk_manager import Position
-from src.strategy import compute_breakeven_price, is_breakeven_triggered
+from src.risk_manager import Position, enforce_min_stop_distance
+from src.strategy import (
+    compute_breakeven_price,
+    compute_trailing_stop,
+    is_breakeven_triggered,
+    is_trailing_triggered,
+)
 
 ML_FEATURE_COLUMNS: list[str] = [
     "rsi",
@@ -82,30 +87,78 @@ def simulate_single_trade_outcome(
     lows = df["low"].to_numpy(dtype="float64")
     closes = df["close"].to_numpy(dtype="float64")
 
+    atr_arr: Optional[np.ndarray] = None
     if "atr" in df.columns:
-        atr_prev = float(df["atr"].iloc[signal_pos])
+        atr_arr = df["atr"].to_numpy(dtype="float64")
+        atr_prev = float(atr_arr[signal_pos])
     else:
         atr_series = features.compute_atr(df, config.atr_period)
-        atr_prev = float(atr_series.iloc[signal_pos])
+        atr_arr = atr_series.to_numpy(dtype="float64")
+        atr_prev = float(atr_arr[signal_pos])
 
-    open_px = float(opens[entry_bar])
+    is_limit = config.entry_mode == "limit_pullback"
+    start_bar = entry_bar
+    is_maker = False
+    if is_limit:
+        if not np.isfinite(atr_prev) or atr_prev <= 0.0:
+            return 0, entry_bar
+        lp = float("nan")
+        if "limit_price" in df.columns:
+            lp = float(df["limit_price"].iloc[signal_pos])
+        if not np.isfinite(lp):
+            ref_px = float(closes[signal_pos])
+            lp = (
+                ref_px - config.limit_pullback_atr_mult * atr_prev
+                if side == 1
+                else ref_px + config.limit_pullback_atr_mult * atr_prev
+            )
+        if not np.isfinite(lp) or lp <= 0.0:
+            return 0, entry_bar
+        last_bar = min(n - 1, entry_bar + max(1, int(config.limit_order_ttl_bars)) - 1)
+        fill_px_found: Optional[float] = None
+        for k in range(entry_bar, last_bar + 1):
+            if side == 1 and lows[k] <= lp:
+                fill_px_found = min(float(opens[k]), lp)
+            elif side == -1 and highs[k] >= lp:
+                fill_px_found = max(float(opens[k]), lp)
+            if fill_px_found is not None:
+                start_bar = k
+                break
+        if fill_px_found is None:
+            return 0, int(last_bar)  # lệnh chờ hết hạn, không khớp -> không có lệnh
+        entry = fill_px_found
+        is_maker = True
+        open_px = entry
+    else:
+        open_px = float(opens[entry_bar])
+        entry = float("nan")
+
     if not np.isfinite(atr_prev) or atr_prev <= 0.0 or not np.isfinite(open_px) or open_px <= 0.0:
         return 0, entry_bar
 
+    if not is_limit:
+        entry = open_px * (1.0 + config.slippage) if side == 1 else open_px * (1.0 - config.slippage)
     if side == 1:
-        entry = open_px * (1.0 + config.slippage)
         sl = entry - config.sl_atr_multiple * atr_prev
         tp = entry + config.tp_atr_multiple * atr_prev
     else:
-        entry = open_px * (1.0 - config.slippage)
         sl = entry + config.sl_atr_multiple * atr_prev
         tp = entry - config.tp_atr_multiple * atr_prev
 
+    if config.min_stop_distance_pct > 0.0:
+        adjusted = enforce_min_stop_distance(
+            1 if side == 1 else -1, entry, sl, tp, config
+        )
+        if adjusted is None:
+            return 0, entry_bar
+        sl, tp = adjusted
+
     entry_ts = (
-        pd.Timestamp(df.index[entry_bar])
+        pd.Timestamp(df.index[start_bar])
         if isinstance(df.index, pd.DatetimeIndex)
         else pd.Timestamp("2024-01-01", tz="UTC")
     )
+    entry_fee_rate = config.maker_fee if is_maker else config.taker_fee
     pos = Position(
         symbol=config.symbol,
         side=1 if side == 1 else -1,
@@ -114,18 +167,19 @@ def simulate_single_trade_outcome(
         take_profit=tp,
         qty=1.0,
         entry_time=entry_ts,
-        entry_fee=entry * config.taker_fee,
+        entry_fee=entry * entry_fee_rate,
         notional=entry,
         initial_sl=sl,
         breakeven_activated=False,
         bars_held=0,
+        entry_order_type="limit" if is_maker else "market",
     )
 
-    raw_exit = float(closes[entry_bar])
-    exit_bar_pos = entry_bar
+    raw_exit = float(closes[start_bar])
+    exit_bar_pos = start_bar
 
-    for k in range(entry_bar, n):
-        opened_this_bar = k == entry_bar
+    for k in range(start_bar, n):
+        opened_this_bar = k == start_bar
 
         # c) Kiểm tra SL/TP trong [low[k], high[k]] (SL ưu tiên, xử lý gap qua open[k])
         if pos.side == 1:
@@ -148,15 +202,30 @@ def simulate_single_trade_outcome(
             exit_bar_pos = k
             break
 
-        # d) Cập nhật Breakeven Stop cho nến k+1
+        # d) Sau khi nến k đóng: cực trị + Breakeven + ATR Trailing (hiệu lực từ nến k+1)
+        eff_high = float(highs[k])
+        eff_low = float(lows[k])
+        if opened_this_bar and is_maker:
+            eff_high = max(pos.entry_price, float(closes[k]))
+            eff_low = min(pos.entry_price, float(closes[k]))
+        pos.highest_price_since_entry = max(pos.highest_price_since_entry, eff_high)
+        pos.lowest_price_since_entry = min(pos.lowest_price_since_entry, eff_low)
+
         if config.use_breakeven and not pos.breakeven_activated:
-            if is_breakeven_triggered(pos, float(highs[k]), float(lows[k]), config):
+            if is_breakeven_triggered(pos, eff_high, eff_low, config):
                 be_sl = compute_breakeven_price(pos.entry_price, pos.side, config)
                 if pos.side == 1:
                     pos.stop_loss = max(pos.stop_loss, be_sl)
                 else:
                     pos.stop_loss = min(pos.stop_loss, be_sl)
                 pos.breakeven_activated = True
+
+        if config.use_trailing_stop:
+            atr_k = float(atr_arr[k]) if atr_arr is not None else float("nan")
+            if np.isfinite(atr_k) and atr_k > 0.0:
+                if pos.trailing_activated or is_trailing_triggered(pos, eff_high, eff_low, config):
+                    pos.trailing_activated = True
+                    pos.stop_loss = compute_trailing_stop(pos, eff_high, eff_low, atr_k, config)
 
         # e) Kiểm tra Time-based Exit tại close[k]
         pos.bars_held += 1

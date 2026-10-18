@@ -57,6 +57,9 @@ class _OfflinePaperExchange:
         return [list(r) for r in out]
 
 
+logger = logging.getLogger("run_live")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Vận hành Paper/Live Quant Trading Bot (Binance USDT-M Futures)"
@@ -81,6 +84,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timeframe",
         default="15m",
         help="Khung thời gian nến (mặc định: 15m)",
+    )
+    parser.add_argument(
+        "--strategy-mode",
+        choices=("breakout", "trend_pullback", "mean_reversion", "regime_adaptive"),
+        default="breakout",
+        help="Chế độ chiến lược (mặc định: breakout)",
+    )
+    parser.add_argument(
+        "--entry-mode",
+        choices=("market", "limit_pullback"),
+        default="market",
+        help="Chế độ vào lệnh: market hoặc limit_pullback (mặc định: market)",
+    )
+    parser.add_argument(
+        "--use-trailing",
+        action="store_true",
+        help="Bật cơ chế ATR Trailing Stop",
+    )
+    parser.add_argument(
+        "--fee-aware",
+        action="store_true",
+        help="Bật cơ chế định cỡ vị thế tính phí (Fee-Aware Position Sizing)",
     )
     parser.add_argument(
         "--use-ml",
@@ -119,9 +144,27 @@ def main(argv: list[str] | None = None) -> int:
         TradingConfig(),
         symbol=args.symbol,
         timeframe=args.timeframe,
+        strategy_mode=args.strategy_mode,
+        entry_mode=args.entry_mode,
+        use_trailing_stop=bool(args.use_trailing),
+        use_fee_aware_sizing=bool(args.fee_aware),
         use_ml=bool(args.use_ml),
         state_file_path=state_path,
     )
+
+    logger.info("=" * 60)
+    logger.info("QUANT TRADING BOT STARTING")
+    logger.info("Mode: %s | Symbol: %s | Timeframe: %s", args.mode, config.symbol, config.timeframe)
+    logger.info(
+        "Strategy: %s | Entry: %s | Trailing: %s | Fee-Aware: %s | ML: %s",
+        config.strategy_mode,
+        config.entry_mode,
+        config.use_trailing_stop,
+        config.use_fee_aware_sizing,
+        config.use_ml,
+    )
+    logger.info("State file: %s", state_path)
+    logger.info("=" * 60)
 
     if args.synthetic or in_pytest:
         exchange: Any = _OfflinePaperExchange(
