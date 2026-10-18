@@ -347,3 +347,127 @@ def test_fee_aware_sizing_caps_total_sl_loss_within_1pct_nav():
     assert pos_m.entry_fee == pytest.approx(pos_m.notional * cfg.maker_fee)
     assert pos_t.entry_fee == pytest.approx(pos_t.notional * cfg.taker_fee)
     assert pos_m.entry_order_type == "limit" and pos_t.entry_order_type == "market"
+
+
+def test_strategy_modes_trend_pullback_mean_reversion_and_regime_adaptive():
+    from dataclasses import replace
+    from run_backtest import generate_synthetic_ohlcv
+
+    # 1) Dữ liệu dựng tay kiểm tra tín hiệu Long, Short, Flat và tỷ lệ R:R
+    idx = pd.date_range("2025-01-01", periods=6, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
+    data = {
+        "open": [50000.0, 50600.0, 49400.0, 49100.0, 50800.0, 50000.0],
+        "high": [50100.0, 51200.0, 49600.0, 50800.0, 51200.0, 50200.0],
+        "low": [49900.0, 50400.0, 48800.0, 48800.0, 50200.0, 49800.0],
+        "close": [50000.0, 51000.0, 49000.0, 50600.0, 50400.0, 50000.0],
+        "volume": [100.0, 150.0, 150.0, 120.0, 120.0, 100.0],
+        "atr": [500.0, 500.0, 500.0, 400.0, 400.0, 500.0],
+        "rsi": [50.0, 55.0, 40.0, 28.0, 72.0, 50.0],
+        "ema_fast": [50000.0, 52000.0, 48000.0, 50000.0, 50000.0, 50000.0],
+        "ema_slow": [50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0],
+        "ema_20": [50000.0, 50500.0, 49500.0, 50000.0, 50000.0, 50000.0],
+        "ema_slow_slope": [0.0, 0.01, -0.01, 0.0, 0.0, 0.0],
+        "adx": [20.0, 30.0, 30.0, 18.0, 18.0, 20.0],
+        "plus_di": [20.0, 35.0, 15.0, 15.0, 30.0, 20.0],
+        "minus_di": [20.0, 15.0, 35.0, 30.0, 15.0, 20.0],
+        "bb_mid": [50000.0, 50400.0, 49600.0, 50000.0, 50000.0, 50000.0],
+        "bb_upper": [51000.0, 51500.0, 50500.0, 51000.0, 51000.0, 51000.0],
+        "bb_lower": [49000.0, 49500.0, 48500.0, 49000.0, 49000.0, 49000.0],
+        "bb_pct_b": [0.5, 0.75, 0.25, 0.8, 0.7, 0.5],
+        "vol_zscore": [0.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+        "regime": [0, 1, -1, 0, 0, 0],
+        "donchian_upper": [50500.0, 50500.0, 50500.0, 50500.0, 50500.0, 50500.0],
+        "donchian_lower": [49500.0, 49500.0, 49500.0, 49500.0, 49500.0, 49500.0],
+        "donchian_mid": [50000.0, 50000.0, 50000.0, 50000.0, 50000.0, 50000.0],
+        "ema_fast_slope": [0.0, 0.02, -0.02, 0.0, 0.0, 0.0],
+    }
+    hand_df = pd.DataFrame(data, index=idx)
+
+    # A) Chế độ trend_pullback: R:R >= 2.0
+    cfg_tp = replace(TradingConfig(), strategy_mode="trend_pullback", pullback_rr_ratio=2.0)
+    sig_tp = Strategy(cfg_tp).generate_signals(hand_df)
+
+    # Nến 1: Long Pullback
+    assert sig_tp["signal"].iloc[1] == 1
+    sl_1 = float(sig_tp["stop_loss"].iloc[1])
+    tp_1 = float(sig_tp["take_profit"].iloc[1])
+    c_1 = float(hand_df["close"].iloc[1])
+    rr_long = (tp_1 - c_1) / (c_1 - sl_1)
+    assert rr_long >= 2.0
+    assert np.isfinite(sig_tp["limit_price"].iloc[1])
+
+    # Nến 2: Short Pullback
+    assert sig_tp["signal"].iloc[2] == -1
+    sl_2 = float(sig_tp["stop_loss"].iloc[2])
+    tp_2 = float(sig_tp["take_profit"].iloc[2])
+    c_2 = float(hand_df["close"].iloc[2])
+    rr_short = (c_2 - tp_2) / (sl_2 - c_2)
+    assert rr_short >= 2.0
+    assert np.isfinite(sig_tp["limit_price"].iloc[2])
+
+    # Nến 5: Flat
+    assert sig_tp["signal"].iloc[5] == 0
+    assert np.isnan(sig_tp["limit_price"].iloc[5])
+
+    # B) Chế độ mean_reversion: R:R >= 1.5
+    cfg_mr = replace(TradingConfig(), strategy_mode="mean_reversion", mr_rr_ratio=1.5)
+    sig_mr = Strategy(cfg_mr).generate_signals(hand_df)
+
+    # Nến 3: Long Mean Reversion (oversold, chạm dưới biên, đảo chiều tăng)
+    assert sig_mr["signal"].iloc[3] == 1
+    sl_3 = float(sig_mr["stop_loss"].iloc[3])
+    tp_3 = float(sig_mr["take_profit"].iloc[3])
+    c_3 = float(hand_df["close"].iloc[3])
+    rr_mr_long = (tp_3 - c_3) / (c_3 - sl_3)
+    assert rr_mr_long >= 1.5
+
+    # Nến 4: Short Mean Reversion (overbought, chạm trên biên, đảo chiều giảm)
+    assert sig_mr["signal"].iloc[4] == -1
+    sl_4 = float(sig_mr["stop_loss"].iloc[4])
+    tp_4 = float(sig_mr["take_profit"].iloc[4])
+    c_4 = float(hand_df["close"].iloc[4])
+    rr_mr_short = (c_4 - tp_4) / (sl_4 - c_4)
+    assert rr_mr_short >= 1.5
+
+    # Nến 5: Flat
+    assert sig_mr["signal"].iloc[5] == 0
+
+    # C) Chế độ regime_adaptive: chuyển nhánh theo adx >= adx_threshold (25.0)
+    cfg_adapt = replace(TradingConfig(), strategy_mode="regime_adaptive", adx_threshold=25.0)
+    sig_adapt = Strategy(cfg_adapt).generate_signals(hand_df)
+
+    # Nến 1 & 2 (adx=30 >= 25): lấy theo trend_pullback -> 1 và -1
+    assert sig_adapt["signal"].iloc[1] == sig_tp["signal"].iloc[1] == 1
+    assert sig_adapt["signal"].iloc[2] == sig_tp["signal"].iloc[2] == -1
+    assert sig_adapt["stop_loss"].iloc[1] == pytest.approx(sig_tp["stop_loss"].iloc[1])
+
+    # Nến 3 & 4 (adx=18 < 25): lấy theo mean_reversion -> 1 và -1
+    assert sig_adapt["signal"].iloc[3] == sig_mr["signal"].iloc[3] == 1
+    assert sig_adapt["signal"].iloc[4] == sig_mr["signal"].iloc[4] == -1
+    assert sig_adapt["stop_loss"].iloc[3] == pytest.approx(sig_mr["stop_loss"].iloc[3])
+
+    # D) Verify No Look-Ahead Bias trên cả 4 modes
+    raw_df = generate_synthetic_ohlcv(n_candles=260, seed=777)
+    full_feat = features.add_all_features(raw_df, TradingConfig(), drop_warmup=True)
+    assert len(full_feat) > 30
+
+    cutoff = len(full_feat) - 5
+    for mode in ("breakout", "trend_pullback", "mean_reversion", "regime_adaptive"):
+        cfg_m = replace(TradingConfig(), strategy_mode=mode)
+        strat_m = Strategy(cfg_m)
+
+        res_full = strat_m.generate_signals(full_feat)
+        res_sub = strat_m.generate_signals(full_feat.iloc[: cutoff + 1])
+
+        # Giá trị tại nến cutoff khi tính trên bảng đầy đủ và bảng cắt ngắn phải khớp nhau 100%
+        assert res_sub["signal"].iloc[-1] == res_full["signal"].iloc[cutoff], f"Look-ahead in {mode} signal"
+        assert np.isclose(
+            res_sub["stop_loss"].iloc[-1], res_full["stop_loss"].iloc[cutoff], equal_nan=True
+        ), f"Look-ahead in {mode} stop_loss"
+        assert np.isclose(
+            res_sub["take_profit"].iloc[-1], res_full["take_profit"].iloc[cutoff], equal_nan=True
+        ), f"Look-ahead in {mode} take_profit"
+        assert np.isclose(
+            res_sub["limit_price"].iloc[-1], res_full["limit_price"].iloc[cutoff], equal_nan=True
+        ), f"Look-ahead in {mode} limit_price"
+

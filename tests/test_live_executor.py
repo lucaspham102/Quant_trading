@@ -591,3 +591,82 @@ def test_live_executor_utc_day_rollover_resets_daily_pnl_and_unlocks_circuit_bre
     assert executor.open_position is not None
     assert executor.open_position.side == 1
 
+
+def test_live_executor_trailing_stop_and_cycle_logging(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Kiểm tra LiveExecutor cập nhật Trailing Stop, khôi phục qua StateStore và ghi heartbeat logging."""
+    import logging
+    caplog.set_level(logging.INFO)
+
+    state_file = tmp_path / "trailing_cycle_state.json"
+    cfg = dataclasses.replace(
+        TradingConfig(),
+        state_file_path=state_file,
+        use_trailing_stop=True,
+        trailing_activation_r=1.5,
+        trailing_atr_mult=2.0,
+        tp_atr_multiple=5.0,
+        use_breakeven=False,
+    )
+    executor = LiveExecutor(
+        config=cfg,
+        mode="paper",
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+    )
+
+    # Nến 1: Mở vị thế Long
+    # entry_price = 50000 * (1 + 0.0002) = 50010.0, atr = 500.0, sl = 50010 - 2*500 = 49010.0
+    # initial_risk = 1000.0 -> trigger dist = 1.5 * 1000 = 1500 -> trigger price = 51510.0
+    rows = [(50000.0, 50100.0, 49900.0, 50000.0, 1, 500.0)]
+    df1 = _make_signal_df(rows)
+    assert executor.process_closed_candles(df1) is True
+    assert executor.open_position is not None
+    pos = executor.open_position
+    assert pos.side == 1
+    assert pos.trailing_activated is False
+    assert pos.highest_price_since_entry == pytest.approx(pos.entry_price)
+
+    # Nến 2: Giá tăng mạnh vượt 1.5R: high = 52000.0 (>= 51510.0), close = 51600.0
+    # Trailing Stop kích hoạt: peak = 52000.0
+    # new_sl = 52000.0 - 2.0 * 500.0 = 51000.0 > initial_sl (49010.0)
+    rows.append((50050.0, 52000.0, 50000.0, 51600.0, 0, 500.0))
+    df2 = _make_signal_df(rows)
+    assert executor.process_closed_candles(df2) is True
+    assert executor.open_position is not None
+    pos2 = executor.open_position
+    assert pos2.trailing_activated is True
+    assert pos2.highest_price_since_entry == pytest.approx(52000.0)
+    assert pos2.stop_loss == pytest.approx(51000.0)
+
+    # Khôi phục trạng thái từ StateStore để đảm bảo trailing fields được persist
+    del executor
+    executor_restored = LiveExecutor(
+        config=cfg,
+        mode="paper",
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+    )
+    restored_pos = executor_restored.open_position
+    assert restored_pos is not None
+    assert restored_pos.trailing_activated is True
+    assert restored_pos.highest_price_since_entry == pytest.approx(52000.0)
+    assert restored_pos.stop_loss == pytest.approx(51000.0)
+
+    # Nến 2 gửi lại (trùng nến): phải log status=WAITING_NEXT_CANDLE và trả về False
+    assert executor_restored.process_closed_candles(df2) is False
+
+    # Kiểm tra Heartbeat logging
+    log_records = [rec.message for rec in caplog.records if "[Heartbeat]" in rec.message]
+    assert len(log_records) >= 3
+    # Phải có bản ghi NEW_CANDLE_PROCESSED
+    processed_logs = [m for m in log_records if "status=NEW_CANDLE_PROCESSED" in m]
+    assert len(processed_logs) >= 2
+    assert any("LONG qty=" in m for m in processed_logs)
+    assert any("mode=paper" in m for m in processed_logs)
+    # Phải có bản ghi WAITING_NEXT_CANDLE
+    waiting_logs = [m for m in log_records if "status=WAITING_NEXT_CANDLE" in m]
+    assert len(waiting_logs) >= 1
+
+
