@@ -30,11 +30,11 @@ Xóa các điểm mù của Đợt 7 và kiểm định khung thời gian lớn 
 | A4 | Block bootstrap theo ngày (CI95 Sharpe diff) | DONE | | `data/sprint5_bootstrap.csv` |
 | A5 | Null khớp exposure (1000 lần) | DONE | | `data/sprint5_null.csv` |
 | A6 | Báo cáo Phần A | DONE | | `docs/sprint5_results_partA.md` |
-| B1 | Resample 4h/1d + kiểm candles_per_year | TODO | | |
-| B2 | Walk-forward 4h & 1d (dev, KHÔNG holdout) | TODO | | |
-| B3 | Chạy holdout 1 lần duy nhất | TODO | | |
-| C | Funding model (tùy chọn) | TODO | | sau A&B |
-| R | Báo cáo GO/NO-GO | TODO | | |
+| B1 | Resample 4h/1d + kiểm candles_per_year | DONE | | 4h=2190, 1d=365 (dùng `candles_per_year_for_timeframe`) |
+| B2 | Walk-forward 4h & 1d (dev, KHÔNG holdout) | DONE | | 4h 15 cửa sổ, 1d 4 cửa sổ |
+| B3 | Chạy holdout 1 lần duy nhất | DONE | | 4h=1080 nến, 1d=180 nến |
+| C | Funding model (tùy chọn) | TODO | | sau A&B (ưu tiên thấp) |
+| R | Báo cáo GO/NO-GO | DONE | | **NO-GO** (xem §8) |
 
 ## 4. Quyết định đã đưa ra & lý do
 - **Branch từ master** (theo chỉ thị). Vì master thiếu code Sprint 4, Phần A tự cài đặt metric (không phụ thuộc `src/diagnostics.py`).
@@ -57,7 +57,24 @@ Nguồn: `data/sprint5_*.csv` + `docs/sprint5_results_partA.md`.
 - Windows: 4h = 120/60/60; 1d = 360/120/120.
 - Lưới cố định 8 tổ hợp; baseline = breakout/market/trailing=True. Số lần thử Phần B = 2×8×4 = 64.
 
-## 7. Cảnh báo cho session sau
+## 7. KẾT QUẢ PHẦN B (4h & 1d, dev 2023-05→2026-04; holdout 180 ngày cuối) — đã chạy
+Nguồn: `data/sprint5_partB_*.csv` + `docs/sprint5_results_partB.md`. Code: `src/deep_analysis.py` (thêm `resample_ohlcv`, `sharpe_of`, `analyze_timeframe`, `holdout_return`), `run_sprint5_partB.py`, `tests/test_deep_analysis_partB.py` (5 test). Full suite **128 passed ×2**.
+- **Cửa sổ**: 4h = 15; 1d = 4 (ít hơn dự kiến 5–6 vì warm-up ~200 nến bị drop). trade-day bootstrap 4h=1047, 1d=877.
+- **Số lệnh/dev**: 4h ~70–78; **1d chỉ 3–10 (≈1 lệnh/cửa sổ)** → power rất thấp.
+- **Alpha/beta (NW)**: 4h alpha **dương** BTC +2.17%/năm (t 0.84), SOL +3.65 (1.25), BNB +3.09 (1.04), ETH +0.57 (0.18); 1d nhỏ ±1% (|t|≤0.99). **Đều không ý nghĩa (<2.5).**
+- **Sharpe (real) vs B&H**: 4h base 0.10–0.78 vs bh 0.47–1.14; 1d base −0.23…0.68 vs bh 0.42–1.05 → **đều thua** (base−bh: 4h −0.28…−0.51; 1d −0.21…−1.08).
+- **Drawdown pooled (real)**: 4h 4.7–7.9% vs B&H 50–73%; 1d 1.2–2.2% vs B&H 50–70% → phòng vệ tốt nhưng đổi bằng return.
+- **Null khớp exposure**: percentile 4h max 93.4 (SOL), 1d max 69.0 → **<95**.
+- **Holdout (real)**: 4h 1/4 dương (SOL +0.20%); 1d 1/4 dương (SOL +1.72; BTC 0 lệnh).
+- **Kết luận: NO-GO** (trượt cả 4 điều kiện). Khung lớn cải thiện Sharpe/alpha so với 1h nhưng vẫn dưới B&H & không ý nghĩa.
+- **Bug đã sửa**: holdout ban đầu bị warm-up ăn hết (1d → 0 nến); đã đổi `holdout_return(symbol, tf, context_df, cutoff)` (tính chỉ báo trên toàn chuỗi rồi mới cắt từ cutoff).
+
+## 8. Còn lại sau Đợt 8
+- **Argon audit look-ahead** (checklist ở `docs/go_no_go_sprint3.md` §5) — chờ quota hồi phục.
+- **Phần C (funding)** — tùy chọn, ưu tiên thấp.
+- `src/deep_analysis.py` là bản sao độc lập metric (nhánh này thiếu `src/diagnostics.py` của Sprint 4).
+
+## 9. Cảnh báo cho session sau
 - Nếu phải viết lại: bắt đầu từ `docs/go_no_go_sprint5.md` + file này.
 - Rule git: KHÔNG đụng master, KHÔNG merge/push/reset --hard/branch -D.
 - Python 3.14, pandas 3.0. PowerShell dùng `;` không `&&`. `PYTHONIOENCODING=utf-8` khi in tiếng Việt.

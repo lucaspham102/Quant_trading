@@ -642,3 +642,264 @@ def run_deep_analysis(
         "bootstrap": bootstrap_df,
         "null": null_df,
     }
+
+
+def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Resample dữ liệu OHLCV 1h sang khung thời gian lớn hơn (chỉ hỗ trợ '4h' và '1d').
+
+    Parameters:
+        df: DataFrame OHLCV gốc (khung 1h) có DatetimeIndex.
+        timeframe: Chuỗi khung đích, '4h' hoặc '1d'.
+
+    Returns:
+        DataFrame OHLCV đã resample, loại bỏ các bucket rỗng, index DatetimeIndex nano-second.
+    """
+    if timeframe not in ("4h", "1d"):
+        raise ValueError(
+            f"Khung thời gian không hợp lệ: {timeframe!r}. Chỉ hỗ trợ '4h' và '1d'."
+        )
+    if len(df) == 0:
+        out = pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([], tz=df.index.tz, name=df.index.name).as_unit("ns"),
+        )
+        if hasattr(df, "attrs") and df.attrs:
+            out.attrs = df.attrs.copy()
+        return out
+
+    rule = "4h" if timeframe == "4h" else "1D"
+    out = df.resample(rule).agg(
+        {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        }
+    )
+    out = out.dropna(subset=["open", "high", "low", "close"])
+    out.index = out.index.as_unit("ns")
+    if hasattr(df, "attrs") and df.attrs:
+        out.attrs = df.attrs.copy()
+    return out
+
+
+def sharpe_of(equity: pd.Series, candles_per_year: int) -> float:
+    """Tính tỷ số Sharpe hàng năm hóa từ chuỗi vốn equity.
+
+    Parameters:
+        equity: Chuỗi giá trị vốn qua từng nến.
+        candles_per_year: Số lượng nến trong 1 năm theo timeframe tương ứng.
+
+    Returns:
+        Tỷ số Sharpe dạng float (0.0 nếu chuỗi vốn < 2 phần tử hoặc độ lệch chuẩn bằng 0).
+    """
+    if len(equity) < 2:
+        return 0.0
+    r = equity.pct_change().dropna()
+    if len(r) < 2:
+        return 0.0
+    std = float(r.std(ddof=1))
+    if not np.isfinite(std) or std <= 1e-12:
+        return 0.0
+    return float(r.mean() / std * math.sqrt(candles_per_year))
+
+
+def analyze_timeframe(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    train_days: int = 120,
+    test_days: int = 60,
+    step_days: int = 60,
+    baseline: Candidate | None = None,
+    n_boot: int = 1000,
+    n_null: int = 1000,
+    seed: int = 42,
+) -> dict[str, pd.DataFrame]:
+    """Phân tích chuyên sâu chiến lược baseline cho một khung thời gian cụ thể kèm so sánh Sharpe với Buy-and-Hold.
+
+    Parameters:
+        symbol: Tên cặp giao dịch (ví dụ 'BTC/USDT:USDT').
+        timeframe: Khung thời gian ('4h' hoặc '1d').
+        df: DataFrame OHLCV của khung thời gian tương ứng.
+        train_days: Số ngày trong tập train walk-forward.
+        test_days: Số ngày trong tập test walk-forward.
+        step_days: Số ngày bước trượt walk-forward.
+        baseline: Cấu hình chiến lược baseline (mặc định DEFAULT_BASELINE).
+        n_boot: Số lần lặp Bootstrap.
+        n_null: Số lần lặp kiểm định Null.
+        seed: Seed sinh số ngẫu nhiên.
+
+    Returns:
+        Dict gồm 6 DataFrame: exposure, drawdown, alpha_beta, bootstrap, null, sharpe.
+    """
+    if baseline is None:
+        baseline = DEFAULT_BASELINE
+
+    out = run_deep_analysis(
+        symbol=symbol,
+        timeframe=timeframe,
+        df=df,
+        train_days=train_days,
+        test_days=test_days,
+        step_days=step_days,
+        baseline=baseline,
+        n_boot=n_boot,
+        n_null=n_null,
+        seed=seed,
+    )
+
+    base_common = dataclasses.replace(
+        TradingConfig(),
+        use_fee_aware_sizing=True,
+        min_stop_distance_pct=0.008,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    feat = add_all_features(df, base_common, drop_warmup=True)
+    if len(feat) == 0:
+        sharpe_df = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "n_bars": len(df),
+                    "base_sharpe": 0.0,
+                    "bh_sharpe": 0.0,
+                    "base_minus_bh_sharpe": 0.0,
+                    "base_return_pct": 0.0,
+                    "bh_return_pct": 0.0,
+                    "base_max_dd": 0.0,
+                    "bh_max_dd": 0.0,
+                }
+            ]
+        )
+    else:
+        cfg_real = make_candidate_config(apply_fee_scenario(base_common, "real"), baseline, timeframe)
+        rep_real = Backtester(cfg_real).run(feat)
+        cpy = candles_per_year_for_timeframe(timeframe)
+        initial = base_common.initial_capital
+        open_0 = float(feat["open"].iloc[0])
+        eq_bh = initial * feat["close"] / open_0 if open_0 > 0 else pd.Series(initial, index=feat.index)
+        bh_sharpe = sharpe_of(eq_bh, cpy)
+        base_sharpe = float(rep_real.sharpe_ratio)
+        base_minus_bh_sharpe = float(base_sharpe - bh_sharpe)
+        base_return_pct = float(rep_real.total_return_pct)
+        close_end = float(feat["close"].iloc[-1])
+        bh_return_pct = float((close_end / open_0 - 1.0) * 100.0) if open_0 > 0 else 0.0
+        base_max_dd = float(rep_real.max_drawdown_pct)
+        bh_max_dd = float(max_drawdown_pct(eq_bh))
+
+        sharpe_df = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "n_bars": len(df),
+                    "base_sharpe": base_sharpe,
+                    "bh_sharpe": bh_sharpe,
+                    "base_minus_bh_sharpe": base_minus_bh_sharpe,
+                    "base_return_pct": base_return_pct,
+                    "bh_return_pct": bh_return_pct,
+                    "base_max_dd": base_max_dd,
+                    "bh_max_dd": bh_max_dd,
+                }
+            ]
+        )
+
+    out["sharpe"] = sharpe_df
+    return out
+
+
+def holdout_return(
+    symbol: str,
+    timeframe: str,
+    context_df: pd.DataFrame,
+    cutoff: pd.Timestamp,
+    baseline: Candidate | None = None,
+    fee_scenario: str = "real",
+) -> dict:
+    """Đánh giá hiệu suất trên tập dữ liệu Holdout biệt lập (180 ngày cuối).
+
+    Hàm nhận TOÀN BỘ chuỗi ``context_df`` để tính chỉ báo (warm-up) rồi CHỈ
+    giao dịch trên phần từ ``cutoff`` trở đi, tránh warm-up ăn mất đoạn holdout
+    (đặc biệt quan trọng với khung 1d nơi warm-up ~200 nến).
+
+    Parameters:
+        symbol: Tên cặp giao dịch (ví dụ 'BTC/USDT:USDT').
+        timeframe: Khung thời gian ('4h' hoặc '1d').
+        context_df: DataFrame OHLCV ĐẦY ĐỦ (đã resample) để tính chỉ báo.
+        cutoff: Mốc thời gian bắt đầu holdout; chỉ giao dịch từ cutoff trở đi.
+        baseline: Cấu hình baseline (mặc định DEFAULT_BASELINE).
+        fee_scenario: Kịch bản phí ('real', 'zero', 'double').
+
+    Returns:
+        Dict gồm các chỉ số holdout của baseline và buy-and-hold.
+    """
+    if baseline is None:
+        baseline = DEFAULT_BASELINE
+
+    base_common = dataclasses.replace(
+        TradingConfig(),
+        use_fee_aware_sizing=True,
+        min_stop_distance_pct=0.008,
+        symbol=symbol,
+        timeframe=timeframe,
+    )
+    feat_full = add_all_features(context_df, base_common, drop_warmup=True)
+    feat = feat_full.loc[feat_full.index >= cutoff]
+    if len(feat) == 0:
+        h_end = context_df.index[-1] if len(context_df) > 0 else pd.Timestamp(0, tz="UTC")
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "n_bars": 0,
+            "holdout_start": cutoff,
+            "holdout_end": h_end,
+            "baseline_return_pct": 0.0,
+            "baseline_sharpe": 0.0,
+            "baseline_max_dd": 0.0,
+            "bh_return_pct": 0.0,
+            "bh_max_dd": 0.0,
+        }
+
+    cfg = make_candidate_config(apply_fee_scenario(base_common, fee_scenario), baseline, timeframe)
+    rep = Backtester(cfg).run(feat)
+    initial = base_common.initial_capital
+    open_0 = float(feat["open"].iloc[0])
+    eq_bh = initial * feat["close"] / open_0 if open_0 > 0 else pd.Series(initial, index=feat.index)
+    close_end = float(feat["close"].iloc[-1])
+    bh_ret = float((close_end / open_0 - 1.0) * 100.0) if open_0 > 0 else 0.0
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "n_bars": len(feat),
+        "holdout_start": feat.index[0],
+        "holdout_end": feat.index[-1],
+        "baseline_return_pct": float(rep.total_return_pct),
+        "baseline_sharpe": float(rep.sharpe_ratio),
+        "baseline_max_dd": float(rep.max_drawdown_pct),
+        "bh_return_pct": bh_ret,
+        "bh_max_dd": float(max_drawdown_pct(eq_bh)),
+    }
+
+
+__all__ = [
+    "REAL_TAKER_FEE",
+    "REAL_SLIPPAGE",
+    "REAL_FEE_PER_SIDE",
+    "DEFAULT_BASELINE",
+    "newey_west_ols",
+    "max_drawdown_pct",
+    "exposure_metrics",
+    "block_bootstrap_sharpe_diff",
+    "exposure_matched_null",
+    "run_deep_analysis",
+    "resample_ohlcv",
+    "sharpe_of",
+    "analyze_timeframe",
+    "holdout_return",
+]
+
