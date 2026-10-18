@@ -1,10 +1,12 @@
 """Tính toán chỉ báo kỹ thuật vector hóa (thuần Pandas/NumPy), không look-ahead bias."""
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 
 from src.config import TradingConfig
 
-FEATURE_COLUMNS = [
+CORE_FEATURE_COLUMNS = [
     "ema_fast",
     "ema_slow",
     "atr",
@@ -14,6 +16,23 @@ FEATURE_COLUMNS = [
     "donchian_mid",
     "vol_zscore",
     "regime",
+]
+
+MICROSTRUCTURE_COLUMNS = [
+    "body_to_range_ratio",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+    "bb_width_squeeze",
+    "return_lag_1",
+    "return_lag_4",
+    "return_lag_16",
+    "hour_sin",
+    "hour_cos",
+]
+
+FEATURE_COLUMNS = [
+    *CORE_FEATURE_COLUMNS,
+    *MICROSTRUCTURE_COLUMNS,
 ]
 
 
@@ -98,6 +117,80 @@ def compute_regime_filter(
     return regime
 
 
+def compute_candle_microstructure(df: pd.DataFrame) -> pd.DataFrame:
+    """Tỷ lệ thân nến và râu nến trên biên độ [low, high]. Khi high == low -> 0.0 (không NaN/inf)."""
+    open_ = df["open"].astype("float64").to_numpy()
+    high = df["high"].astype("float64").to_numpy()
+    low = df["low"].astype("float64").to_numpy()
+    close = df["close"].astype("float64").to_numpy()
+
+    rng = high - low
+    valid = np.isfinite(rng) & (rng > 0.0) & np.isfinite(open_) & np.isfinite(close)
+    safe_rng = np.where(valid, rng, 1.0)
+
+    body = np.abs(close - open_)
+    upper_wick = high - np.maximum(open_, close)
+    lower_wick = np.minimum(open_, close) - low
+
+    body_ratio = np.where(valid, body / safe_rng, 0.0)
+    upper_ratio = np.where(valid, upper_wick / safe_rng, 0.0)
+    lower_ratio = np.where(valid, lower_wick / safe_rng, 0.0)
+
+    return pd.DataFrame(
+        {
+            "body_to_range_ratio": body_ratio,
+            "upper_wick_ratio": upper_ratio,
+            "lower_wick_ratio": lower_ratio,
+        },
+        index=df.index,
+        dtype="float64",
+    )
+
+
+def compute_bb_width_squeeze(
+    df: pd.DataFrame,
+    bb_window: int = 20,
+    bb_std_mult: float = 2.0,
+    atr_period: int = 14,
+) -> pd.Series:
+    """Độ rộng dải Bollinger chuẩn hóa: (upper - lower) / mid trên cửa sổ bb_window (ddof=1)."""
+    _ = atr_period
+    close = df["close"].astype("float64") if isinstance(df, pd.DataFrame) else df.astype("float64")
+    mid = close.rolling(window=bb_window, min_periods=bb_window).mean()
+    std = close.rolling(window=bb_window, min_periods=bb_window).std(ddof=1)
+    upper = mid + bb_std_mult * std
+    lower = mid - bb_std_mult * std
+    squeeze = (upper - lower) / mid.replace(0.0, np.nan)
+    squeeze.name = "bb_width_squeeze"
+    return squeeze.astype("float64")
+
+
+def compute_return_lags(
+    series: pd.Series,
+    lags: Sequence[int] = (1, 4, 16),
+) -> pd.DataFrame:
+    """Lợi suất trễ close.pct_change(periods=k) (tương thích Pandas 3.0, không truyền fill_method)."""
+    s = series["close"].astype("float64") if isinstance(series, pd.DataFrame) else series.astype("float64")
+    cols = {f"return_lag_{int(k)}": s.pct_change(periods=int(k)) for k in lags}
+    return pd.DataFrame(cols, index=s.index, dtype="float64")
+
+
+def compute_time_cyclical(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Mã hóa chu kỳ giờ UTC: sin(2*pi*hour/24), cos(2*pi*hour/24)."""
+    idx = index.index if isinstance(index, pd.DataFrame) else pd.DatetimeIndex(index)
+    idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    hours = idx_utc.hour.to_numpy(dtype="float64")
+    angles = 2.0 * np.pi * hours / 24.0
+    return pd.DataFrame(
+        {
+            "hour_sin": np.sin(angles),
+            "hour_cos": np.cos(angles),
+        },
+        index=idx,
+        dtype="float64",
+    )
+
+
 def add_all_features(
     df: pd.DataFrame,
     config: TradingConfig = TradingConfig(),
@@ -119,9 +212,24 @@ def add_all_features(
         config.ema_slow_period,
         config.regime_slope_lookback,
     )
+
+    micro = compute_candle_microstructure(out)
+    for col in micro.columns:
+        out[col] = micro[col]
+    out["bb_width_squeeze"] = compute_bb_width_squeeze(
+        out, config.bb_window, config.bb_std_mult, config.atr_period
+    )
+    ret_lags = compute_return_lags(out["close"], config.return_lags)
+    for col in ret_lags.columns:
+        out[col] = ret_lags[col]
+    cyclical = compute_time_cyclical(out.index)
+    for col in cyclical.columns:
+        out[col] = cyclical[col]
+
     if drop_warmup:
         # Chỉ cắt đoạn warmup ở đầu chuỗi khi các chỉ báo cốt lõi chưa đủ chu kỳ;
         # nếu giữa chuỗi có vol_zscore == NaN (do std == 0) thì điền 0.0 để giữ index liên tục.
+        lag_cols = [f"return_lag_{int(k)}" for k in config.return_lags]
         core_cols = [
             "ema_fast",
             "ema_slow",
@@ -130,17 +238,30 @@ def add_all_features(
             "donchian_upper",
             "donchian_lower",
             "donchian_mid",
+            "bb_width_squeeze",
+            *lag_cols,
         ]
         slope_ok = out["ema_slow"].shift(config.regime_slope_lookback).notna()
         vol_warmup_ok = pd.Series(
             np.arange(len(out)) >= config.vol_zscore_window - 1,
             index=out.index,
         )
-        valid_mask = slope_ok & out[core_cols].notna().all(axis=1) & vol_warmup_ok
+        bb_warmup_ok = pd.Series(
+            np.arange(len(out)) >= config.bb_window - 1,
+            index=out.index,
+        )
+        valid_mask = (
+            slope_ok
+            & out[core_cols].notna().all(axis=1)
+            & vol_warmup_ok
+            & bb_warmup_ok
+        )
         if valid_mask.any():
             first_valid_pos = int(np.argmax(valid_mask.to_numpy()))
             out = out.iloc[first_valid_pos:].copy()
         else:
             out = out.iloc[0:0].copy()
         out["vol_zscore"] = out["vol_zscore"].fillna(0.0)
+        out["bb_width_squeeze"] = out["bb_width_squeeze"].fillna(0.0)
     return out
+

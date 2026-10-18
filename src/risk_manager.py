@@ -16,12 +16,19 @@ class Position:
     symbol: str
     side: Literal[1, -1]              # 1: Long, -1: Short
     entry_price: float                # Giá khớp thực tế (đã tính slippage)
-    stop_loss: float                  # Mức giá cắt lỗ
+    stop_loss: float                  # Mức giá cắt lỗ hiện hành (có thể được dời về breakeven)
     take_profit: float                # Mức giá chốt lời
     qty: float                        # Khối lượng hợp đồng (đã làm tròn theo step_size)
     entry_time: pd.Timestamp          # Thời điểm mở lệnh (tz-aware UTC)
     entry_fee: float                  # Phí mở lệnh đã trả (USDT)
     notional: float                   # Giá trị danh nghĩa lúc vào lệnh = qty * entry_price
+    initial_sl: float = 0.0           # Mức SL ban đầu lúc mở lệnh (để tính initial_risk = |entry - initial_sl|)
+    breakeven_activated: bool = False # Cờ đánh dấu đã kích hoạt dời SL về hòa vốn
+    bars_held: int = 0                # Số nến đã nắm giữ vị thế
+
+    def __post_init__(self) -> None:
+        if self.initial_sl == 0.0:
+            self.initial_sl = self.stop_loss
 
 
 def _to_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
@@ -37,6 +44,7 @@ class RiskManager:
         self.daily_start_equity: float = config.initial_capital
         self.daily_realized_pnl: float = 0.0
         self.circuit_breaker_tripped: bool = False
+        self.consecutive_losses: int = 0
 
     def _daily_loss_limit(self) -> float:
         return self.daily_start_equity * self.config.max_daily_drawdown_pct
@@ -115,11 +123,19 @@ class RiskManager:
             entry_time=utc_entry_time,
             entry_fee=notional * self.config.taker_fee,
             notional=notional,
+            initial_sl=stop_loss,
+            breakeven_activated=False,
+            bars_held=0,
         )
 
     def update_after_trade_close(self, net_pnl: float, exit_time: pd.Timestamp) -> None:
         self.on_new_Timestamp(exit_time)
         self.current_equity += net_pnl
         self.daily_realized_pnl += net_pnl
+        if net_pnl < 0.0:
+            self.consecutive_losses += 1
+        elif net_pnl > 0.0:
+            self.consecutive_losses = 0
         if self._limit_hit():
             self.circuit_breaker_tripped = True
+

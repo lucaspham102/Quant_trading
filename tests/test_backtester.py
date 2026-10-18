@@ -355,3 +355,103 @@ def test_index_to_ms_returns_int64_ndarray_with_exact_values():
         assert isinstance(got, np.ndarray)
         assert got.dtype == np.int64
         np.testing.assert_array_equal(got, expected)
+
+
+# ------------------------------------------------------------------
+# Sprint 2 - Phần A2 & A3: Breakeven Stop (t+1) & Time-based Exit
+# ------------------------------------------------------------------
+
+def test_breakeven_activates_only_from_next_bar_not_same_bar():
+    from src.strategy import compute_breakeven_price
+
+    # Bar 0: phát tín hiệu LONG (atr = 500 -> initial_risk = 2 * 500 = 1000)
+    # Bar 1 (nến t): khớp LONG tại open=50000 -> entry = 50010, initial_sl = 49010, tp = 51510.
+    #   Ngưỡng kích hoạt breakeven (1R) = 50010 + 1000 = 51010.
+    #   Trong nến 1: high=51100 (>= 51010, kích hoạt breakeven) VÀ low=49900 (<= be_sl ~ 50080.014,
+    #   nhưng > initial_sl=49010). Lệnh KHÔNG được đóng ở nến 1!
+    # Bar 2 (nến t+1): open=50200, high=50300, low=50000 (<= be_sl) -> đóng tại be_sl với net_pnl >= 0.
+    rows = [
+        (50000, 50050, 49950, 50000, 1, 500),
+        (50000, 51100, 49900, 50300, 0, 500),
+        (50200, 50300, 50000, 50100, 0, 500),
+        (50100, 50150, 50050, 50100, 0, 500),
+    ]
+    rep, frame = run_fake(rows)
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    entry = 50000.0 * (1.0 + SLIP)
+    be_sl = compute_breakeven_price(entry, 1, CFG)
+    expected_exit = be_sl * (1.0 - SLIP)
+
+    assert tr.entry_time == frame.index[1]
+    assert tr.exit_time == frame.index[2]  # đóng ở nến t+1, KHÔNG đóng ở nến t (index[1])
+    assert tr.exit_reason == "SL"
+    assert tr.exit_price == pytest.approx(expected_exit)
+    assert tr.net_pnl >= 0.0
+
+
+def test_breakeven_short_position_covers_round_trip_fees():
+    from src.strategy import compute_breakeven_price
+
+    # Bar 0: phát tín hiệu SHORT (atr = 500 -> initial_risk = 1000)
+    # Bar 1 (nến t): khớp SHORT tại open=50000 -> entry = 49990, initial_sl = 50990, tp = 48490.
+    #   Ngưỡng kích hoạt breakeven (1R) = 49990 - 1000 = 48990.
+    #   Trong nến 1: low=48900 (<= 48990, kích hoạt breakeven) VÀ high=50100 (>= be_sl ~ 49920.014,
+    #   nhưng < initial_sl=50990). Không đóng ở nến 1.
+    # Bar 2 (nến t+1): open=49800, high=50000 (>= be_sl), low=49700 -> đóng tại be_sl với net_pnl >= 0.
+    rows = [
+        (50000, 50050, 49950, 50000, -1, 500),
+        (50000, 50100, 48900, 49700, 0, 500),
+        (49800, 50000, 49700, 49900, 0, 500),
+        (49900, 49950, 49850, 49900, 0, 500),
+    ]
+    rep, frame = run_fake(rows)
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    entry = 50000.0 * (1.0 - SLIP)
+    be_sl = compute_breakeven_price(entry, -1, CFG)
+    expected_exit = be_sl * (1.0 + SLIP)
+
+    assert tr.entry_time == frame.index[1]
+    assert tr.exit_time == frame.index[2]
+    assert tr.exit_reason == "SL"
+    assert tr.exit_price == pytest.approx(expected_exit)
+    assert tr.net_pnl >= 0.0
+
+
+def test_time_based_exit_closes_at_close_with_slippage():
+    from dataclasses import replace
+
+    cfg_time = replace(CFG, max_holding_bars=3)
+    # Bar 0: tín hiệu LONG
+    # Bar 1: mở lệnh tại open=50000, đi ngang (bars_held = 1)
+    # Bar 2: đi ngang (bars_held = 2)
+    # Bar 3: đi ngang, cuối nến bars_held = 3 >= max_holding_bars -> đóng tại close[3]=50120 với TIME_EXIT
+    # Bar 4: nến dư để chứng minh đóng vì TIME_EXIT ở bar 3 chứ không phải END_OF_DATA ở bar 4
+    rows = [
+        (50000, 50050, 49950, 50000, 1, 500),
+        (50000, 50100, 49900, 50020, 0, 500),
+        (50020, 50100, 49920, 50050, 0, 500),
+        (50050, 50150, 49950, 50120, 0, 500),
+        (50120, 50200, 50000, 50150, 0, 500),
+    ]
+    frame = make_frame(rows)
+    bt = Backtester(cfg_time, strategy=FakeStrategy(frame))
+    rep = bt.run(frame)
+
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    entry = 50000.0 * (1.0 + SLIP)
+    expected_exit = 50120.0 * (1.0 - SLIP)
+    qty = 0.004
+    gross = qty * (expected_exit - entry)
+    fee = qty * entry * FEE + qty * expected_exit * FEE
+
+    assert tr.entry_time == frame.index[1]
+    assert tr.exit_time == frame.index[3]
+    assert tr.exit_reason == "TIME_EXIT"
+    assert tr.exit_price == pytest.approx(expected_exit)
+    assert tr.gross_pnl == pytest.approx(gross)
+    assert tr.total_fee == pytest.approx(fee)
+    assert tr.net_pnl == pytest.approx(gross - fee)
+

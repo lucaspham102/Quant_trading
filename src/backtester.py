@@ -1,14 +1,16 @@
 """Backtester: khớp lệnh next-bar open, SL/TP trong nến (SL ưu tiên), phí taker 2 chiều + slippage."""
 import math
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
 
 from src.config import TradingConfig
 from src.risk_manager import Position, RiskManager
-from src.strategy import Strategy
+from src.strategy import Strategy, compute_breakeven_price, is_breakeven_triggered
+
+ExitReason = Literal["SL", "TP", "TIME_EXIT", "SIGNAL_REVERSE", "END_OF_DATA"]
 
 
 @dataclass(frozen=True)
@@ -22,7 +24,7 @@ class TradeRecord:
     gross_pnl: float
     total_fee: float
     net_pnl: float
-    exit_reason: Literal["SL", "TP", "SIGNAL_REVERSE", "END_OF_DATA"]
+    exit_reason: ExitReason
 
 
 @dataclass(frozen=True)
@@ -45,10 +47,12 @@ class Backtester:
         config: TradingConfig = TradingConfig(),
         strategy: Optional[Strategy] = None,
         risk_manager: Optional[RiskManager] = None,
+        ml_filter: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.strategy = strategy if strategy is not None else Strategy(config)
         self.risk_manager = risk_manager if risk_manager is not None else RiskManager(config)
+        self.ml_filter = ml_filter
 
     # ------------------------------------------------------------------
     def _close_position(
@@ -145,7 +149,24 @@ class Backtester:
                     trades.append(self._close_position(pos, raw_tp, ts, "TP"))
                     pos = None
 
-            # d) Đóng cưỡng bức ở nến cuối
+            # d) Cập nhật Breakeven Stop cho nến t+1 (nếu vị thế vẫn mở sau bước c)
+            if pos is not None and self.config.use_breakeven and not pos.breakeven_activated:
+                if is_breakeven_triggered(pos, highs[t], lows[t], self.config):
+                    be_sl = compute_breakeven_price(pos.entry_price, pos.side, self.config)
+                    if pos.side == 1:
+                        pos.stop_loss = max(pos.stop_loss, be_sl)
+                    else:
+                        pos.stop_loss = min(pos.stop_loss, be_sl)
+                    pos.breakeven_activated = True
+
+            # e) Kiểm tra Time-based Exit tại close[t] (nếu vị thế vẫn mở)
+            if pos is not None:
+                pos.bars_held += 1
+                if self.config.max_holding_bars > 0 and pos.bars_held >= self.config.max_holding_bars:
+                    trades.append(self._close_position(pos, closes[t], ts, "TIME_EXIT"))
+                    pos = None
+
+            # f) Đóng cưỡng bức ở nến cuối
             if pos is not None and t == n - 1:
                 trades.append(self._close_position(pos, closes[t], ts, "END_OF_DATA"))
                 pos = None
@@ -154,6 +175,7 @@ class Backtester:
 
         equity_curve = pd.Series(equity_vals, index=index, name="equity", dtype="float64")
         return self._build_report(equity_curve, trades)
+
 
     # ------------------------------------------------------------------
     def _build_report(self, equity_curve: pd.Series, trades: list[TradeRecord]) -> BacktestReport:

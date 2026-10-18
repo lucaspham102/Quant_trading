@@ -1,9 +1,44 @@
 """Chiến lược Donchian Breakout + Volume Z-Score + Regime Filter, SL/TP động theo ATR."""
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 
 from src import features
 from src.config import TradingConfig
+from src.risk_manager import Position
+
+
+def compute_breakeven_price(
+    entry_price: float,
+    side: Literal[1, -1],
+    config: TradingConfig = TradingConfig(),
+) -> float:
+    """Tính mức SL hòa vốn đã cộng bù phí taker 2 chiều + slippage 2 chiều."""
+    cost_buffer = 2.0 * config.taker_fee + 2.0 * config.slippage
+    if side == 1:
+        return float(entry_price * (1.0 + cost_buffer))
+    return float(entry_price * (1.0 - cost_buffer))
+
+
+compute_breakeven_sl = compute_breakeven_price
+
+
+def is_breakeven_triggered(
+    pos: Position,
+    candle_high: float,
+    candle_low: float,
+    config: TradingConfig = TradingConfig(),
+) -> bool:
+    """Kiểm tra nến hiện tại đã đạt ngưỡng kích hoạt Breakeven (breakeven_trigger_r * initial_risk) chưa."""
+    initial_sl = pos.initial_sl if pos.initial_sl != 0.0 else pos.stop_loss
+    initial_risk = abs(pos.entry_price - initial_sl)
+    if initial_risk <= 0.0:
+        return False
+    trigger_dist = config.breakeven_trigger_r * initial_risk
+    if pos.side == 1:
+        return bool(candle_high >= pos.entry_price + trigger_dist)
+    return bool(candle_low <= pos.entry_price - trigger_dist)
 
 
 class Strategy:
@@ -18,7 +53,7 @@ class Strategy:
         khi khớp thực tế tại open[t+1], Backtester tính lại SL/TP theo giá entry đã gồm slippage.
         """
         cfg = self.config
-        if not all(col in df.columns for col in features.FEATURE_COLUMNS):
+        if not all(col in df.columns for col in features.CORE_FEATURE_COLUMNS):
             out = features.add_all_features(df, cfg, drop_warmup=True)
         else:
             out = df.copy()
@@ -58,3 +93,4 @@ class Strategy:
         out["stop_loss"] = stop_loss
         out["take_profit"] = take_profit
         return out
+

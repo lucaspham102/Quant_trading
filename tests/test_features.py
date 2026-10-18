@@ -5,12 +5,17 @@ import pytest
 from src.config import TradingConfig
 from src.features import (
     FEATURE_COLUMNS,
+    MICROSTRUCTURE_COLUMNS,
     add_all_features,
     compute_atr,
+    compute_bb_width_squeeze,
+    compute_candle_microstructure,
     compute_donchian,
     compute_ema,
     compute_regime_filter,
+    compute_return_lags,
     compute_rsi,
+    compute_time_cyclical,
     compute_volume_zscore,
 )
 
@@ -244,3 +249,88 @@ def test_drop_warmup_keeps_contiguous_index_with_constant_volume_mid_series():
     # Không còn NaN ở toàn bộ bảng sau warmup; đoạn volume hằng giữa chuỗi được điền vol_zscore = 0.0
     assert not out[FEATURE_COLUMNS].isna().any().any()
     assert (out.loc[df.index[319:330], "vol_zscore"] == 0.0).all()
+
+
+# ------------------------------------------------------------------
+# Sprint 2 - Phần A1: 9 đặc trưng vi cấu trúc & chu kỳ
+# ------------------------------------------------------------------
+
+def test_candle_microstructure_ratios_and_flat_candle():
+    df = make_ohlcv(50, seed=21)
+    # Chèn nến Doji phẳng (high == low) ở dòng 10 và 20
+    df.iloc[10] = [100.0, 100.0, 100.0, 100.0, 150.0]
+    df.iloc[20] = [250.0, 250.0, 250.0, 250.0, 120.0]
+
+    micro = compute_candle_microstructure(df)
+    cols = ["body_to_range_ratio", "upper_wick_ratio", "lower_wick_ratio"]
+    assert list(micro.columns) == cols
+    assert not micro.isna().any().any()
+    assert not np.isinf(micro.to_numpy()).any()
+
+    # Mọi tỷ lệ nằm trong [0, 1]
+    assert (micro.to_numpy() >= 0.0).all()
+    assert (micro.to_numpy() <= 1.0 + 1e-12).all()
+
+    # Khi high == low -> cả 3 cột bằng 0.0
+    for idx_pos in (10, 20):
+        np.testing.assert_allclose(micro.iloc[idx_pos].to_numpy(), [0.0, 0.0, 0.0], atol=1e-15)
+
+    # Khi high > low -> tổng 3 tỷ lệ bằng 1.0
+    non_flat = (df["high"] > df["low"]).to_numpy()
+    row_sums = micro.loc[non_flat].sum(axis=1).to_numpy()
+    np.testing.assert_allclose(row_sums, 1.0, rtol=1e-12, atol=1e-12)
+
+
+def test_bb_width_squeeze_formula_and_window():
+    df = make_ohlcv(60, seed=22)
+    sq = compute_bb_width_squeeze(df, bb_window=20, bb_std_mult=2.0)
+    assert sq.name == "bb_width_squeeze"
+    assert sq.iloc[:19].isna().all()
+    assert sq.iloc[19:].notna().all()
+
+    close = df["close"].astype("float64")
+    mid = close.rolling(20, min_periods=20).mean()
+    std = close.rolling(20, min_periods=20).std(ddof=1)
+    expected = ((mid + 2.0 * std) - (mid - 2.0 * std)) / mid
+    np.testing.assert_allclose(sq.iloc[19:].to_numpy(), expected.iloc[19:].to_numpy(), rtol=1e-12)
+
+
+def test_return_lags_1_4_16_and_cyclical_hours():
+    df = make_ohlcv(100, seed=23)
+    lags = compute_return_lags(df["close"], lags=(1, 4, 16))
+    assert list(lags.columns) == ["return_lag_1", "return_lag_4", "return_lag_16"]
+
+    for k in (1, 4, 16):
+        col = f"return_lag_{k}"
+        assert lags[col].iloc[:k].isna().all()
+        expected = df["close"].iloc[k:].to_numpy() / df["close"].iloc[:-k].to_numpy() - 1.0
+        np.testing.assert_allclose(lags[col].iloc[k:].to_numpy(), expected, rtol=1e-12)
+
+    cyc = compute_time_cyclical(df.index)
+    assert list(cyc.columns) == ["hour_sin", "hour_cos"]
+    assert not cyc.isna().any().any()
+    norm_sq = cyc["hour_sin"].to_numpy() ** 2 + cyc["hour_cos"].to_numpy() ** 2
+    np.testing.assert_allclose(norm_sq, 1.0, rtol=1e-12, atol=1e-12)
+    # 00:00 UTC -> sin = 0, cos = 1; 06:00 UTC (nến thứ 24 khung 15m) -> sin = 1, cos = 0
+    assert cyc["hour_sin"].iloc[0] == pytest.approx(0.0, abs=1e-12)
+    assert cyc["hour_cos"].iloc[0] == pytest.approx(1.0, abs=1e-12)
+    assert cyc["hour_sin"].iloc[24] == pytest.approx(1.0, abs=1e-12)
+    assert cyc["hour_cos"].iloc[24] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_new_features_no_look_ahead_bias():
+    T = 500
+    df_full = make_extreme_future(T=T, n_future=50, seed=31)
+    df_sub = df_full.iloc[:T]
+
+    feat_sub = add_all_features(df_sub, drop_warmup=False)
+    feat_full = add_all_features(df_full, drop_warmup=False)
+
+    assert len(MICROSTRUCTURE_COLUMNS) == 9
+    for col in MICROSTRUCTURE_COLUMNS:
+        assert col in feat_sub.columns
+        a = feat_sub[col].iloc[:T].to_numpy(dtype="float64")
+        b = feat_full[col].iloc[:T].to_numpy(dtype="float64")
+        assert np.allclose(a, b, equal_nan=True), f"Look-ahead bias ở cột mới {col}"
+        assert np.array_equal(np.isnan(a), np.isnan(b)), f"Vị trí NaN khác nhau ở cột mới {col}"
+
