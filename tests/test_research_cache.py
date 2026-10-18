@@ -8,6 +8,7 @@ kiểm tra 3 nhánh hành vi chính bằng một FakeExchange hoàn toàn offlin
 2. Cache đã phủ đủ cả đầu lẫn đuôi -> KHÔNG gọi mạng.
 3. Không backfill được (sàn không có dữ liệu cũ) -> raise RuntimeError, KHÔNG fallback synthetic.
 """
+import pandas as pd
 import pytest
 from dataclasses import replace
 from pathlib import Path
@@ -136,3 +137,75 @@ def test_backfill_failure_raises_runtimeerror(tmp_path):
         load_or_fetch_symbol_data(
             SYMBOL, TIMEFRAME, days=180, raw_data_dir=tmp_path, exchange=ex
         )
+
+
+def test_truncate_returns_exactly_requested_days_when_cache_longer(tmp_path):
+    """Cache dài 180 ngày nhưng chỉ xin 60 ngày -> trả về đúng 60 ngày gần nhất.
+
+    Hàm phải neo theo nến cuối (`ts >= ts.max() - days`) và cắt còn đúng
+    `days * 24` nến, index không trùng và tăng dần; vì cache đã đủ nên KHÔNG
+    được gọi mạng.
+    """
+    rows = _make_rows(180 * 24, NOW_MS)
+    ex = FakeExchange(rows, NOW_MS)
+    loader = _loader(tmp_path, ex)
+
+    # Lưu cache ĐẦY ĐỦ 180 ngày (không cắt trên đĩa).
+    loader.save_parquet(
+        raw_ohlcv_to_dataframe(rows, SYMBOL, TIMEFRAME), loader.default_file_path()
+    )
+
+    ex.calls.clear()
+    out = load_or_fetch_symbol_data(
+        SYMBOL, TIMEFRAME, days=60, raw_data_dir=tmp_path, exchange=ex
+    )
+
+    assert len(out) == 60 * 24 + 1  # công thức cắt dùng '>=' nên bao gồm cả nến mốc
+    assert out.index.is_unique
+    assert out.index.is_monotonic_increasing
+    assert len(ex.calls) == 0  # cache đã đủ, không cần mạng
+
+
+def test_disk_cache_not_truncated(tmp_path):
+    """Kết quả trả về bị cắt nhưng file cache trên đĩa phải giữ nguyên 180 ngày."""
+    rows = _make_rows(180 * 24, NOW_MS)
+    ex = FakeExchange(rows, NOW_MS)
+    loader = _loader(tmp_path, ex)
+
+    # Lưu cache ĐẦY ĐỦ 180 ngày.
+    loader.save_parquet(
+        raw_ohlcv_to_dataframe(rows, SYMBOL, TIMEFRAME), loader.default_file_path()
+    )
+
+    out = load_or_fetch_symbol_data(
+        SYMBOL, TIMEFRAME, days=30, raw_data_dir=tmp_path, exchange=ex
+    )
+    assert len(out) == 30 * 24 + 1  # '>=' bao gồm nến mốc
+
+    # Đọc lại file trên đĩa: KHÔNG được bị cắt theo `days`.
+    reloaded = loader.load_parquet(loader.default_file_path())
+    assert len(reloaded) == 180 * 24
+    assert reloaded.index.is_unique
+
+    # Nến đầu trên đĩa khớp với nến đầu của dữ liệu gốc.
+    assert reloaded.index[0] == pd.Timestamp(rows[0][0], unit="ms", tz="UTC")
+
+
+def test_days_365_then_1095_no_error(tmp_path):
+    """Cache 365 ngày rồi xin 1095 ngày -> backfill thêm, không raise, đủ 1095 ngày."""
+    rows = _make_rows(1095 * 24, NOW_MS)  # sàn có sẵn 3 năm dữ liệu
+    ex = FakeExchange(rows, NOW_MS)
+    loader = _loader(tmp_path, ex)
+
+    out1 = load_or_fetch_symbol_data(
+        SYMBOL, TIMEFRAME, days=365, raw_data_dir=tmp_path, exchange=ex
+    )
+    assert len(out1) == 365 * 24
+
+    # Cache đã có 365 ngày, yêu cầu 1095 -> phải backfill thêm, KHÔNG được raise.
+    out2 = load_or_fetch_symbol_data(
+        SYMBOL, TIMEFRAME, days=1095, raw_data_dir=tmp_path, exchange=ex
+    )
+    assert len(out2) == 1095 * 24
+    assert out2.index.is_unique
+    assert out2.index.is_monotonic_increasing

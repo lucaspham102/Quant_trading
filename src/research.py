@@ -125,6 +125,19 @@ def generate_synthetic_ohlcv(
     return df
 
 
+def _truncate_to_recent_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """Cắt DataFrame chỉ giữ `days` ngày gần nhất (neo theo nến cuối).
+
+    Chỉ ảnh hưởng giá trị TRẢ VỀ; cache trên đĩa vẫn giữ đầy đủ (hàm này không ghi đĩa).
+    """
+    if len(df) == 0 or days <= 0:
+        return df
+    cutoff = df.index[-1] - pd.Timedelta(days=days)
+    out = df.loc[df.index >= cutoff].copy()
+    out.attrs.update(df.attrs)
+    return out
+
+
 def load_or_fetch_symbol_data(
     symbol: str,
     timeframe: str,
@@ -138,6 +151,7 @@ def load_or_fetch_symbol_data(
 
     - Nếu cache chưa phủ tới mốc `now - days` (vượt dung sai 1 nến), tải bù phần thiếu ở phía ĐẦU.
     - Nếu cache đã phủ đủ cả đầu lẫn đuôi, trả cache luôn (không gọi mạng).
+    - Cache trên đĩa luôn giữ đầy đủ; giá trị trả về được cắt còn đúng `days` ngày gần nhất.
     - Lỗi tải dữ liệu -> raise RuntimeError rõ ràng, KHÔNG fallback synthetic.
     """
     if use_synthetic:
@@ -153,18 +167,18 @@ def load_or_fetch_symbol_data(
 
     path = loader.default_file_path()
     if not path.exists():
-        return loader.update_incremental(default_start_ms=since_ms)
+        return _truncate_to_recent_days(loader.update_incremental(default_start_ms=since_ms), days)
 
     cached = loader.load_parquet()
     if len(cached) == 0:
-        return loader.update_incremental(default_start_ms=since_ms)
+        return _truncate_to_recent_days(loader.update_incremental(default_start_ms=since_ms), days)
 
     first_ms = int(cached.index[0].timestamp() * 1000)
     last_ms = int(cached.index[-1].timestamp() * 1000)
     head_ok = first_ms <= since_ms + tol_ms
     tail_ok = last_ms >= now_ms - 2 * tf_ms
     if head_ok and tail_ok:
-        return cached  # cache đã phủ đủ khoảng yêu cầu -> không cần fetch
+        return _truncate_to_recent_days(cached, days)  # cache đủ -> không fetch, cắt theo days
 
     merged = cached
     if not tail_ok:
@@ -184,7 +198,7 @@ def load_or_fetch_symbol_data(
         merged.attrs["symbol"] = symbol
         merged.attrs["timeframe"] = timeframe
         loader.save_parquet(merged, path)
-    return merged
+    return _truncate_to_recent_days(merged, days)
 
 
 def run_research_matrix(
