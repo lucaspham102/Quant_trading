@@ -120,7 +120,27 @@ def add_all_features(
         config.regime_slope_lookback,
     )
     if drop_warmup:
-        # regime chưa hợp lệ khi độ dốc EMA slow còn NaN
+        # Chỉ cắt đoạn warmup ở đầu chuỗi khi các chỉ báo cốt lõi chưa đủ chu kỳ;
+        # nếu giữa chuỗi có vol_zscore == NaN (do std == 0) thì điền 0.0 để giữ index liên tục.
+        core_cols = [
+            "ema_fast",
+            "ema_slow",
+            "atr",
+            "rsi",
+            "donchian_upper",
+            "donchian_lower",
+            "donchian_mid",
+        ]
         slope_ok = out["ema_slow"].shift(config.regime_slope_lookback).notna()
-        out = out.loc[slope_ok].dropna()
+        vol_warmup_ok = pd.Series(
+            np.arange(len(out)) >= config.vol_zscore_window - 1,
+            index=out.index,
+        )
+        valid_mask = slope_ok & out[core_cols].notna().all(axis=1) & vol_warmup_ok
+        if valid_mask.any():
+            first_valid_pos = int(np.argmax(valid_mask.to_numpy()))
+            out = out.iloc[first_valid_pos:].copy()
+        else:
+            out = out.iloc[0:0].copy()
+        out["vol_zscore"] = out["vol_zscore"].fillna(0.0)
     return out

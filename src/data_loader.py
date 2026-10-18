@@ -2,6 +2,7 @@
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
+import numpy as np
 import pandas as pd
 
 from src.config import TradingConfig
@@ -51,7 +52,7 @@ def _empty_ohlcv_frame() -> pd.DataFrame:
     )
 
 
-def _index_to_ms(index: pd.DatetimeIndex) -> pd.Index:
+def _index_to_ms(index: pd.DatetimeIndex) -> np.ndarray:
     return index.as_unit("ns").asi8 // 1_000_000
 
 

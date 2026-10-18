@@ -47,7 +47,9 @@ def generate_synthetic_ohlcv(
     volume = rng.lognormal(mean=4.0, sigma=0.3, size=n_candles)
     volume = np.where(spike, volume * rng.uniform(3.0, 6.0, size=n_candles), volume)
 
-    index = pd.date_range("2024-01-01", periods=n_candles, freq=f"{minutes}min", tz="UTC", name="timestamp")
+    index = pd.date_range(
+        "2024-01-01", periods=n_candles, freq=f"{minutes}min", tz="UTC", name="timestamp"
+    ).as_unit("ns")
     df = pd.DataFrame(
         {
             "open": open_.astype("float64"),

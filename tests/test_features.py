@@ -241,8 +241,6 @@ def test_drop_warmup_keeps_contiguous_index_with_constant_volume_mid_series():
     assert out.index[0] <= df.index[250]  # warmup chỉ vài trăm nến đầu
     assert all(ts in out.index for ts in df.index[300:330])
 
-    # Không có NaN ở các cột lõi; vol_zscore chỉ được NaN đúng trong đoạn volume hằng
-    core = [c for c in FEATURE_COLUMNS if c != "vol_zscore"]
-    assert not out[core].isna().any().any()
-    vz_nan = out.index[out["vol_zscore"].isna()]
-    assert all(df.index[300] <= ts <= df.index[329] for ts in vz_nan)
+    # Không còn NaN ở toàn bộ bảng sau warmup; đoạn volume hằng giữa chuỗi được điền vol_zscore = 0.0
+    assert not out[FEATURE_COLUMNS].isna().any().any()
+    assert (out.loc[df.index[319:330], "vol_zscore"] == 0.0).all()

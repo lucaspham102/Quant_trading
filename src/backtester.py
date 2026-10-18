@@ -62,7 +62,7 @@ class Backtester:
         side = pos.side
         exit_price = raw_exit * (1.0 - cfg.slippage) if side == 1 else raw_exit * (1.0 + cfg.slippage)
         gross = pos.qty * (exit_price - pos.entry_price) * side
-        fee = pos.qty * pos.entry_price * cfg.taker_fee + pos.qty * exit_price * cfg.taker_fee
+        fee = pos.entry_fee + pos.qty * exit_price * cfg.taker_fee
         net = gross - fee
         self.risk_manager.update_after_trade_close(net, exit_time)
         return TradeRecord(
@@ -96,7 +96,6 @@ class Backtester:
 
     # ------------------------------------------------------------------
     def run(self, df: pd.DataFrame) -> BacktestReport:
-        cfg = self.config
         sig_df = self.strategy.generate_signals(df)
 
         index = sig_df.index
@@ -122,22 +121,28 @@ class Backtester:
                 pos = None
 
             # b) Mở lệnh tại open[t] khi tín hiệu t-1 != 0
+            opened_this_bar = False
             if pos is None and prev_sig != 0:
                 pos = self._try_open(prev_sig, opens[t], atrs[t - 1], ts)
+                opened_this_bar = pos is not None
 
-            # c) Kiểm tra SL/TP trong [low[t], high[t]] (SL ưu tiên)
+            # c) Kiểm tra SL/TP trong [low[t], high[t]] (SL ưu tiên, xử lý gap qua open[t])
             if pos is not None:
                 if pos.side == 1:
                     hit_sl = lows[t] <= pos.stop_loss
                     hit_tp = highs[t] >= pos.take_profit
+                    raw_sl = pos.stop_loss if opened_this_bar else min(opens[t], pos.stop_loss)
+                    raw_tp = pos.take_profit if opened_this_bar else max(opens[t], pos.take_profit)
                 else:
                     hit_sl = highs[t] >= pos.stop_loss
                     hit_tp = lows[t] <= pos.take_profit
+                    raw_sl = pos.stop_loss if opened_this_bar else max(opens[t], pos.stop_loss)
+                    raw_tp = pos.take_profit if opened_this_bar else min(opens[t], pos.take_profit)
                 if hit_sl:
-                    trades.append(self._close_position(pos, pos.stop_loss, ts, "SL"))
+                    trades.append(self._close_position(pos, raw_sl, ts, "SL"))
                     pos = None
                 elif hit_tp:
-                    trades.append(self._close_position(pos, pos.take_profit, ts, "TP"))
+                    trades.append(self._close_position(pos, raw_tp, ts, "TP"))
                     pos = None
 
             # d) Đóng cưỡng bức ở nến cuối
@@ -169,10 +174,10 @@ class Backtester:
             sharpe = 0.0
         else:
             std = float(returns.std(ddof=1))
-            if not np.isfinite(std) or std == 0.0:
+            if not np.isfinite(std) or std <= 1e-12:
                 sharpe = 0.0
             else:
-                sharpe = float(returns.mean() / std * math.sqrt(365 * 24 * 4))
+                sharpe = float(returns.mean() / std * math.sqrt(cfg.candles_per_year))
 
         total_trades = len(trades)
         wins = [tr.net_pnl for tr in trades if tr.net_pnl > 0]

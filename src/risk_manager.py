@@ -24,6 +24,11 @@ class Position:
     notional: float                   # Giá trị danh nghĩa lúc vào lệnh = qty * entry_price
 
 
+def _to_utc_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
 class RiskManager:
     def __init__(self, config: TradingConfig = TradingConfig()) -> None:
         self.config = config
@@ -41,9 +46,7 @@ class RiskManager:
 
     def on_new_Timestamp(self, ts: pd.Timestamp) -> None:
         """Sang ngày UTC mới thì reset bộ đếm ngày và mở khóa circuit breaker."""
-        ts = pd.Timestamp(ts)
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert("UTC")
+        ts = _to_utc_timestamp(ts)
         day = ts.date()
         if self.current_utc_date != day:
             self.current_utc_date = day
@@ -53,6 +56,8 @@ class RiskManager:
 
     def can_open_trade(self, current_time: pd.Timestamp) -> bool:
         self.on_new_Timestamp(current_time)
+        if self.current_equity <= 0.0:
+            return False
         if self.circuit_breaker_tripped:
             return False
         if self._limit_hit():
@@ -61,6 +66,8 @@ class RiskManager:
         return True
 
     def calculate_position_size(self, entry_price: float, stop_loss: float) -> Optional[float]:
+        if self.current_equity <= 0.0:
+            return None
         if entry_price <= 0 or stop_loss <= 0:
             return None
         distance = abs(entry_price - stop_loss)
@@ -91,7 +98,8 @@ class RiskManager:
         take_profit: float,
         entry_time: pd.Timestamp,
     ) -> Optional[Position]:
-        if not self.can_open_trade(entry_time):
+        utc_entry_time = _to_utc_timestamp(entry_time)
+        if not self.can_open_trade(utc_entry_time):
             return None
         qty = self.calculate_position_size(entry_price, stop_loss)
         if qty is None:
@@ -104,7 +112,7 @@ class RiskManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
             qty=qty,
-            entry_time=pd.Timestamp(entry_time),
+            entry_time=utc_entry_time,
             entry_fee=notional * self.config.taker_fee,
             notional=notional,
         )

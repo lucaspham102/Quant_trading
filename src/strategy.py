@@ -14,6 +14,8 @@ class Strategy:
         """Sinh cột 'signal' (1/-1/0), 'stop_loss', 'take_profit' (NaN khi flat).
 
         Tín hiệu tại nến t chỉ dùng dữ liệu đã đóng đến t; thực thi ở open[t+1] (Backtester).
+        Hai cột 'stop_loss' và 'take_profit' ở đây là mức tham chiếu neo theo close[t];
+        khi khớp thực tế tại open[t+1], Backtester tính lại SL/TP theo giá entry đã gồm slippage.
         """
         cfg = self.config
         if not all(col in df.columns for col in features.FEATURE_COLUMNS):
