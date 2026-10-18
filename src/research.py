@@ -21,7 +21,7 @@ import pandas as pd
 from src import features
 from src.backtester import Backtester
 from src.config import TradingConfig, candles_per_year_for_timeframe
-from src.data_loader import DataLoader, ExchangeProtocol
+from src.data_loader import DataLoader, ExchangeProtocol, merge_and_deduplicate_ohlcv
 
 DEFAULT_SYMBOLS: tuple[str, ...] = (
     "BTC/USDT:USDT",
@@ -134,18 +134,57 @@ def load_or_fetch_symbol_data(
     use_synthetic: bool = False,
     synthetic_n: int = 2000,
 ) -> pd.DataFrame:
-    """Đọc cache Parquet (cập nhật tăng dần) hoặc tải mới; hỗ trợ chế độ synthetic offline."""
+    """Đọc cache Parquet và BACKFILL phần đầu còn thiếu để phủ đủ `days` ngày gần nhất.
+
+    - Nếu cache chưa phủ tới mốc `now - days` (vượt dung sai 1 nến), tải bù phần thiếu ở phía ĐẦU.
+    - Nếu cache đã phủ đủ cả đầu lẫn đuôi, trả cache luôn (không gọi mạng).
+    - Lỗi tải dữ liệu -> raise RuntimeError rõ ràng, KHÔNG fallback synthetic.
+    """
     if use_synthetic:
         return generate_synthetic_ohlcv(n_candles=synthetic_n, symbol=symbol, timeframe=timeframe)
     cfg = dataclasses.replace(
         TradingConfig(), symbol=symbol, timeframe=timeframe, raw_data_dir=Path(raw_data_dir)
     )
     loader = DataLoader(cfg, exchange=exchange)
-    since_ms = int((time.time() - days * 86400) * 1000)
-    if exchange is not None:
-        # FakeExchange trong unit test: tải trực tiếp, không cần cache.
-        return loader.fetch_historical_ohlcv(since_ms)
-    return loader.update_incremental(default_start_ms=since_ms)
+    tf_ms = loader.timeframe_ms
+    now_ms = int(exchange.milliseconds()) if exchange is not None else int(time.time() * 1000)
+    since_ms = now_ms - days * 86400 * 1000
+    tol_ms = tf_ms
+
+    path = loader.default_file_path()
+    if not path.exists():
+        return loader.update_incremental(default_start_ms=since_ms)
+
+    cached = loader.load_parquet()
+    if len(cached) == 0:
+        return loader.update_incremental(default_start_ms=since_ms)
+
+    first_ms = int(cached.index[0].timestamp() * 1000)
+    last_ms = int(cached.index[-1].timestamp() * 1000)
+    head_ok = first_ms <= since_ms + tol_ms
+    tail_ok = last_ms >= now_ms - 2 * tf_ms
+    if head_ok and tail_ok:
+        return cached  # cache đã phủ đủ khoảng yêu cầu -> không cần fetch
+
+    merged = cached
+    if not tail_ok:
+        merged = loader.update_incremental(default_start_ms=since_ms)
+
+    first_ms = int(merged.index[0].timestamp() * 1000)
+    if first_ms > since_ms + tol_ms:
+        head = loader.fetch_historical_ohlcv(since_ms, until_ms=first_ms - 1000)
+        if len(head) == 0:
+            since_ts = pd.Timestamp(since_ms, unit="ms", tz="UTC")
+            raise RuntimeError(
+                f"Không backfill được dữ liệu {symbol} {timeframe}: cache bắt đầu tại "
+                f"{merged.index[0]} nhưng yêu cầu {days} ngày (từ {since_ts}). "
+                f"Kiểm tra kết nối mạng / phạm vi dữ liệu của sàn."
+            )
+        merged = merge_and_deduplicate_ohlcv(merged, head)
+        merged.attrs["symbol"] = symbol
+        merged.attrs["timeframe"] = timeframe
+        loader.save_parquet(merged, path)
+    return merged
 
 
 def run_research_matrix(
