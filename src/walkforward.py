@@ -10,6 +10,7 @@ import math
 from pathlib import Path
 from typing import Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from src import features
@@ -373,6 +374,182 @@ def run_walkforward(
     return per_window_df, summary_df
 
 
+def run_null_test(
+    symbol: str,
+    timeframe: str = "1h",
+    days: int = 365,
+    train_days: int = 120,
+    test_days: int = 60,
+    step_days: int = 60,
+    n_iter: int = 100,
+    seed: int = 42,
+    candidates: Sequence[Candidate] = DEFAULT_CANDIDATES,
+    base_config: Optional[TradingConfig] = None,
+    fee_scenario: str = "real",
+    min_trades: int = 15,
+    max_drawdown_pct: float = 8.0,
+    buffer_days: int = 15,
+    raw_data_dir: Path = Path("data/raw"),
+    df: Optional[pd.DataFrame] = None,
+    exchange=None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Kiểm định Null Hypothesis Test cho Walk-Forward Engine.
+
+    Với mỗi cửa sổ trượt, so sánh lợi nhuận out-of-sample của cấu hình được tối ưu
+    trên tập train với phân phối null gồm n_iter lần chọn cấu hình ngẫu nhiên.
+    """
+    if base_config is not None:
+        base = dataclasses.replace(base_config, symbol=symbol, timeframe=timeframe)
+    else:
+        base = dataclasses.replace(
+            TradingConfig(),
+            use_fee_aware_sizing=True,
+            min_stop_distance_pct=0.008,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+    base = apply_fee_scenario(base, fee_scenario)
+
+    if df is None:
+        df = load_or_fetch_symbol_data(
+            symbol=symbol,
+            timeframe=timeframe,
+            days=days + buffer_days,
+            raw_data_dir=raw_data_dir,
+            exchange=exchange,
+        )
+
+    feat = features.add_all_features(df, base, drop_warmup=True)
+    windows = generate_walkforward_windows(
+        feat.index, train_days=train_days, test_days=test_days, step_days=step_days
+    )
+
+    rows: list[dict] = []
+
+    for w in windows:
+        train_frame = _slice_window(feat, w.train_start, w.train_end)
+        train_reports = {
+            cand: Backtester(make_candidate_config(base, cand, timeframe)).run(train_frame)
+            for cand in candidates
+        }
+        chosen = select_candidate(
+            train_reports, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct
+        )
+
+        test_frame = _slice_window(feat, w.test_start, w.test_end)
+
+        cand_test_returns = {
+            cand: float(
+                Backtester(make_candidate_config(base, cand, timeframe)).run(test_frame).total_return_pct
+            )
+            for cand in candidates
+        }
+
+        if chosen is None:
+            chosen_return = 0.0
+            chosen_label = "stand_aside"
+        else:
+            chosen_return = cand_test_returns.get(
+                chosen,
+                float(
+                    Backtester(make_candidate_config(base, chosen, timeframe))
+                    .run(test_frame)
+                    .total_return_pct
+                ),
+            )
+            trail_tag = "trail" if chosen.use_trailing_stop else "no_trail"
+            chosen_label = f"{chosen.strategy_mode}/{chosen.entry_mode}/{trail_tag}"
+
+        rng = np.random.default_rng(seed + w.window_index)
+        n_cands = len(candidates)
+        null = [
+            cand_test_returns[candidates[int(rng.integers(0, n_cands))]]
+            for _ in range(n_iter)
+        ]
+
+        arr = np.asarray(null, dtype=float)
+        p25 = float(np.percentile(arr, 25))
+        p75 = float(np.percentile(arr, 75))
+        mean = float(arr.mean())
+        mx = float(arr.max())
+        mn = float(arr.min())
+        percentile = float(np.mean(arr <= chosen_return) * 100.0)
+        beats_p75 = bool(chosen_return > p75)
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "window_index": w.window_index,
+                "test_start": w.test_start,
+                "test_end": w.test_end,
+                "chosen_label": chosen_label,
+                "chosen_test_return_pct": chosen_return,
+                "null_mean_return_pct": mean,
+                "null_p25_return_pct": p25,
+                "null_p75_return_pct": p75,
+                "null_max_return_pct": mx,
+                "chosen_percentile": percentile,
+                "beats_p75": beats_p75,
+            }
+        )
+
+    per_window_cols = [
+        "symbol",
+        "window_index",
+        "test_start",
+        "test_end",
+        "chosen_label",
+        "chosen_test_return_pct",
+        "null_mean_return_pct",
+        "null_p25_return_pct",
+        "null_p75_return_pct",
+        "null_max_return_pct",
+        "chosen_percentile",
+        "beats_p75",
+    ]
+    summary_cols = [
+        "symbol",
+        "n_windows",
+        "pct_windows_beating_p75",
+        "mean_chosen_return_pct",
+        "mean_null_p75_return_pct",
+        "mean_null_mean_return_pct",
+    ]
+
+    if rows:
+        per_window_df = pd.DataFrame(rows, columns=per_window_cols)
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "n_windows": len(rows),
+                    "pct_windows_beating_p75": float(per_window_df["beats_p75"].mean() * 100.0),
+                    "mean_chosen_return_pct": float(per_window_df["chosen_test_return_pct"].mean()),
+                    "mean_null_p75_return_pct": float(per_window_df["null_p75_return_pct"].mean()),
+                    "mean_null_mean_return_pct": float(per_window_df["null_mean_return_pct"].mean()),
+                }
+            ],
+            columns=summary_cols,
+        )
+    else:
+        per_window_df = pd.DataFrame(columns=per_window_cols)
+        summary_df = pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "n_windows": 0,
+                    "pct_windows_beating_p75": 0.0,
+                    "mean_chosen_return_pct": 0.0,
+                    "mean_null_p75_return_pct": 0.0,
+                    "mean_null_mean_return_pct": 0.0,
+                }
+            ],
+            columns=summary_cols,
+        )
+
+    return per_window_df, summary_df
+
+
 __all__ = [
     "Candidate",
     "DEFAULT_CANDIDATES",
@@ -382,6 +559,7 @@ __all__ = [
     "apply_fee_scenario",
     "generate_walkforward_windows",
     "make_candidate_config",
+    "run_null_test",
     "run_walkforward",
     "select_candidate",
 ]
