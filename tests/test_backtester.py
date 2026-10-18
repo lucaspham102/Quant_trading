@@ -682,4 +682,37 @@ def test_atr_trailing_stop_activates_after_threshold_and_applies_from_next_bar()
     assert ratchet_sl == pytest.approx(51000.0)
 
 
+def test_atr_trailing_activatable_with_default_config():
+    """Với cấu hình mặc định, trailing stop THỰC SỰ kích hoạt và thoát tại trailing SL (không phải TP/SL gốc)."""
+    from dataclasses import replace
+
+    cfg = replace(TradingConfig(), use_trailing_stop=True, use_breakeven=False)
+    # ATR=500 => sl = 2*500 = 1000; ngưỡng kích hoạt = 0.75*1000 = 750 (từ entry).
+    # entry = 50000*(1+SLIP) = 50010.0 ; initial_sl = 49010.0 ; TP = 50010 + 1500 = 51510.0
+    # Ngưỡng kích hoạt trailing = 50010 + 750 = 50760.0
+    rows = [
+        (50000, 50050, 49950, 50000, 1, 500),   # tín hiệu LONG -> khớp ở nến sau
+        (50000, 50200, 49500, 50100, 0, 500),   # mở LONG tại open=50000; high chưa đạt 50760 -> chưa kích hoạt
+        (50200, 51100, 50000, 51000, 0, 500),   # high=51100 >= 50760 -> kích hoạt; peak=51100 -> SL trailing = 51100-1000 = 50100 (hiệu lực nến sau)
+        (50100, 50300, 49900, 50000, 0, 500),   # low=49900 <= 50100 -> khớp trailing SL tại 50100
+        (50000, 50100, 49800, 49900, 0, 500),   # nến dư
+    ]
+    frame = make_frame(rows)
+    bt = Backtester(cfg, strategy=FakeStrategy(frame))
+    rep = bt.run(frame)
+
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    assert tr.exit_reason == "SL"  # KHÔNG phải "TP"
+    assert tr.exit_time == frame.index[3]
+    assert tr.exit_price == pytest.approx(50100.0 * (1.0 - SLIP))
+
+    # Kiểm chứng phản đề: cùng chuỗi nến nhưng TẮT trailing -> không chạm SL, đi hết dữ liệu
+    cfg_no_trail = replace(TradingConfig(), use_trailing_stop=False, use_breakeven=False)
+    rep_no_trail = Backtester(cfg_no_trail, strategy=FakeStrategy(frame)).run(frame)
+    assert rep_no_trail.total_trades == 1
+    assert rep_no_trail.trades[0].exit_reason == "END_OF_DATA"
+    assert rep_no_trail.trades[0].exit_price == pytest.approx(49900.0 * (1.0 - SLIP))
+
+
 

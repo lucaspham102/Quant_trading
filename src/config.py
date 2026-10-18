@@ -72,7 +72,7 @@ class TradingConfig:
     limit_pullback_atr_mult: float = 0.5
     limit_order_ttl_bars: int = 3
     use_trailing_stop: bool = False
-    trailing_activation_r: float = 1.5
+    trailing_activation_r: float = 0.75          # Ngưỡng kích hoạt trailing (× R0); phải thỏa trailing_activation_r*sl_atr_multiple < tp_atr_multiple
     trailing_atr_mult: float = 2.0
 
     # Sprint 3 - Phần B: Đa chiến lược & chế độ thị trường
@@ -88,6 +88,33 @@ class TradingConfig:
     mr_rsi_overbought: float = 70.0
     mr_rr_ratio: float = 1.5
     adaptive_trend_mode: Literal["trend_pullback", "breakout"] = "trend_pullback"
+
+    def __post_init__(self) -> None:
+        """Fail-fast: chặn cấu hình Trailing Stop không bao giờ có thể kích hoạt."""
+        if not self.use_trailing_stop:
+            return
+        if self.trailing_activation_r <= 0:
+            raise ValueError(
+                f"trailing_activation_r phải > 0 khi bật trailing, nhận: {self.trailing_activation_r}"
+            )
+        if self.sl_atr_multiple <= 0:
+            raise ValueError(
+                f"sl_atr_multiple phải > 0 khi bật trailing, nhận: {self.sl_atr_multiple}"
+            )
+        if self.trailing_atr_mult <= 0:
+            raise ValueError(
+                f"trailing_atr_mult phải > 0 khi bật trailing, nhận: {self.trailing_atr_mult}"
+            )
+        if self.tp_atr_multiple > 0:
+            activation_dist = self.trailing_activation_r * self.sl_atr_multiple
+            if activation_dist >= self.tp_atr_multiple:
+                raise ValueError(
+                    f"Cấu hình Trailing Stop vô hiệu: trailing_activation_r "
+                    f"({self.trailing_activation_r}) * sl_atr_multiple ({self.sl_atr_multiple}) = "
+                    f"{activation_dist:.4f} >= tp_atr_multiple ({self.tp_atr_multiple}). "
+                    f"Giá sẽ chạm TP trước khi trailing kích hoạt; hãy giảm trailing_activation_r "
+                    f"hoặc tăng tp_atr_multiple."
+                )
 
 
 def candles_per_year_for_timeframe(timeframe: str) -> int:
