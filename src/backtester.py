@@ -111,6 +111,19 @@ class Backtester:
         atrs = sig_df["atr"].to_numpy(dtype="float64")
         n = len(sig_df)
 
+        ml_probs: Optional[np.ndarray] = None
+        ml_threshold: float = float(self.config.ml_prob_threshold)
+        if self.config.use_ml and n > 0:
+            from src.ml_filter import _ensure_ml_feature_columns, compute_walk_forward_probs
+
+            sig_df = _ensure_ml_feature_columns(sig_df, self.config)
+            if self.ml_filter is not None and getattr(self.ml_filter, "is_fitted_", True):
+                ml_threshold = float(getattr(self.ml_filter, "prob_threshold", ml_threshold))
+                if hasattr(self.ml_filter, "predict_proba"):
+                    ml_probs = np.asarray(self.ml_filter.predict_proba(sig_df), dtype="float64")
+            else:
+                ml_probs = compute_walk_forward_probs(sig_df, self.config).to_numpy(dtype="float64")
+
         trades: list[TradeRecord] = []
         equity_vals = np.empty(n, dtype="float64")
         pos: Optional[Position] = None
@@ -127,8 +140,16 @@ class Backtester:
             # b) Mở lệnh tại open[t] khi tín hiệu t-1 != 0
             opened_this_bar = False
             if pos is None and prev_sig != 0:
-                pos = self._try_open(prev_sig, opens[t], atrs[t - 1], ts)
-                opened_this_bar = pos is not None
+                allow_open = True
+                if self.config.use_ml:
+                    if ml_probs is not None:
+                        prob_win = float(ml_probs[t - 1])
+                        allow_open = bool(np.isfinite(prob_win) and prob_win >= ml_threshold)
+                    elif self.ml_filter is not None and hasattr(self.ml_filter, "should_take"):
+                        allow_open = bool(self.ml_filter.should_take(sig_df.iloc[t - 1]))
+                if allow_open:
+                    pos = self._try_open(prev_sig, opens[t], atrs[t - 1], ts)
+                    opened_this_bar = pos is not None
 
             # c) Kiểm tra SL/TP trong [low[t], high[t]] (SL ưu tiên, xử lý gap qua open[t])
             if pos is not None:

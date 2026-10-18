@@ -71,15 +71,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--symbol", default="BTC/USDT:USDT", help="Cặp giao dịch")
     parser.add_argument("--timeframe", default="15m", help="Khung thời gian")
     parser.add_argument("--days", type=int, default=30, help="Số ngày lịch sử khi tải dữ liệu thật")
+    parser.add_argument("--use-ml", action="store_true", help="Bật bộ lọc ML Meta-Labeling (Purged Walk-Forward)")
     return parser.parse_args(argv)
 
 
 def format_report(report: BacktestReport, config: TradingConfig) -> str:
     pf = "inf" if np.isinf(report.profit_factor) else f"{report.profit_factor:.2f}"
+    ml_status = f"ON (p>={config.ml_prob_threshold:.2f})" if config.use_ml else "OFF"
     lines = [
         "=" * 46,
         f" BACKTEST REPORT - {config.symbol} ({config.timeframe})",
         "=" * 46,
+        f" ML Meta-Filter      : {ml_status:>14}",
         f" Initial Capital     : {config.initial_capital:>14.2f} USDT",
         f" Final Equity        : {report.final_equity:>14.2f} USDT",
         f" Total Return        : {report.total_return_pct:>14.2f} %",
@@ -96,7 +99,12 @@ def format_report(report: BacktestReport, config: TradingConfig) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    config = dataclasses.replace(TradingConfig(), symbol=args.symbol, timeframe=args.timeframe)
+    config = dataclasses.replace(
+        TradingConfig(),
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        use_ml=args.use_ml,
+    )
 
     try:
         if args.synthetic:
