@@ -36,6 +36,10 @@ def position_to_dict(pos: Position) -> dict[str, Any]:
         "initial_sl": float(raw.get("initial_sl", raw["stop_loss"])),
         "breakeven_activated": bool(raw.get("breakeven_activated", False)),
         "bars_held": int(raw.get("bars_held", 0)),
+        "trailing_activated": bool(raw.get("trailing_activated", False)),
+        "highest_price_since_entry": float(raw.get("highest_price_since_entry", raw["entry_price"])),
+        "lowest_price_since_entry": float(raw.get("lowest_price_since_entry", raw["entry_price"])),
+        "entry_order_type": "limit" if str(raw.get("entry_order_type", "market")) == "limit" else "market",
     }
 
 
@@ -61,6 +65,10 @@ def position_from_dict(data: Optional[dict[str, Any]]) -> Optional[Position]:
         initial_sl=initial_sl,
         breakeven_activated=bool(data.get("breakeven_activated", False)),
         bars_held=int(data.get("bars_held", 0)),
+        trailing_activated=bool(data.get("trailing_activated", False)),
+        highest_price_since_entry=float(data.get("highest_price_since_entry", 0.0) or 0.0),
+        lowest_price_since_entry=float(data.get("lowest_price_since_entry", 0.0) or 0.0),
+        entry_order_type="limit" if str(data.get("entry_order_type", "market")) == "limit" else "market",
     )
 
 

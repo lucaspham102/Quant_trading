@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -62,4 +63,36 @@ class TradingConfig:
     state_file_path: Path = Path("data/state/bot_state.json")
     live_lookback_candles: int = 300                 # Số nến lịch sử tối thiểu tải mỗi chu kỳ để tính đủ warmup
     poll_interval_seconds: float = 5.0               # Chu kỳ ngủ giữa các lần kiểm tra nến mới
+
+    # Sprint 3 - Phần A: Fee-aware sizing, Min Stop Distance, Limit Pullback, Trailing Stop
+    use_fee_aware_sizing: bool = False
+    min_stop_distance_pct: float = 0.0
+    min_stop_action: Literal["widen", "reject"] = "widen"
+    entry_mode: Literal["market", "limit_pullback"] = "market"
+    limit_pullback_atr_mult: float = 0.5
+    limit_order_ttl_bars: int = 3
+    use_trailing_stop: bool = False
+    trailing_activation_r: float = 1.5
+    trailing_atr_mult: float = 2.0
+
+    # Sprint 3 - Phần B: Đa chiến lược & chế độ thị trường
+    strategy_mode: Literal["breakout", "trend_pullback", "mean_reversion", "regime_adaptive"] = "breakout"
+    ema_pullback_period: int = 20
+    adx_period: int = 14
+    adx_threshold: float = 25.0
+    pullback_rsi_long_max: float = 50.0
+    pullback_rsi_short_min: float = 50.0
+    pullback_rr_ratio: float = 2.0
+    mr_bb_std_mult: float = 2.0
+    mr_rsi_oversold: float = 30.0
+    mr_rsi_overbought: float = 70.0
+    mr_rr_ratio: float = 1.5
+    adaptive_trend_mode: Literal["trend_pullback", "breakout"] = "trend_pullback"
+
+
+def candles_per_year_for_timeframe(timeframe: str) -> int:
+    """Số nến mỗi năm (365 ngày) theo khung thời gian: 15m -> 35040, 1h -> 8760."""
+    from src.data_loader import timeframe_to_ms  # import muộn để tránh vòng lặp import
+
+    return int((365 * 86_400_000) // timeframe_to_ms(timeframe))
 

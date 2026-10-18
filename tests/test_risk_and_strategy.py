@@ -239,3 +239,111 @@ def test_aware_non_utc_entry_time_normalized_to_utc():
     assert pos is not None
     assert str(pos.entry_time.tz) == "UTC"
     assert pos.entry_time == pd.Timestamp("2025-01-01 20:00", tz="UTC")
+
+
+# ------------------------- Sprint 3: Min stop & fee-aware sizing -------------------------
+
+def test_min_stop_distance_widen_and_reject():
+    from dataclasses import replace
+
+    from src.risk_manager import enforce_min_stop_distance
+
+    cfg = replace(TradingConfig(), min_stop_distance_pct=0.008)
+    entry = 50000.0
+    d_min = entry * 0.008  # 400
+
+    # Long: SL 0.3% < 0.8% -> nới ra đúng 0.8%, giữ R:R = 2.0
+    res = enforce_min_stop_distance(1, entry, 49850.0, 50300.0, cfg)
+    assert res is not None
+    sl, tp = res
+    assert sl == pytest.approx(entry - d_min)
+    assert (tp - entry) / (entry - sl) == pytest.approx(2.0)
+
+    # Short
+    res = enforce_min_stop_distance(-1, entry, 50150.0, 49700.0, cfg)
+    assert res is not None
+    sl, tp = res
+    assert sl == pytest.approx(entry + d_min)
+    assert (entry - tp) / (sl - entry) == pytest.approx(2.0)
+
+    # Đủ khoảng cách -> giữ nguyên
+    assert enforce_min_stop_distance(1, entry, 49500.0, 51000.0, cfg) == (49500.0, 51000.0)
+    # Khi nới SL, TP cũng được nới theo để BẢO TOÀN R:R ban đầu (spec §2.2.B)
+    res = enforce_min_stop_distance(1, entry, 49850.0, 52000.0, cfg)
+    assert res is not None
+    rr0 = (52000.0 - entry) / (entry - 49850.0)  # 13.333... giữ nguyên tỷ lệ
+    assert res[0] == pytest.approx(entry - d_min)
+    assert res[1] == pytest.approx(entry + rr0 * d_min)
+    # SL sai hướng -> None
+    assert enforce_min_stop_distance(1, entry, 50100.0, 51000.0, cfg) is None
+    assert enforce_min_stop_distance(-1, entry, 49900.0, 49000.0, cfg) is None
+    # min_stop_distance_pct = 0 -> giữ nguyên
+    assert enforce_min_stop_distance(1, entry, 49990.0, 50010.0, TradingConfig()) == (49990.0, 50010.0)
+
+    # reject
+    cfg_rej = replace(cfg, min_stop_action="reject")
+    assert enforce_min_stop_distance(1, entry, 49850.0, 50300.0, cfg_rej) is None
+    assert enforce_min_stop_distance(-1, entry, 50150.0, 49700.0, cfg_rej) is None
+
+    # build_position tích hợp
+    ts = pd.Timestamp("2025-01-01 10:00", tz="UTC")
+    pos = RiskManager(cfg).build_position(1, entry, 49850.0, 50300.0, ts)
+    assert pos is not None
+    assert pos.stop_loss == pytest.approx(entry - d_min)
+    assert pos.initial_sl == pytest.approx(entry - d_min)
+    assert RiskManager(cfg_rej).build_position(1, entry, 49850.0, 50300.0, ts) is None
+
+
+def test_fee_aware_sizing_caps_total_sl_loss_within_1pct_nav():
+    import math
+    from dataclasses import replace
+
+    base = TradingConfig()
+    cfg = replace(base, use_fee_aware_sizing=True)
+    entry = 50000.0
+    risk_amount = base.initial_capital * base.risk_per_trade_pct  # 4.0
+
+    for sl_pct in (0.004, 0.008):
+        sl = entry * (1.0 - sl_pct)
+        dist = entry - sl
+        eff = dist + entry * 2.0 * (cfg.taker_fee + cfg.slippage)
+        expected = round(math.floor(risk_amount / eff / cfg.step_size + 1e-9) * cfg.step_size, 12)
+
+        qty = RiskManager(cfg).calculate_position_size(entry, sl)
+        assert qty == pytest.approx(expected, abs=1e-12)
+        # Không bị kẹp bởi trần leverage 2.0x
+        assert qty * entry < base.initial_capital * base.max_effective_leverage
+        # Legacy (mặc định) sizing lớn hơn hoặc bằng fee-aware
+        legacy = RiskManager(base).calculate_position_size(entry, sl)
+        assert legacy is not None and legacy >= qty
+
+        # Khi chạm SL (kèm trượt giá + phí 2 chiều) lỗ ròng <= 4.0 USDT
+        exit_price = sl * (1.0 - cfg.slippage)
+        gross = qty * (exit_price - entry)
+        fees = qty * entry * cfg.taker_fee + qty * exit_price * cfg.taker_fee
+        net = gross - fees
+        assert abs(net) <= risk_amount + 1e-9
+
+        # Short đối xứng
+        sl_s = entry * (1.0 + sl_pct)
+        qty_s = RiskManager(cfg).calculate_position_size(entry, sl_s)
+        assert qty_s is not None
+        exit_s = sl_s * (1.0 + cfg.slippage)
+        net_s = qty_s * (entry - exit_s) - qty_s * entry * cfg.taker_fee - qty_s * exit_s * cfg.taker_fee
+        assert abs(net_s) <= risk_amount + 1e-9
+
+    # Maker entry: phí maker + taker + 2*slippage
+    sl = entry * (1.0 - 0.004)
+    qty_m = RiskManager(cfg).calculate_position_size(entry, sl, is_maker_entry=True)
+    eff_m = (entry - sl) + entry * (cfg.maker_fee + cfg.taker_fee + 2.0 * cfg.slippage)
+    assert qty_m is not None
+    assert qty_m * eff_m <= risk_amount + 1e-9
+
+    # build_position: entry_fee theo maker/taker
+    ts = pd.Timestamp("2025-01-01 10:00", tz="UTC")
+    pos_m = RiskManager(cfg).build_position(1, entry, sl, 51000.0, ts, is_maker_entry=True)
+    pos_t = RiskManager(cfg).build_position(1, entry, sl, 51000.0, ts)
+    assert pos_m is not None and pos_t is not None
+    assert pos_m.entry_fee == pytest.approx(pos_m.notional * cfg.maker_fee)
+    assert pos_t.entry_fee == pytest.approx(pos_t.notional * cfg.taker_fee)
+    assert pos_m.entry_order_type == "limit" and pos_t.entry_order_type == "market"
