@@ -183,6 +183,8 @@ def test_meta_label_filter_graceful_fallback_small_or_single_class():
     probs_zero = clf_all_zero.predict_proba(X_single.iloc[:4])
     assert probs_zero.shape == (4,)
     assert np.all((probs_zero >= 0.0) & (probs_zero <= 1.0))
+    assert np.allclose(probs_zero, 0.5)
+    assert clf_all_zero.fallback_prob_ == pytest.approx(0.5)
     assert clf_all_zero.should_take(X_single.iloc[0]) is False
 
     clf_all_one = MetaLabelFilter(CFG)
@@ -190,6 +192,7 @@ def test_meta_label_filter_graceful_fallback_small_or_single_class():
     assert clf_all_one.is_fitted_ is False
     probs_one = clf_all_one.predict_proba(X_single.iloc[:4])
     assert np.all(probs_one == pytest.approx(1.0))
+    assert clf_all_one.fallback_prob_ == pytest.approx(1.0)
     assert clf_all_one.should_take(X_single.iloc[0]) is True
 
     # Khi signal == 0 thì should_take luôn trả về False

@@ -20,6 +20,13 @@ from src.features import (
 )
 
 
+def _utc_ns_index(
+    periods: int, start: str = "2024-01-01", freq: str = "15min", name: str | None = None
+) -> pd.DatetimeIndex:
+    """Tạo DatetimeIndex UTC độ phân giải nanoseconds (pandas 3.x mặc định trả về 'us')."""
+    return pd.date_range(start, periods=periods, freq=freq, tz="UTC", name=name).as_unit("ns")
+
+
 def make_ohlcv(n: int, seed: int = 0, start_price: float = 100.0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     close = start_price * np.exp(np.cumsum(rng.normal(0.0, 0.005, n)))
@@ -73,7 +80,7 @@ def test_atr_wilder_formula():
 
 def test_atr_constant_range():
     n = 40
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    idx = _utc_ns_index(n)
     df = pd.DataFrame(
         {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0}, index=idx
     )
@@ -136,7 +143,7 @@ def test_volume_zscore_formula():
 
 
 def test_volume_zscore_zero_std_is_nan():
-    idx = pd.date_range("2024-01-01", periods=30, freq="15min", tz="UTC")
+    idx = _utc_ns_index(30)
     df = pd.DataFrame({"volume": np.full(30, 5.0)}, index=idx)
     z = compute_volume_zscore(df, 20)
     assert z.isna().all()
@@ -145,7 +152,7 @@ def test_volume_zscore_zero_std_is_nan():
 
 def test_regime_filter_states():
     n = 400
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    idx = _utc_ns_index(n)
     up = pd.DataFrame({"close": np.linspace(100.0, 500.0, n)}, index=idx)
     down = pd.DataFrame({"close": np.linspace(500.0, 100.0, n)}, index=idx)
     flat = pd.DataFrame({"close": np.full(n, 100.0)}, index=idx)

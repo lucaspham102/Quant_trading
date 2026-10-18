@@ -387,6 +387,13 @@ def test_breakeven_activates_only_from_next_bar_not_same_bar():
     assert tr.exit_time == frame.index[2]  # đóng ở nến t+1, KHÔNG đóng ở nến t (index[1])
     assert tr.exit_reason == "SL"
     assert tr.exit_price == pytest.approx(expected_exit)
+    # Breakeven SL đã cộng bù phí taker 2 chiều + slippage 2 chiều -> không lỗ sau phí.
+    # Kiểm tra chính xác biên expected_net_pnl theo công thức bù phí hòa vốn
+    # (phần dư nhỏ chỉ do làm tròn qty theo step_size).
+    expected_net_pnl = tr.qty * (tr.exit_price - tr.entry_price) * tr.side - tr.qty * (
+        tr.entry_price + tr.exit_price
+    ) * CFG.taker_fee
+    assert tr.net_pnl == pytest.approx(expected_net_pnl)
     assert tr.net_pnl >= 0.0
 
 
@@ -416,6 +423,11 @@ def test_breakeven_short_position_covers_round_trip_fees():
     assert tr.exit_time == frame.index[2]
     assert tr.exit_reason == "SL"
     assert tr.exit_price == pytest.approx(expected_exit)
+    # Breakeven SL đã cộng bù phí taker 2 chiều + slippage 2 chiều -> không lỗ sau phí.
+    expected_net_pnl = tr.qty * (tr.exit_price - tr.entry_price) * tr.side - tr.qty * (
+        tr.entry_price + tr.exit_price
+    ) * CFG.taker_fee
+    assert tr.net_pnl == pytest.approx(expected_net_pnl)
     assert tr.net_pnl >= 0.0
 
 
