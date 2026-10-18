@@ -27,7 +27,7 @@ def make_ohlcv(n: int, seed: int = 0, start_price: float = 100.0) -> pd.DataFram
     high = np.maximum(open_, close) * (1.0 + rng.uniform(0.0, 0.003, n))
     low = np.minimum(open_, close) * (1.0 - rng.uniform(0.0, 0.003, n))
     volume = rng.uniform(100.0, 200.0, n)
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     return pd.DataFrame(
         {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
         index=idx,
@@ -192,7 +192,7 @@ def make_extreme_future(T: int = 500, n_future: int = 50, seed: int = 7) -> pd.D
     high = np.maximum(prev, path) * (1.0 + rng.uniform(0.0, 0.2, n_future))
     low = np.minimum(prev, path) * (1.0 - rng.uniform(0.0, 0.2, n_future))
     volume = rng.uniform(1000.0, 5000.0, n_future)  # ~10-30x volume
-    idx = pd.date_range(base.index[-1] + pd.Timedelta(minutes=15), periods=n_future, freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range(base.index[-1] + pd.Timedelta(minutes=15), periods=n_future, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     fut = pd.DataFrame({"open": prev, "high": high, "low": low, "close": path, "volume": volume}, index=idx)
     return pd.concat([base, fut])
 

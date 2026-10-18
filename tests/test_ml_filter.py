@@ -167,8 +167,8 @@ def test_meta_label_filter_graceful_fallback_small_or_single_class():
     assert clf_small.is_fitted_ is False
     probs_small = clf_small.predict_proba(X_small)
     assert probs_small.shape == (5,)
-    assert np.all((probs_small >= 0.0) & (probs_small <= 1.0))
-    assert isinstance(clf_small.should_take(X_small.iloc[0]), bool)
+    assert np.allclose(probs_small, 1.0)
+    assert clf_small.should_take(X_small.iloc[0]) is True
 
     # 2) Tập train đủ mẫu (>= 30) nhưng chỉ có 1 lớp duy nhất (toàn 0 hoặc toàn 1)
     X_single = pd.DataFrame(
@@ -269,3 +269,84 @@ def test_backtester_with_use_ml_filters_low_probability_signals(capsys):
     assert exit_code == 0
     assert "ML Meta-Filter" in captured.out
     assert "ON" in captured.out
+
+
+def test_purged_walk_forward_split_respects_exit_bar_positions_when_purge_zero():
+    """[MEDIUM-01] PurgedWalkForwardSplit.split phải nhận exit_bar_positions và loại các mẫu train còn mở sang test ngay cả khi purge_bars=0."""
+    n_samples = 60
+    X = pd.DataFrame(np.zeros((n_samples, len(ML_FEATURE_COLUMNS))), columns=ML_FEATURE_COLUMNS)
+    bar_positions = np.arange(n_samples, dtype=np.int64) * 2
+    # Giả sử mỗi lệnh giữ kéo dài 15 nến (khi max_holding_bars=0 -> purge_bars=0)
+    exit_bar_positions = bar_positions + 15
+
+    splitter = PurgedWalkForwardSplit(n_splits=5, purge_bars=0, embargo_bars=4)
+    folds = splitter.split(
+        X,
+        bar_positions=bar_positions,
+        exit_bar_positions=exit_bar_positions,
+    )
+    assert len(folds) == 5
+    for train_idx, test_idx in folds:
+        assert len(test_idx) > 0
+        assert len(train_idx) > 0
+        assert (
+            int(exit_bar_positions[train_idx].max()) + splitter.embargo_bars
+            < int(bar_positions[test_idx].min())
+        )
+
+
+def test_compute_walk_forward_probs_runs_multi_fold_loop_out_of_sample():
+    """[LOW-01(d)] compute_walk_forward_probs chạy thực sự qua vòng lặp nhiều fold khi số tín hiệu >= n_splits + 1."""
+    n_bars = 260
+    df = _make_signal_frame(n=n_bars, seed=2025)
+    for i in range(n_bars):
+        df.iloc[i, df.columns.get_loc("open")] = 50000.0
+        df.iloc[i, df.columns.get_loc("high")] = 50100.0
+        df.iloc[i, df.columns.get_loc("low")] = 49900.0
+        df.iloc[i, df.columns.get_loc("close")] = 50000.0
+        df.iloc[i, df.columns.get_loc("atr")] = 500.0
+        df.iloc[i, df.columns.get_loc("signal")] = 0
+
+    # Đặt 60 tín hiệu cách nhau 4 nến (t = 0, 4, 8, ..., 236):
+    # Chẵn: rsi=65, vol_zscore=3.0 -> nến t+1 chạm TP (high=51600) -> label=1
+    # Lẻ:   rsi=35, vol_zscore=1.0 -> nến t+1 chạm SL (low=48800)  -> label=0
+    sig_positions: list[int] = []
+    for k in range(60):
+        t = k * 4
+        sig_positions.append(t)
+        df.iloc[t, df.columns.get_loc("signal")] = 1
+        if k % 2 == 0:
+            df.iloc[t, df.columns.get_loc("rsi")] = 65.0
+            df.iloc[t, df.columns.get_loc("vol_zscore")] = 3.0
+            df.iloc[t + 1, df.columns.get_loc("high")] = 51600.0
+        else:
+            df.iloc[t, df.columns.get_loc("rsi")] = 35.0
+            df.iloc[t, df.columns.get_loc("vol_zscore")] = 1.0
+            df.iloc[t + 1, df.columns.get_loc("low")] = 48800.0
+
+    cfg_wf = replace(
+        CFG,
+        use_ml=True,
+        ml_n_splits=4,
+        ml_min_train_samples=10,
+        max_holding_bars=2,
+        ml_embargo_bars=1,
+    )
+    probs = compute_walk_forward_probs(df, cfg_wf)
+    assert len(probs) == n_bars
+    # Các nến không có tín hiệu phải là NaN
+    non_sig_mask = df["signal"] == 0
+    assert probs.loc[non_sig_mask].isna().all()
+
+    # Các nến có tín hiệu đều có xác suất hợp lệ trong [0, 1]
+    sig_probs = probs.iloc[sig_positions]
+    assert sig_probs.notna().all()
+    assert np.all((sig_probs.to_numpy() >= 0.0) & (sig_probs.to_numpy() <= 1.0))
+
+    # Fold cuối (12 tín hiệu cuối, khi tập train đã >= 30 mẫu cả 2 lớp) phải được model đã fit dự đoán
+    # phân tách rõ nhóm thắng (chẵn) > 0.55 và nhóm thua (lẻ) < 0.55 (chứng minh vòng lặp fold đã fit thật)
+    last_fold_even_probs = [probs.iloc[sig_positions[k]] for k in range(48, 60, 2)]
+    last_fold_odd_probs = [probs.iloc[sig_positions[k]] for k in range(49, 60, 2)]
+    assert all(p >= 0.55 for p in last_fold_even_probs)
+    assert all(p < 0.55 for p in last_fold_odd_probs)
+

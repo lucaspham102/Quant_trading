@@ -25,7 +25,7 @@ class FakeStrategy:
 
 def make_frame(rows: list[tuple]) -> pd.DataFrame:
     """rows: (open, high, low, close, signal, atr)."""
-    idx = pd.date_range("2024-03-01", periods=len(rows), freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2024-03-01", periods=len(rows), freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     df = pd.DataFrame(rows, columns=["open", "high", "low", "close", "signal", "atr"], index=idx)
     df["volume"] = 100.0
     for c in ["open", "high", "low", "close", "atr"]:
@@ -182,7 +182,7 @@ def _synthetic_ohlcv(n: int = 3000, seed: int = 7) -> pd.DataFrame:
     high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.001, n)))
     low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.001, n)))
     vol = rng.lognormal(4.0, 0.3, n) * np.where(spike, 5.0, 1.0)
-    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close, "volume": vol}, index=idx)
     df.attrs["symbol"] = "BTC/USDT:USDT"
     df.attrs["timeframe"] = "15m"
@@ -297,7 +297,7 @@ def test_short_gap_through_take_profit_exits_at_open():
 
 def _sharpe_from_equity(cfg: TradingConfig, values) -> float:
     bt = Backtester(cfg, strategy=FakeStrategy(pd.DataFrame()))
-    idx = pd.date_range("2024-01-01", periods=len(values), freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2024-01-01", periods=len(values), freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     curve = pd.Series(np.asarray(values, dtype="float64"), index=idx, name="equity")
     return bt._build_report(curve, []).sharpe_ratio
 
@@ -454,4 +454,48 @@ def test_time_based_exit_closes_at_close_with_slippage():
     assert tr.gross_pnl == pytest.approx(gross)
     assert tr.total_fee == pytest.approx(fee)
     assert tr.net_pnl == pytest.approx(gross - fee)
+
+
+def test_breakeven_gap_through_stop_loss_at_next_bar_open():
+    """[LOW-01(b)] Gap qua Breakeven SL ở đầu nến t+1 phải thoát tại open[t+1] (kèm slippage)."""
+    from src.strategy import compute_breakeven_price
+
+    # 1) Long: nến 1 đạt >= +1R (high=51100 >= 51010) kích hoạt breakeven (be_sl ~ 50080.014).
+    #    Nến 2 (t+1) mở cửa gap xuống dưới be_sl tại open=49500 -> thoát tại 49500 * (1 - SLIP).
+    rows_long = [
+        (50000, 50050, 49950, 50000, 1, 500),
+        (50000, 51100, 49900, 50500, 0, 500),
+        (49500, 49600, 49400, 49550, 0, 500),
+        (49550, 49600, 49500, 49550, 0, 500),
+    ]
+    rep_l, frame_l = run_fake(rows_long)
+    assert rep_l.total_trades == 1
+    tr_l = rep_l.trades[0]
+    entry_l = 50000.0 * (1.0 + SLIP)
+    be_sl_l = compute_breakeven_price(entry_l, 1, CFG)
+    assert 49500.0 < be_sl_l
+    assert tr_l.entry_time == frame_l.index[1]
+    assert tr_l.exit_time == frame_l.index[2]
+    assert tr_l.exit_reason == "SL"
+    assert tr_l.exit_price == pytest.approx(49500.0 * (1.0 - SLIP))
+
+    # 2) Short: nến 1 đạt >= +1R (low=48900 <= 48990) kích hoạt breakeven (be_sl ~ 49920.014).
+    #    Nến 2 (t+1) mở cửa gap lên trên be_sl tại open=50500 -> thoát tại 50500 * (1 + SLIP).
+    rows_short = [
+        (50000, 50050, 49950, 50000, -1, 500),
+        (50000, 50100, 48900, 49500, 0, 500),
+        (50500, 50600, 50400, 50450, 0, 500),
+        (50450, 50500, 50400, 50450, 0, 500),
+    ]
+    rep_s, frame_s = run_fake(rows_short)
+    assert rep_s.total_trades == 1
+    tr_s = rep_s.trades[0]
+    entry_s = 50000.0 * (1.0 - SLIP)
+    be_sl_s = compute_breakeven_price(entry_s, -1, CFG)
+    assert 50500.0 > be_sl_s
+    assert tr_s.entry_time == frame_s.index[1]
+    assert tr_s.exit_time == frame_s.index[2]
+    assert tr_s.exit_reason == "SL"
+    assert tr_s.exit_price == pytest.approx(50500.0 * (1.0 + SLIP))
+
 

@@ -89,7 +89,7 @@ def test_circuit_breaker_single_big_loss():
 # ------------------------------- Strategy -------------------------------
 
 def _feature_frame(rows):
-    idx = pd.date_range("2025-01-01", periods=len(rows), freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2025-01-01", periods=len(rows), freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     df = pd.DataFrame(rows, index=idx)
     for col in ["close", "atr", "rsi", "donchian_upper", "donchian_lower", "vol_zscore"]:
         df[col] = df[col].astype("float64")
@@ -148,7 +148,7 @@ def _make_ohlcv(n, seed, extreme_tail=0):
     spread = np.abs(rng.normal(0, 0.002, n)) * close
     high = np.maximum(open_, close) + spread
     low = np.minimum(open_, close) - spread
-    idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC", name="timestamp")
+    idx = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC", name="timestamp").as_unit("ns")
     return pd.DataFrame(
         {"open": open_, "high": high, "low": low, "close": close, "volume": vol}, index=idx
     )

@@ -256,6 +256,7 @@ class PurgedWalkForwardSplit:
         self,
         X: pd.DataFrame | np.ndarray,
         bar_positions: Optional[np.ndarray | pd.Series | Sequence[int]] = None,
+        exit_bar_positions: Optional[np.ndarray | pd.Series | Sequence[int]] = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
         """Chia chuỗi mẫu theo thứ tự thời gian thành `n_splits` cặp (train_idx, test_idx) nguyên."""
         n_samples = len(X)
@@ -272,6 +273,12 @@ class PurgedWalkForwardSplit:
             if n_samples > 1 and np.any(np.diff(pos_arr) < 0):
                 raise ValueError("bar_positions phải được sắp xếp tăng dần theo thời gian.")
 
+        exit_arr: Optional[np.ndarray] = None
+        if exit_bar_positions is not None:
+            exit_arr = np.asarray(exit_bar_positions, dtype=np.int64)
+            if exit_arr.ndim != 1 or len(exit_arr) != n_samples:
+                raise ValueError("exit_bar_positions phải là mảng 1 chiều có cùng độ dài với X.")
+
         block_size = n_samples // (self.n_splits + 1)
         effective_gap = self.purge_bars + self.embargo_bars
         splits: list[tuple[np.ndarray, np.ndarray]] = []
@@ -281,16 +288,21 @@ class PurgedWalkForwardSplit:
             e_test = (k + 2) * block_size if k < self.n_splits - 1 else n_samples
             test_idx = np.arange(s_test, e_test, dtype=np.int64)
 
-            if pos_arr is None:
+            if pos_arr is None and exit_arr is None:
                 train_end = max(0, s_test - effective_gap)
                 train_idx = np.arange(0, train_end, dtype=np.int64)
             else:
-                candidates = np.arange(0, s_test, dtype=np.int64)
-                mask = (pos_arr[candidates] + effective_gap < pos_arr[s_test]) & (
-                    candidates + effective_gap < s_test
-                    if np.array_equal(pos_arr, np.arange(n_samples, dtype=np.int64))
-                    else pos_arr[candidates] + effective_gap < pos_arr[s_test]
+                base_pos = (
+                    pos_arr
+                    if pos_arr is not None
+                    else np.arange(n_samples, dtype=np.int64)
                 )
+                candidates = np.arange(0, s_test, dtype=np.int64)
+                mask = base_pos[candidates] + effective_gap < base_pos[s_test]
+                if exit_arr is not None:
+                    mask = mask & (
+                        exit_arr[candidates] + self.embargo_bars < base_pos[s_test]
+                    )
                 train_idx = candidates[mask]
 
             splits.append((train_idx, test_idx))
@@ -429,7 +441,7 @@ def compute_walk_forward_probs(
     if len(signal_bar_positions) == 0:
         return probs
 
-    X, y, _ = build_meta_dataset(work_df, config)
+    X, y, exit_positions = build_meta_dataset(work_df, config)
     default_filter = MetaLabelFilter(config)
     # Khối khởi đầu (fold 0 chưa có tập train trước đó) dùng fallback_prob_ của model chưa fit
     probs.loc[X.index] = default_filter.fallback_prob_
@@ -443,7 +455,11 @@ def compute_walk_forward_probs(
         purge_bars=max(0, int(config.max_holding_bars)),
         embargo_bars=max(0, int(config.ml_embargo_bars)),
     )
-    folds = splitter.split(X, bar_positions=signal_bar_positions)
+    folds = splitter.split(
+        X,
+        bar_positions=signal_bar_positions,
+        exit_bar_positions=exit_positions.to_numpy(dtype=np.int64),
+    )
 
     for train_idx, test_idx in folds:
         if len(test_idx) == 0:

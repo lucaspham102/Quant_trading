@@ -130,6 +130,7 @@ class Backtester:
 
         for t in range(n):
             ts = index[t]
+            self.risk_manager.on_new_Timestamp(ts)
             prev_sig = int(signals[t - 1]) if t > 0 and not pd.isna(signals[t - 1]) else 0
 
             # a) Đảo chiều tại open[t] nếu tín hiệu t-1 ngược vị thế đang mở

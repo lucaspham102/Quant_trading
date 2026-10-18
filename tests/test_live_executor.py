@@ -3,6 +3,7 @@ import dataclasses
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -10,6 +11,7 @@ import run_live
 from src.config import TradingConfig
 from src.data_loader import DataLoader, timeframe_to_ms
 from src.live_executor import LiveExecutor
+from src.ml_filter import ML_FEATURE_COLUMNS, MetaLabelFilter
 from src.notifier import TelegramNotifier
 from src.risk_manager import RiskManager
 from src.state_store import StateStore
@@ -214,6 +216,15 @@ def test_atomic_persistence_restores_open_position_and_daily_pnl(tmp_path: Path)
     assert len(executor2.trade_history) == 1
     assert executor2.trade_history[0].exit_reason == "SL"
 
+    # Nến 5: Chạy tiếp trên executor2 để xác nhận vị thế khôi phục đóng lệnh TP bình thường
+    rows.append((48800.0, 48850.0, 47500.0, 47600.0, 0, 400.0))
+    assert executor2.process_closed_candles(_make_signal_df(rows)) is True
+    assert executor2.open_position is None
+    assert len(executor2.trade_history) == 2
+    assert executor2.trade_history[-1].exit_reason == "TP"
+    assert executor2.risk_manager.consecutive_losses == 0
+
+
 
 def test_fault_tolerance_survives_network_and_notifier_exceptions(tmp_path: Path) -> None:
     """(b) Kiểm tra khả năng chịu lỗi khi exchange ném RuntimeError và notifier ném ConnectionError."""
@@ -381,3 +392,202 @@ def test_live_mode_orders_breakeven_time_exit_and_cli(tmp_path: Path) -> None:
     )
     assert exit_code == 0
     assert cli_state.exists()
+
+
+def test_live_executor_auto_trains_unfitted_ml_filter_on_closed_history(tmp_path: Path) -> None:
+    """[HIGH-01] Khi config.use_ml=True và ml_filter chưa fit, LiveExecutor phải tự train trên cửa sổ lịch sử đã đóng."""
+    state_file = tmp_path / "ml_auto_fit_state.json"
+    cfg = dataclasses.replace(
+        TradingConfig(),
+        state_file_path=state_file,
+        use_ml=True,
+        ml_prob_threshold=0.55,
+        ml_min_train_samples=30,
+        max_holding_bars=48,
+    )
+    ml_filter = MetaLabelFilter(cfg, random_state=42)
+    assert ml_filter.is_fitted_ is False
+
+    n_bars = 200
+    rows = [(50000.0, 50100.0, 49900.0, 50000.0, 0, 500.0) for _ in range(n_bars)]
+    df = _make_signal_df(rows)
+    for col in ML_FEATURE_COLUMNS:
+        if col != "signal":
+            df[col] = 0.0
+
+    # Đặt 40 tín hiệu lịch sử đã đóng hoàn toàn (t = 2, 5, ..., 119; 119 + 48 < 199):
+    # Chẵn: rsi=65, vol_zscore=3.0 -> chạm TP ở t+1 (high=51600) -> label=1
+    # Lẻ:   rsi=35, vol_zscore=1.0 -> chạm SL ở t+1 (low=48800)  -> label=0
+    for k in range(40):
+        t = 2 + k * 3
+        df.iloc[t, df.columns.get_loc("signal")] = 1
+        if k % 2 == 0:
+            df.iloc[t, df.columns.get_loc("rsi")] = 65.0
+            df.iloc[t, df.columns.get_loc("vol_zscore")] = 3.0
+            df.iloc[t + 1, df.columns.get_loc("high")] = 51600.0
+        else:
+            df.iloc[t, df.columns.get_loc("rsi")] = 35.0
+            df.iloc[t, df.columns.get_loc("vol_zscore")] = 1.0
+            df.iloc[t + 1, df.columns.get_loc("low")] = 48800.0
+
+    # Nến cuối cùng (t=199) phát tín hiệu Long nhưng có đặc trưng xác suất thắng thấp (rsi=35, vol_zscore=1.0)
+    df.iloc[-1, df.columns.get_loc("signal")] = 1
+    df.iloc[-1, df.columns.get_loc("rsi")] = 35.0
+    df.iloc[-1, df.columns.get_loc("vol_zscore")] = 1.0
+
+    executor = LiveExecutor(
+        config=cfg,
+        mode="paper",
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+        ml_filter=ml_filter,
+    )
+
+    assert executor.process_closed_candles(df) is True
+    assert ml_filter.is_fitted_ is True
+    # Vì ml_filter đã được fit, tín hiệu chất lượng thấp ở nến cuối phải bị từ chối
+    assert executor.open_position is None
+
+
+def test_live_mode_open_position_reanchors_sl_initial_sl_and_tp_to_fill_price(tmp_path: Path) -> None:
+    """[HIGH-02] Khi sàn khớp giá thực tế fill_px lệch khỏi ref_price ở mode='live', phải tính lại initial_sl/stop_loss/take_profit theo fill_px."""
+
+    class FillDeviationExchange(StaticExchange):
+        def __init__(self, fill_price: float) -> None:
+            super().__init__(raw_rows=[], now_ms=_T0_MS)
+            self.fill_price = fill_price
+
+        def create_order(
+            self,
+            symbol: str,
+            type: str,
+            side: str,
+            amount: float,
+            price: Optional[float] = None,
+            params: Optional[dict[str, Any]] = None,
+        ) -> dict[str, Any]:
+            order = super().create_order(symbol, type, side, amount, price, params)
+            order["average"] = self.fill_price
+            return order
+
+    state_file = tmp_path / "fill_reanchor_state.json"
+    cfg = dataclasses.replace(TradingConfig(), state_file_path=state_file)
+    fill_px = 50250.0  # lệch rõ so với ref_price=50000.0
+    atr_val = 500.0
+
+    exchange = FillDeviationExchange(fill_price=fill_px)
+    loader = DataLoader(cfg, exchange=exchange)
+    executor = LiveExecutor(
+        config=cfg,
+        mode="live",
+        data_loader=loader,
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+    )
+
+    rows = [(50000.0, 50050.0, 49950.0, 50000.0, 1, atr_val)]
+    assert executor.process_closed_candles(_make_signal_df(rows)) is True
+    pos = executor.open_position
+    assert pos is not None
+    assert pos.entry_price == pytest.approx(fill_px)
+    assert pos.stop_loss == pytest.approx(fill_px - cfg.sl_atr_multiple * atr_val)
+    assert pos.initial_sl == pytest.approx(fill_px - cfg.sl_atr_multiple * atr_val)
+    assert pos.take_profit == pytest.approx(fill_px + cfg.tp_atr_multiple * atr_val)
+    assert abs(pos.entry_price - pos.initial_sl) == pytest.approx(cfg.sl_atr_multiple * atr_val)
+
+
+def test_live_executor_time_exit_takes_precedence_over_signal_reverse_on_same_bar(tmp_path: Path) -> None:
+    """[MEDIUM-02] Khi nến đóng đồng thời đạt max_holding_bars và có tín hiệu ngược chiều, lý do thoát phải là TIME_EXIT nhất quán với Backtester."""
+    state_file = tmp_path / "time_exit_vs_reverse.json"
+    cfg = dataclasses.replace(
+        TradingConfig(),
+        state_file_path=state_file,
+        max_holding_bars=2,
+    )
+    executor = LiveExecutor(
+        config=cfg,
+        mode="paper",
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+    )
+
+    # Nến 1: Mở vị thế Long (bars_held = 0)
+    rows = [(50000.0, 50050.0, 49950.0, 50000.0, 1, 500.0)]
+    assert executor.process_closed_candles(_make_signal_df(rows)) is True
+    assert executor.open_position is not None
+    assert executor.open_position.bars_held == 0
+
+    # Nến 2: Giữ vị thế Long (bars_held = 1 < max_holding_bars=2)
+    rows.append((50000.0, 50100.0, 49900.0, 50020.0, 0, 500.0))
+    assert executor.process_closed_candles(_make_signal_df(rows)) is True
+    assert executor.open_position is not None
+    assert executor.open_position.bars_held == 1
+
+    # Nến 3: Đồng thời đạt bars_held=2 == max_holding_bars VÀ xuất hiện tín hiệu ngược chiều (sig=-1)
+    rows.append((50020.0, 50100.0, 49920.0, 50050.0, -1, 500.0))
+    assert executor.process_closed_candles(_make_signal_df(rows)) is True
+    assert len(executor.trade_history) == 1
+    assert executor.trade_history[0].exit_reason == "TIME_EXIT"
+
+
+def test_live_executor_utc_day_rollover_resets_daily_pnl_and_unlocks_circuit_breaker(tmp_path: Path) -> None:
+    """[LOW-01(c)] Đổi ngày UTC trong LiveExecutor phải reset daily_realized_pnl về 0 và mở khóa circuit_breaker_tripped."""
+    state_file = tmp_path / "utc_rollover_state.json"
+    # Đặt max_daily_drawdown_pct=0.01 (4 USDT trên vốn 400 USDT) để 1 lệnh thua SL (~ -4.4 USDT) kích hoạt circuit breaker
+    cfg = dataclasses.replace(
+        TradingConfig(),
+        state_file_path=state_file,
+        max_daily_drawdown_pct=0.01,
+    )
+    executor = LiveExecutor(
+        config=cfg,
+        mode="paper",
+        strategy=PassthroughStrategy(),  # type: ignore[arg-type]
+        state_store=StateStore(state_file),
+        notifier=TelegramNotifier(env_file=None),
+    )
+
+    def _df_with_timestamps(
+        items: list[tuple[str, float, float, float, float, int, float]]
+    ) -> pd.DataFrame:
+        idx = pd.DatetimeIndex([pd.Timestamp(x[0], tz="UTC") for x in items], name="timestamp").as_unit("ns")
+        df = pd.DataFrame(
+            [x[1:] for x in items],
+            columns=["open", "high", "low", "close", "signal", "atr"],
+            index=idx,
+        )
+        df["volume"] = 100.0
+        for col in ("open", "high", "low", "close", "atr", "volume"):
+            df[col] = df[col].astype("float64")
+        df["signal"] = df["signal"].astype("int64")
+        return df
+
+    # Nến 1 (2025-01-01 23:15 UTC): Mở Long
+    items = [("2025-01-01 23:15:00", 50000.0, 50050.0, 49950.0, 50000.0, 1, 500.0)]
+    assert executor.process_closed_candles(_df_with_timestamps(items)) is True
+    assert executor.open_position is not None
+
+    # Nến 2 (2025-01-01 23:30 UTC): Chạm SL -> lỗ > 4 USDT -> kích hoạt circuit_breaker_tripped
+    items.append(("2025-01-01 23:30:00", 49900.0, 49950.0, 48800.0, 48900.0, 0, 500.0))
+    assert executor.process_closed_candles(_df_with_timestamps(items)) is True
+    assert executor.open_position is None
+    assert executor.risk_manager.daily_realized_pnl < -4.0
+    assert executor.risk_manager.circuit_breaker_tripped is True
+
+    # Nến 3 (2025-01-01 23:45 UTC - cùng ngày UTC): Có tín hiệu Long mới nhưng bị chặn bởi circuit breaker
+    items.append(("2025-01-01 23:45:00", 48900.0, 49000.0, 48850.0, 48950.0, 1, 500.0))
+    assert executor.process_closed_candles(_df_with_timestamps(items)) is True
+    assert executor.open_position is None
+    assert executor.risk_manager.circuit_breaker_tripped is True
+
+    # Nến 4 (2025-01-02 00:00:00 UTC - sang ngày UTC mới): Reset daily_realized_pnl=0, mở khóa circuit breaker và vào lệnh
+    items.append(("2025-01-02 00:00:00", 48950.0, 49050.0, 48900.0, 49000.0, 1, 500.0))
+    assert executor.process_closed_candles(_df_with_timestamps(items)) is True
+    assert executor.risk_manager.daily_realized_pnl == pytest.approx(0.0)
+    assert executor.risk_manager.circuit_breaker_tripped is False
+    assert executor.open_position is not None
+    assert executor.open_position.side == 1
+

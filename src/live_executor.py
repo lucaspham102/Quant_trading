@@ -16,7 +16,11 @@ from src.data_loader import (
     drop_incomplete_last_candle,
     raw_ohlcv_to_dataframe,
 )
-from src.ml_filter import MetaLabelFilter, _ensure_ml_feature_columns
+from src.ml_filter import (
+    MetaLabelFilter,
+    _ensure_ml_feature_columns,
+    build_meta_dataset,
+)
 from src.notifier import TelegramNotifier
 from src.risk_manager import Position, RiskManager
 from src.state_store import StateStore, _to_utc_timestamp, trade_record_from_dict
@@ -171,6 +175,7 @@ class LiveExecutor:
         )
         self.trade_history.append(record)
         self.open_position = None
+        self.save_state()
         self.notifier.notify_trade_close(
             record, equity=self.risk_manager.current_equity, mode=self.mode
         )
@@ -212,11 +217,21 @@ class LiveExecutor:
                 avg_px = order.get("average") or order.get("price")
                 if avg_px is not None and float(avg_px) > 0:
                     fill_px = float(avg_px)
+                    if side == 1:
+                        new_sl = fill_px - cfg.sl_atr_multiple * atr_val
+                        new_tp = fill_px + cfg.tp_atr_multiple * atr_val
+                    else:
+                        new_sl = fill_px + cfg.sl_atr_multiple * atr_val
+                        new_tp = fill_px - cfg.tp_atr_multiple * atr_val
                     pos.entry_price = fill_px
+                    pos.stop_loss = new_sl
+                    pos.initial_sl = new_sl
+                    pos.take_profit = new_tp
                     pos.notional = pos.qty * fill_px
                     pos.entry_fee = pos.notional * cfg.taker_fee
 
         self.open_position = pos
+        self.save_state()
         self.notifier.notify_trade_open(pos, mode=self.mode)
         return pos
 
@@ -271,7 +286,7 @@ class LiveExecutor:
                 raw_atr = atr_series.iloc[-1] if len(atr_series) > 0 else np.nan
             atr_val = float(raw_atr) if not pd.isna(raw_atr) else float("nan")
 
-            # 1) Quản trị vị thế đang mở (SL/TP -> Đảo chiều -> Breakeven -> Time Exit)
+            # 1) Quản trị vị thế đang mở (SL/TP -> Breakeven -> Time Exit -> Đảo chiều)
             if self.open_position is not None:
                 pos = self.open_position
                 if pos.side == 1:
@@ -289,8 +304,6 @@ class LiveExecutor:
                     self._close_position(pos, raw_sl, latest_ts, "SL")
                 elif hit_tp:
                     self._close_position(pos, raw_tp, latest_ts, "TP")
-                elif sig in (1, -1) and sig == -pos.side:
-                    self._close_position(pos, c_close, latest_ts, "SIGNAL_REVERSE")
                 else:
                     if self.config.use_breakeven and not pos.breakeven_activated:
                         if is_breakeven_triggered(pos, c_high, c_low, self.config):
@@ -309,11 +322,31 @@ class LiveExecutor:
                         and pos.bars_held >= self.config.max_holding_bars
                     ):
                         self._close_position(pos, c_close, latest_ts, "TIME_EXIT")
+                    elif sig in (1, -1) and sig == -pos.side:
+                        self._close_position(pos, c_close, latest_ts, "SIGNAL_REVERSE")
 
             # 2) Mở vị thế mới nếu đang flat và có tín hiệu hợp lệ
             if self.open_position is None and sig in (1, -1):
                 allow_open = True
-                if self.config.use_ml and self.ml_filter is not None:
+                if self.config.use_ml:
+                    if self.ml_filter is None:
+                        self.ml_filter = MetaLabelFilter(self.config)
+                    if (
+                        not getattr(self.ml_filter, "is_fitted_", False)
+                        and len(sig_df) > 1
+                    ):
+                        history_df = sig_df.iloc[:-1]
+                        X_hist, y_hist, exit_pos_hist = build_meta_dataset(
+                            history_df, self.config
+                        )
+                        if len(X_hist) > 0:
+                            valid_mask = exit_pos_hist.to_numpy(dtype=np.int64) < (
+                                len(history_df) - 1
+                            )
+                            if int(valid_mask.sum()) > 0:
+                                self.ml_filter.fit(
+                                    X_hist.iloc[valid_mask], y_hist.iloc[valid_mask]
+                                )
                     allow_open = bool(self.ml_filter.should_take(last_row))
                 if allow_open and self.risk_manager.can_open_trade(latest_ts):
                     side_lit: Literal[1, -1] = 1 if sig == 1 else -1
