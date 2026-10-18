@@ -195,9 +195,13 @@ def test_full_pipeline_real_strategy_conservation():
     assert isinstance(rep, BacktestReport)
     assert rep.final_equity == pytest.approx(CFG.initial_capital + sum(t.net_pnl for t in rep.trades))
     assert rep.total_fees_paid == pytest.approx(sum(t.total_fee for t in rep.trades))
+    equity_before = CFG.initial_capital
     for t in rep.trades:
         assert t.net_pnl == pytest.approx(t.gross_pnl - t.total_fee)
-        assert t.qty * t.entry_price <= CFG.initial_capital * 10 * CFG.max_effective_leverage
+        notional = t.qty * t.entry_price
+        assert notional <= equity_before * CFG.max_effective_leverage + 1e-9
+        assert notional >= CFG.min_notional - 1e-9
+        equity_before += t.net_pnl
 
 
 def test_report_fields_and_sane_values():
@@ -224,3 +228,130 @@ def test_report_fields_and_sane_values():
     assert all(isinstance(t, TradeRecord) for t in rep.trades)
     assert rep.final_equity == pytest.approx(400.0 + sum(t.net_pnl for t in rep.trades))
     assert rep.total_fees_paid > 0
+
+
+# ------------------------------------------------------------------
+# [MEDIUM-01] Gap-through SL/TP: giá thoát phải nằm trong thực tế có thể khớp
+# ------------------------------------------------------------------
+
+def test_long_gap_through_stop_loss_exits_at_open():
+    rows = [
+        (50000, 50050, 49950, 50000, 1, 500),    # tín hiệu LONG
+        (50000, 50100, 49900, 50000, 0, 500),    # vào lệnh, entry~50010, SL~49010, không chạm
+        (48000, 48500, 47500, 48200, 0, 500),    # gap xuống dưới SL: open=48000
+        (48200, 48250, 48150, 48200, 0, 500),
+    ]
+    rep, _ = run_fake(rows)
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    assert tr.exit_reason == "SL"
+    assert tr.exit_price == pytest.approx(48000 * (1 - SLIP))  # min(open, SL) rồi trừ slippage
+    assert 47500 <= tr.exit_price <= 48500
+
+
+def test_short_gap_through_stop_loss_exits_at_open():
+    rows = [
+        (50000, 50050, 49950, 50000, -1, 500),   # tín hiệu SHORT
+        (50000, 50100, 49900, 50000, 0, 500),    # entry~49990, SL~50990
+        (52000, 52500, 51500, 51800, 0, 500),    # gap lên trên SL: open=52000
+        (51800, 51850, 51750, 51800, 0, 500),
+    ]
+    rep, _ = run_fake(rows)
+    assert rep.total_trades == 1
+    tr = rep.trades[0]
+    assert tr.exit_reason == "SL"
+    assert tr.exit_price == pytest.approx(52000 * (1 + SLIP))  # max(open, SL) rồi cộng slippage
+    assert 51500 <= tr.exit_price <= 52500
+
+
+def test_long_gap_through_take_profit_exits_at_open():
+    rows = [
+        (50000, 50050, 49950, 50000, 1, 500),
+        (50000, 50100, 49900, 50000, 0, 500),    # entry~50010, TP~51510
+        (53000, 53500, 52800, 53200, 0, 500),    # gap lên trên TP: open=53000
+        (53200, 53250, 53150, 53200, 0, 500),
+    ]
+    rep, _ = run_fake(rows)
+    tr = rep.trades[0]
+    assert tr.exit_reason == "TP"
+    # Conservative: thoát tại open thực tế (>= TP) trừ slippage, không dưới mức TP
+    assert tr.exit_price == pytest.approx(53000 * (1 - SLIP))
+
+
+def test_short_gap_through_take_profit_exits_at_open():
+    rows = [
+        (50000, 50050, 49950, 50000, -1, 500),
+        (50000, 50100, 49900, 50000, 0, 500),    # entry~49990, TP~48490
+        (47000, 47200, 46500, 46800, 0, 500),    # gap xuống dưới TP: open=47000
+        (46800, 46850, 46750, 46800, 0, 500),
+    ]
+    rep, _ = run_fake(rows)
+    tr = rep.trades[0]
+    assert tr.exit_reason == "TP"
+    assert tr.exit_price == pytest.approx(47000 * (1 + SLIP))
+
+
+# ------------------------------------------------------------------
+# [MEDIUM-03] Sharpe năm hóa theo config
+# ------------------------------------------------------------------
+
+def _sharpe_from_equity(cfg: TradingConfig, values) -> float:
+    bt = Backtester(cfg, strategy=FakeStrategy(pd.DataFrame()))
+    idx = pd.date_range("2024-01-01", periods=len(values), freq="15min", tz="UTC", name="timestamp")
+    curve = pd.Series(np.asarray(values, dtype="float64"), index=idx, name="equity")
+    return bt._build_report(curve, []).sharpe_ratio
+
+
+def test_sharpe_annualization_uses_config_candles_per_year():
+    from dataclasses import replace
+
+    values = [400.0, 402.0, 401.0, 404.0, 403.0, 407.0, 406.0, 410.0, 409.0, 412.0]
+    cfg_1h = replace(CFG, timeframe="1h", candles_per_year=365 * 24)
+    cfg_4h = replace(CFG, timeframe="4h", candles_per_year=365 * 6)
+
+    rets = pd.Series(values).pct_change().dropna()
+    base = float(rets.mean() / rets.std(ddof=1))
+
+    assert _sharpe_from_equity(CFG, values) == pytest.approx(base * math.sqrt(365 * 24 * 4))
+    assert _sharpe_from_equity(cfg_1h, values) == pytest.approx(base * math.sqrt(365 * 24))
+    assert _sharpe_from_equity(cfg_4h, values) == pytest.approx(base * math.sqrt(365 * 6))
+    # Tỷ lệ 1h/15m = sqrt(1/4)
+    assert _sharpe_from_equity(cfg_1h, values) / _sharpe_from_equity(CFG, values) == pytest.approx(0.5)
+
+
+def test_sharpe_zero_when_returns_constant_float_noise():
+    # Lợi suất hằng số 1% -> std ~ 1e-17 do sai số dấu phẩy động, phải trả 0.0
+    values = [100.0 * (1.01 ** k) for k in range(12)]
+    assert len(pd.Series(values).pct_change().dropna()) >= 2
+    assert _sharpe_from_equity(CFG, values) == 0.0
+
+
+def test_sharpe_zero_when_equity_flat():
+    assert _sharpe_from_equity(CFG, [400.0] * 6) == 0.0
+
+
+# ------------------------------------------------------------------
+# [LOW-04] Pandas 3.0: đơn vị thời gian ns & _index_to_ms
+# ------------------------------------------------------------------
+
+def test_generate_synthetic_ohlcv_index_is_utc_ns():
+    from run_backtest import generate_synthetic_ohlcv
+
+    df = generate_synthetic_ohlcv(n_candles=50, seed=1)
+    assert isinstance(df.index, pd.DatetimeIndex)
+    assert str(df.index.tz) == "UTC"
+    assert df.index.unit == "ns"
+    assert str(df.index.dtype) == "datetime64[ns, UTC]"
+
+
+def test_index_to_ms_returns_int64_ndarray_with_exact_values():
+    from src.data_loader import _index_to_ms
+
+    base_ms = 1_704_067_200_000  # 2024-01-01T00:00:00Z
+    expected = np.array([base_ms + k * 900_000 for k in range(4)], dtype="int64")
+    for unit in ("ns", "us", "ms"):
+        idx = pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC").as_unit(unit)
+        got = _index_to_ms(idx)
+        assert isinstance(got, np.ndarray)
+        assert got.dtype == np.int64
+        np.testing.assert_array_equal(got, expected)

@@ -188,3 +188,54 @@ def test_strategy_no_look_ahead_bias():
     assert np.allclose(
         feat_sub.to_numpy(dtype="float64"), feat_full.to_numpy(dtype="float64"), equal_nan=True
     )
+
+
+# ------------------------------------------------------------------
+# [MEDIUM-02] current_equity <= 0
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_equity", [0.0, -5.0])
+def test_non_positive_equity_blocks_trading_same_day(bad_equity):
+    rm = RiskManager(TradingConfig())
+    ts = pd.Timestamp("2025-01-01 08:00", tz="UTC")
+    assert rm.can_open_trade(ts) is True  # khởi tạo ngày với equity 400
+    rm.current_equity = bad_equity        # daily_start_equity vẫn 400, chưa chạm giới hạn lỗ ngày
+    assert rm.can_open_trade(pd.Timestamp("2025-01-01 08:15", tz="UTC")) is False
+    assert rm.calculate_position_size(50000.0, 49000.0) is None
+    assert rm.build_position(1, 50000.0, 49000.0, 53000.0, pd.Timestamp("2025-01-01 08:15", tz="UTC")) is None
+
+
+@pytest.mark.parametrize("bad_equity", [0.0, -5.0])
+def test_non_positive_equity_blocks_trading_on_new_utc_day(bad_equity):
+    rm = RiskManager(TradingConfig())
+    assert rm.can_open_trade(pd.Timestamp("2025-01-01 08:00", tz="UTC")) is True
+    rm.current_equity = bad_equity
+    new_day = pd.Timestamp("2025-01-02 00:00", tz="UTC")
+    assert rm.can_open_trade(new_day) is False
+    assert rm.calculate_position_size(50000.0, 49000.0) is None
+
+
+# ------------------------------------------------------------------
+# [LOW-03] tz-naive timestamp coi là UTC
+# ------------------------------------------------------------------
+
+def test_naive_timestamp_treated_as_utc_in_risk_manager():
+    rm = RiskManager(TradingConfig())
+    naive = pd.Timestamp("2025-01-01 23:45")
+    rm.on_new_Timestamp(naive)
+    assert rm.current_utc_date == pd.Timestamp("2025-01-01", tz="UTC").date()
+
+    pos = rm.build_position(1, 50000.0, 49000.0, 53000.0, naive)
+    assert pos is not None
+    assert pos.entry_time.tzinfo is not None
+    assert pos.entry_time.utcoffset() == pd.Timedelta(0)
+    assert pos.entry_time == pd.Timestamp("2025-01-01 23:45", tz="UTC")
+
+
+def test_aware_non_utc_entry_time_normalized_to_utc():
+    rm = RiskManager(TradingConfig())
+    ts = pd.Timestamp("2025-01-02 03:00", tz="Asia/Bangkok")  # = 2025-01-01 20:00 UTC
+    pos = rm.build_position(1, 50000.0, 49000.0, 53000.0, ts)
+    assert pos is not None
+    assert str(pos.entry_time.tz) == "UTC"
+    assert pos.entry_time == pd.Timestamp("2025-01-01 20:00", tz="UTC")

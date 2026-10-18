@@ -217,3 +217,32 @@ def test_no_look_ahead_bias():
 
     # Sanity: phần tương lai thực sự cực đoan (test có tác dụng)
     assert feat_full["atr"].iloc[T:].max() > 5 * feat_full["atr"].iloc[T - 1]
+
+
+# ------------------------------------------------------------------
+# [LOW-01] drop_warmup không được xóa nến giữa chuỗi
+# ------------------------------------------------------------------
+
+def test_drop_warmup_keeps_contiguous_index_with_constant_volume_mid_series():
+    n = 600
+    df = make_ohlcv(n, seed=11)
+    df.iloc[300:330, df.columns.get_loc("volume")] = 150.0  # >=20 nến volume hằng -> vol_zscore NaN
+    cfg = TradingConfig()
+
+    full = add_all_features(df, cfg, drop_warmup=False)
+    assert full["vol_zscore"].iloc[325:330].isna().all()  # tiền đề của test
+
+    out = add_all_features(df, cfg, drop_warmup=True)
+
+    # Chỉ cắt warmup ở đầu: phần còn lại là đuôi liên tục của chuỗi gốc
+    assert out.index[-1] == df.index[-1]
+    assert out.index.equals(df.index[len(df) - len(out):])
+    assert (out.index.to_series().diff().dropna() == pd.Timedelta(minutes=15)).all()
+    assert out.index[0] <= df.index[250]  # warmup chỉ vài trăm nến đầu
+    assert all(ts in out.index for ts in df.index[300:330])
+
+    # Không có NaN ở các cột lõi; vol_zscore chỉ được NaN đúng trong đoạn volume hằng
+    core = [c for c in FEATURE_COLUMNS if c != "vol_zscore"]
+    assert not out[core].isna().any().any()
+    vz_nan = out.index[out["vol_zscore"].isna()]
+    assert all(df.index[300] <= ts <= df.index[329] for ts in vz_nan)
