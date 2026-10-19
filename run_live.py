@@ -86,6 +86,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Khung thời gian nến (mặc định: 15m)",
     )
     parser.add_argument(
+        "--strategy",
+        choices=("directional", "dynamic_carry"),
+        default="directional",
+        help="Chien luoc van hanh: directional (mac dinh) hoac dynamic_carry (Sprint 8)",
+    )
+    parser.add_argument(
         "--strategy-mode",
         choices=("breakout", "trend_pullback", "mean_reversion", "regime_adaptive"),
         default="breakout",
@@ -139,6 +145,48 @@ def main(argv: list[str] | None = None) -> int:
         state_path = Path(tempfile.gettempdir()) / "quant_trading_pytest_bot_state.json"
     else:
         state_path = TradingConfig().state_file_path
+
+    if getattr(args, "strategy", "directional") == "dynamic_carry":
+        logger.info("=" * 60)
+        logger.info("QUANT TRADING BOT STARTING (DYNAMIC CARRY)")
+        logger.info("Mode: %s | Strategy: dynamic_carry", args.mode)
+        logger.info("State file: %s", state_path)
+        logger.info("=" * 60)
+
+        from src.carry_live_executor import CarryLiveExecutor
+        from src.dynamic_carry_basis import DynamicCarryConfig
+
+        perp_exchange = None
+        spot_exchange = None
+        if not (args.synthetic or in_pytest):
+            try:
+                import ccxt
+
+                perp_exchange = ccxt.binanceusdm({"enableRateLimit": True})
+                spot_exchange = ccxt.binance({"enableRateLimit": True})
+            except Exception as e:
+                logger.warning(
+                    "Could not initialize live exchanges (%s), falling back to offline cache",
+                    e,
+                )
+                perp_exchange = None
+                spot_exchange = None
+
+        carry_config = DynamicCarryConfig()
+        trading_config = dataclasses.replace(
+            TradingConfig(),
+            timeframe=args.timeframe,
+            state_file_path=state_path,
+        )
+        executor = CarryLiveExecutor(
+            config=trading_config,
+            carry_config=carry_config,
+            mode=args.mode,
+            state_store=StateStore(state_path),
+            perp_exchange=perp_exchange,
+            spot_exchange=spot_exchange,
+        )
+        return executor.run_loop(once=bool(args.once))
 
     config = dataclasses.replace(
         TradingConfig(),
