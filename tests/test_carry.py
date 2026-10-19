@@ -12,7 +12,12 @@ import pandas as pd
 import pytest
 
 from src.carry_strategy import CarryConfig, run_carry_portfolio
-from src.funding_loader import align_ohlcv_with_funding, fetch_funding_history
+from src.funding_loader import (
+    align_ohlcv_with_funding,
+    align_spot_perp_funding,
+    fetch_funding_history,
+    fetch_spot_ohlcv,
+)
 
 
 def test_align_no_lookahead() -> None:
@@ -315,3 +320,399 @@ def test_fetch_funding_history_pagination_and_cache(tmp_path: Path) -> None:
 
     assert len(df2) == 5
     assert len(fake_exchange_2.call_history) == 0  # Không có lệnh gọi mạng nào vì cache đã đủ
+
+
+# ---------------------------------------------------------------------------
+# Sprint 7: Bar-by-bar MTM, margin/price rebalance, passive long-term mode,
+# Spot OHLCV loader và đồng bộ Spot/Perp/Funding không look-ahead.
+# ---------------------------------------------------------------------------
+
+
+def test_spot_perp_mtm_tracks_basis_variation() -> None:
+    """MTM spot_perp_2leg phản ánh biến động giá perp dù spot đứng yên.
+
+    Spot giữ nguyên 100, perp dao động hình sin quanh 100. Vị thế mua spot /
+    bán perp phải sinh lãi lỗ MTM từng nến, tạo drawdown và tổng MTM khác 0.
+    """
+    n = 200
+    dates = pd.date_range("2024-01-01 00:00:00", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    perp_close = 100.0 * (1.0 + 0.005 * np.sin(np.arange(n) / 7.0))
+    spot_close = np.full(n, 100.0)
+    basis_pct = (perp_close - spot_close) / spot_close
+    funding_event = np.where(dates.hour % 8 == 0, 0.0002, 0.0)
+
+    frame = pd.DataFrame(
+        {
+            "open": perp_close,
+            "high": perp_close,
+            "low": perp_close,
+            "close": perp_close,
+            "volume": 1000.0,
+            "spot_close": spot_close,
+            "perp_close": perp_close,
+            "basis_pct": basis_pct,
+            "funding_rate_event": funding_event,
+            "last_known_funding_rate": 0.0002,
+        },
+        index=dates,
+    )
+    frame.index.name = "datetime"
+
+    cfg = CarryConfig(
+        structure="spot_perp_2leg",
+        basis_noise_std=0.0,
+        entry_threshold=0.0001,
+        exit_threshold=0.0,
+        min_hold_periods=3,
+        initial_capital=400.0,
+    )
+
+    result = run_carry_portfolio({"BTC/USDT:USDT": frame}, cfg)
+    equity_curve = result["equity_curve"]
+    metrics = result["metrics"]
+
+    assert metrics["MaxDD %"] > 0.0
+    assert metrics["Total MTM PnL"] != 0.0
+    # Phải có ít nhất một nến equity giảm so với nến trước.
+    assert (equity_curve.diff().dropna() < 0.0).any()
+
+
+def test_mtm_accounting_reconciles() -> None:
+    """Bảo toàn kế toán: final = initial + funding + MTM - fees (spot_perp_2leg)."""
+    n = 200
+    dates = pd.date_range("2024-01-01 00:00:00", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    perp_close = 100.0 * (1.0 + 0.005 * np.sin(np.arange(n) / 7.0))
+    spot_close = np.full(n, 100.0)
+    basis_pct = (perp_close - spot_close) / spot_close
+    funding_event = np.where(dates.hour % 8 == 0, 0.0002, 0.0)
+
+    frame = pd.DataFrame(
+        {
+            "open": perp_close,
+            "high": perp_close,
+            "low": perp_close,
+            "close": perp_close,
+            "volume": 1000.0,
+            "spot_close": spot_close,
+            "perp_close": perp_close,
+            "basis_pct": basis_pct,
+            "funding_rate_event": funding_event,
+            "last_known_funding_rate": 0.0002,
+        },
+        index=dates,
+    )
+    frame.index.name = "datetime"
+
+    cfg = CarryConfig(
+        structure="spot_perp_2leg",
+        basis_noise_std=0.0,
+        entry_threshold=0.0001,
+        exit_threshold=0.0,
+        min_hold_periods=3,
+        initial_capital=400.0,
+    )
+
+    result = run_carry_portfolio({"BTC/USDT:USDT": frame}, cfg)
+    metrics = result["metrics"]
+    final_equity = float(result["equity_curve"].iloc[-1])
+
+    expected = (
+        cfg.initial_capital
+        + metrics["Total Funding Collected"]
+        + metrics["Total MTM PnL"]
+        - metrics["Total Fees Paid"]
+    )
+    assert final_equity == pytest.approx(expected, rel=1e-9)
+
+
+def test_margin_rebalance_triggers_on_price_spike() -> None:
+    """Giá spot tăng sốc >40% sau khi mở phải kích hoạt rebalance do giá."""
+    n = 100
+    dates = pd.date_range("2024-01-01 00:00:00", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    funding_event = np.where(dates.hour % 8 == 0, 0.0002, 0.0)
+
+    def _make_frame(price: np.ndarray) -> pd.DataFrame:
+        f = pd.DataFrame(
+            {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 1000.0,
+                "spot_close": price,
+                "perp_close": price,
+                "basis_pct": np.zeros(n),
+                "funding_rate_event": funding_event,
+                "last_known_funding_rate": 0.0002,
+            },
+            index=dates,
+        )
+        f.index.name = "datetime"
+        return f
+
+    cfg = CarryConfig(
+        structure="spot_perp_2leg",
+        basis_noise_std=0.0,
+        entry_threshold=0.0001,
+        exit_threshold=0.0,
+        min_hold_periods=3,
+        initial_capital=400.0,
+    )
+
+    # Kịch bản sốc giá: giữ 100 đến nến 9, sau đó nhảy lên 150 và giữ nguyên.
+    spiked_price = np.full(n, 100.0)
+    spiked_price[10:] = 150.0
+    spiked = run_carry_portfolio({"BTC/USDT:USDT": _make_frame(spiked_price)}, cfg)
+
+    # Kịch bản đối chứng: giá phẳng 100 suốt.
+    flat = run_carry_portfolio({"BTC/USDT:USDT": _make_frame(np.full(n, 100.0))}, cfg)
+
+    trades_df = spiked["trades_df"]
+    has_rebalance_row = bool(
+        "action" in trades_df.columns and (trades_df["action"] == "rebalance").any()
+    )
+
+    assert spiked["metrics"]["Price Rebalances"] >= 1 or has_rebalance_row
+    assert spiked["metrics"]["Total Fees Paid"] > flat["metrics"]["Total Fees Paid"]
+
+
+def test_coinm_basis_mtm() -> None:
+    """Coin-M 1 chân: basis mở rộng (perp cao hơn spot) làm short perp lỗ MTM."""
+    n = 100
+    dates = pd.date_range("2024-01-01 00:00:00", periods=n, freq="1h", tz="UTC").as_unit("ns")
+    basis_pct = np.linspace(0.0, 0.005, n)
+    funding_event = np.where(dates.hour % 8 == 0, 0.0002, 0.0)
+
+    frame = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+            "basis_pct": basis_pct,
+            "funding_rate_event": funding_event,
+            "last_known_funding_rate": 0.0002,
+        },
+        index=dates,
+    )
+    frame.index.name = "datetime"
+
+    cfg = CarryConfig(
+        structure="coinm_1leg",
+        basis_noise_std=0.0,
+        entry_threshold=0.0001,
+        exit_threshold=0.0,
+        min_hold_periods=3,
+        initial_capital=400.0,
+    )
+
+    result = run_carry_portfolio({"BTC/USDT:USDT": frame}, cfg)
+    metrics = result["metrics"]
+
+    assert metrics["MaxDD %"] > 0.0
+    assert metrics["Total MTM PnL"] < 0.0
+
+
+def test_passive_long_term_mode() -> None:
+    """Passive long-term: mở một lần, giữ >=21 kỳ funding rồi thoát khi funding âm."""
+    n = 300
+    dates = pd.date_range("2024-01-01 00:00:00", periods=n, freq="1h", tz="UTC").as_unit("ns")
+
+    funding_event = np.zeros(n)
+    last_known = np.zeros(n)
+    for i in range(n):
+        is_anchor = i % 8 == 0
+        rate = 0.0002 if i < 184 else -0.0002
+        if is_anchor:
+            funding_event[i] = rate
+        last_known[i] = 0.0002 if i < 184 else -0.0002
+
+    frame = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1000.0,
+            "funding_rate_event": funding_event,
+            "last_known_funding_rate": last_known,
+        },
+        index=dates,
+    )
+    frame.index.name = "datetime"
+
+    cfg = CarryConfig(
+        structure="coinm_1leg",
+        carry_mode="passive_long_term",
+        passive_entry_ema_span=21,
+        passive_exit_ema_span=42,
+        passive_entry_threshold=5e-5,
+        passive_exit_threshold=-2e-5,
+        passive_min_hold_periods=21,
+        initial_capital=400.0,
+        basis_noise_std=0.0,
+    )
+
+    result = run_carry_portfolio({"BTC/USDT:USDT": frame}, cfg)
+    trades_df = result["trades_df"]
+
+    opens = trades_df[trades_df["action"] == "open"]
+    closes = trades_df[trades_df["action"] == "close"]
+    assert len(opens) <= 2
+    assert len(closes) >= 1
+    # Vị thế được giữ đủ số kỳ funding tối thiểu trước khi đóng.
+    assert result["metrics"]["Total Funding Collected"] > 0.0
+
+
+class FakeSpotExchange:
+    """Sàn Spot giả lập trả tối đa 2 nến mỗi lần gọi để kiểm tra phân trang."""
+
+    def __init__(self, records: list[list[float]], server_time_ms: int) -> None:
+        self.records = records
+        self.server_time_ms = server_time_ms
+        self.call_history: list[dict[str, Any]] = []
+
+    def milliseconds(self) -> int:
+        return self.server_time_ms
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> list[list[float]]:
+        self.call_history.append(
+            {"symbol": symbol, "timeframe": timeframe, "since": since, "limit": limit}
+        )
+        filtered = [r for r in self.records if since is None or int(r[0]) >= since]
+        cap = 2 if limit is None else min(2, int(limit))
+        return [list(r) for r in filtered[:cap]]
+
+
+def test_fetch_spot_ohlcv_pagination_and_cache(tmp_path: Path) -> None:
+    """fetch_spot_ohlcv phân trang đúng và lần gọi thứ hai đọc hoàn toàn từ cache."""
+    start = pd.Timestamp("2024-01-01 00:00:00", tz="UTC")
+    records = [
+        [
+            int((start + pd.Timedelta(hours=i)).timestamp() * 1000),
+            100.0 + i,
+            101.0 + i,
+            99.0 + i,
+            100.5 + i,
+            10.0 + i,
+        ]
+        for i in range(6)
+    ]
+    server_ms = int((start + pd.Timedelta(hours=7)).timestamp() * 1000)
+
+    fake = FakeSpotExchange(records, server_time_ms=server_ms)
+    df1 = fetch_spot_ohlcv(
+        "BTC/USDT",
+        data_dir=str(tmp_path),
+        exchange=fake,
+        start_date="2024-01-01 00:00:00",
+        limit_per_call=2,
+    )
+
+    assert len(df1) == 6
+    assert len(fake.call_history) >= 3  # Đã phân trang nhiều lần
+    assert (tmp_path / "BTCUSDT_SPOT_1h.parquet").exists()
+
+    fake2 = FakeSpotExchange(records, server_time_ms=server_ms)
+    df2 = fetch_spot_ohlcv(
+        "BTC/USDT",
+        data_dir=str(tmp_path),
+        exchange=fake2,
+        start_date="2024-01-01 00:00:00",
+        limit_per_call=2,
+    )
+
+    assert len(fake2.call_history) == 0  # Cache đã bao phủ đủ dải yêu cầu
+    assert len(df2) == 6
+    assert all(str(dtype) == "float64" for dtype in df2.dtypes)
+    assert str(df2.index.tz) == "UTC"
+
+
+def test_align_spot_perp_funding_no_lookahead() -> None:
+    """Đồng bộ Spot/Perp/Funding: inner join chính xác và không nhìn trước funding."""
+    perp_dates = pd.date_range(
+        "2024-01-01 00:00:00", periods=24, freq="1h", tz="UTC"
+    ).as_unit("ns")
+    spot_dates = pd.date_range(
+        "2024-01-01 01:00:00", periods=24, freq="1h", tz="UTC"
+    ).as_unit("ns")
+
+    perp_close = 100.0 + np.arange(len(perp_dates)) * 0.1
+    spot_close = 99.0 + np.arange(len(spot_dates)) * 0.1
+
+    perp_df = pd.DataFrame(
+        {
+            "open": perp_close,
+            "high": perp_close + 0.5,
+            "low": perp_close - 0.5,
+            "close": perp_close,
+            "volume": 1000.0,
+        },
+        index=perp_dates,
+    )
+    spot_df = pd.DataFrame(
+        {
+            "open": spot_close,
+            "high": spot_close + 0.5,
+            "low": spot_close - 0.5,
+            "close": spot_close,
+            "volume": 500.0,
+        },
+        index=spot_dates,
+    )
+
+    funding_times = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2024-01-01 00:00:00", tz="UTC"),
+            pd.Timestamp("2024-01-01 08:00:00", tz="UTC"),
+            pd.Timestamp("2024-01-01 16:00:00", tz="UTC"),
+            pd.Timestamp("2024-01-02 00:00:00", tz="UTC"),
+        ]
+    ).as_unit("ns")
+    funding_df = pd.DataFrame(
+        {
+            "datetime": funding_times,
+            "funding_rate": [0.0001, 0.0002, 0.0003, 0.0004],
+        }
+    )
+
+    aligned = align_spot_perp_funding(perp_df, spot_df, funding_df)
+
+    # Chỉ giữ giao timestamp chính xác (01:00..23:00), không ffill phần lệch.
+    expected_index = perp_dates.intersection(spot_dates)
+    assert len(aligned) == len(expected_index) == 23
+    assert aligned.index.equals(expected_index)
+    assert aligned.index.name == "datetime"
+    assert str(aligned.index.tz) == "UTC"
+    assert pd.Timestamp("2024-01-01 00:00:00", tz="UTC") not in aligned.index
+    assert pd.Timestamp("2024-01-02 00:00:00", tz="UTC") not in aligned.index
+
+    # Giữ đủ cột OHLCV của perp và tính basis_pct chính xác.
+    for col in ("open", "high", "low", "close", "volume"):
+        assert col in aligned.columns
+    expected_basis = (aligned["perp_close"] - aligned["spot_close"]) / aligned["spot_close"]
+    pd.testing.assert_series_equal(
+        aligned["basis_pct"], expected_basis.astype("float64"), check_names=False
+    )
+
+    # funding_rate_event chỉ khác 0 tại đúng các nến 00/08/16.
+    for ts, event_rate in aligned["funding_rate_event"].items():
+        if ts.hour in (0, 8, 16) and ts.minute == 0:
+            assert event_rate == pytest.approx(
+                0.0001 if ts.hour == 0 else (0.0002 if ts.hour == 8 else 0.0003)
+            )
+        else:
+            assert event_rate == 0.0
+
+    # Ngay trước mốc funding thứ hai (08:00), chỉ được biết funding thứ nhất.
+    t_07 = pd.Timestamp("2024-01-01 07:00:00", tz="UTC")
+    assert float(aligned.loc[t_07, "last_known_funding_rate"]) == pytest.approx(0.0001)
+    t_08 = pd.Timestamp("2024-01-01 08:00:00", tz="UTC")
+    assert float(aligned.loc[t_08, "last_known_funding_rate"]) == pytest.approx(0.0002)

@@ -242,3 +242,223 @@ def align_ohlcv_with_funding(ohlcv_df: pd.DataFrame, funding_df: pd.DataFrame) -
     out["last_known_funding_rate"] = merged["_rate"].fillna(0.0).to_numpy(dtype="float64")
 
     return out
+
+
+def fetch_spot_ohlcv(
+    spot_symbol: str,
+    timeframe: str = "1h",
+    start_date: str = "2023-05-07",
+    data_dir: str = "./data/raw",
+    exchange: Any = None,
+    end_date: str | None = None,
+    limit_per_call: int = 1000,
+) -> pd.DataFrame:
+    """Tải lịch sử OHLCV Spot phân trang từ Binance và lưu trữ cache Parquet cục bộ.
+
+    Tham số:
+        spot_symbol: Cặp giao dịch Spot (ví dụ 'BTC/USDT' hoặc 'BTC/USDT:USDT').
+        timeframe: Khung thời gian nến (mặc định '1h').
+        start_date: Ngày bắt đầu (UTC), mặc định '2023-05-07'.
+        data_dir: Thư mục lưu cache Parquet.
+        exchange: Đối tượng ccxt exchange hoặc None (tự khởi tạo ccxt.binance).
+        end_date: Ngày kết thúc (UTC) hoặc None (lấy đến hiện tại).
+        limit_per_call: Số nến tối đa mỗi lần gọi API phân trang (mặc định 1000).
+
+    Trả về:
+        DataFrame index DatetimeIndex UTC ns tên 'timestamp', cột float64: open, high, low, close, volume.
+    """
+    from src.data_loader import (
+        _empty_ohlcv_frame,
+        _normalize_frame,
+        raw_ohlcv_to_dataframe,
+        timeframe_to_ms,
+    )
+
+    clean = (
+        spot_symbol.replace("/", "")
+        .replace(":", "")
+        .replace("_", "")
+        .upper()
+        .replace("USDTUSDT", "USDT")
+    )
+    cache_path = Path(data_dir) / f"{clean}_SPOT_{timeframe}.parquet"
+
+    tf_ms = timeframe_to_ms(timeframe)
+    since_ms = int(pd.Timestamp(start_date, tz="UTC").timestamp() * 1000)
+    until_ms = int(pd.Timestamp(end_date, tz="UTC").timestamp() * 1000) if end_date is not None else None
+
+    if exchange is None:
+        import ccxt
+
+        exchange = ccxt.binance({"enableRateLimit": True})
+
+    now_ms = (
+        int(exchange.milliseconds())
+        if hasattr(exchange, "milliseconds") and callable(exchange.milliseconds)
+        else int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    )
+    target_end_ms = min(until_ms, now_ms) if until_ms is not None else now_ms
+    two_candles_ms = 2 * tf_ms
+
+    cached_df: pd.DataFrame | None = None
+    if cache_path.exists():
+        try:
+            raw_cached = pd.read_parquet(cache_path)
+            if not raw_cached.empty:
+                if "timestamp" in raw_cached.columns and not isinstance(raw_cached.index, pd.DatetimeIndex):
+                    raw_cached = raw_cached.set_index("timestamp")
+                cached_df = _normalize_frame(raw_cached)
+                min_ts = int(cached_df.index.asi8[0] // 1_000_000)
+                max_ts = int(cached_df.index.asi8[-1] // 1_000_000)
+                covers_start = min_ts <= (since_ms + two_candles_ms)
+                covers_end = max_ts >= (target_end_ms - two_candles_ms)
+                if covers_start and covers_end:
+                    return cached_df
+        except Exception:
+            cached_df = None
+
+    if cached_df is not None and not cached_df.empty:
+        min_ts = int(cached_df.index.asi8[0] // 1_000_000)
+        max_ts = int(cached_df.index.asi8[-1] // 1_000_000)
+        if min_ts <= (since_ms + two_candles_ms):
+            fetch_start_ms = max_ts + tf_ms
+        else:
+            fetch_start_ms = since_ms
+    else:
+        fetch_start_ms = since_ms
+
+    all_rows: list[list[float | int]] = []
+    curr_since = fetch_start_ms
+
+    while True:
+        records = exchange.fetch_ohlcv(
+            spot_symbol,
+            timeframe=timeframe,
+            since=curr_since,
+            limit=limit_per_call,
+        )
+        if not records:
+            break
+        all_rows.extend(records)
+        last_ts = int(records[-1][0])
+        if until_ms is not None and last_ts >= until_ms:
+            break
+        if len(records) < limit_per_call:
+            break
+        next_since = last_ts + tf_ms
+        if next_since <= curr_since:
+            break
+        curr_since = next_since
+
+    if all_rows:
+        new_df = raw_ohlcv_to_dataframe(all_rows, symbol=spot_symbol, timeframe=timeframe)
+    else:
+        new_df = _empty_ohlcv_frame()
+
+    parts: list[pd.DataFrame] = []
+    if cached_df is not None and not cached_df.empty:
+        parts.append(cached_df)
+    if not new_df.empty:
+        parts.append(new_df)
+
+    if parts:
+        final_df = _normalize_frame(pd.concat(parts, axis=0))
+    else:
+        final_df = _empty_ohlcv_frame()
+
+    if not final_df.empty:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        final_df.to_parquet(cache_path, engine="pyarrow")
+
+    return final_df
+
+
+def _to_datetime_indexed(df: pd.DataFrame) -> pd.DataFrame:
+    """Chuẩn hóa DataFrame về DatetimeIndex UTC ns tên 'datetime'."""
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        if "datetime" in out.columns:
+            out["datetime"] = pd.to_datetime(out["datetime"], utc=True)
+            out = out.set_index("datetime")
+        elif "timestamp" in out.columns:
+            if pd.api.types.is_integer_dtype(out["timestamp"]):
+                out["datetime"] = pd.to_datetime(out["timestamp"], unit="ms", utc=True)
+            else:
+                out["datetime"] = pd.to_datetime(out["timestamp"], utc=True)
+            out = out.set_index("datetime")
+        else:
+            raise ValueError("DataFrame phải có DatetimeIndex hoặc cột datetime/timestamp")
+    idx = pd.DatetimeIndex(out.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+    idx = idx.as_unit("ns")
+    idx.name = "datetime"
+    out.index = idx
+    out = out[~out.index.duplicated(keep="last")]
+    out = out.sort_index()
+    return out
+
+
+def align_spot_perp_funding(
+    perp_df: pd.DataFrame,
+    spot_df: pd.DataFrame,
+    funding_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Đồng bộ dữ liệu Spot, Perp OHLCV và Funding Rate, tính toán basis_pct và loại bỏ look-ahead bias.
+
+    Tham số:
+        perp_df: DataFrame OHLCV của hợp đồng Perp.
+        spot_df: DataFrame OHLCV của cặp Spot tương ứng.
+        funding_df: DataFrame lịch sử Funding Rate.
+
+    Trả về:
+        DataFrame đồng bộ với DatetimeIndex UTC ns tên 'datetime', gồm:
+        - Các cột OHLCV của perp.
+        - spot_close: Giá close của spot tại nến t.
+        - perp_close: Giá close của perp tại nến t.
+        - basis_pct: (perp_close - spot_close) / spot_close.
+        - funding_rate_event: Funding rate tại nến thanh toán (00/08/16 UTC), nến khác = 0.0.
+        - last_known_funding_rate: Funding rate đã chốt gần nhất tính đến <= t.
+    """
+    perp_norm = _to_datetime_indexed(perp_df)
+    spot_norm = _to_datetime_indexed(spot_df)
+
+    # Giao chính xác giữa perp và spot timestamp
+    common_idx = perp_norm.index.intersection(spot_norm.index)
+
+    if len(common_idx) == 0:
+        empty_df = perp_norm.iloc[:0].copy()
+        empty_df["spot_close"] = pd.Series([], dtype="float64", index=empty_df.index)
+        empty_df["perp_close"] = pd.Series([], dtype="float64", index=empty_df.index)
+        empty_df["basis_pct"] = pd.Series([], dtype="float64", index=empty_df.index)
+        return align_ohlcv_with_funding(empty_df, funding_df)
+
+    matched_perp = perp_norm.loc[common_idx].copy()
+    matched_spot = spot_norm.loc[common_idx].copy()
+
+    spot_close_series = matched_spot["close"].astype("float64")
+    perp_close_series = matched_perp["close"].astype("float64")
+
+    # Loại nến có spot_close <= 0
+    valid_mask = spot_close_series > 0
+    matched_perp = matched_perp[valid_mask]
+    spot_close_series = spot_close_series[valid_mask]
+    perp_close_series = perp_close_series[valid_mask]
+
+    basis_pct = (perp_close_series - spot_close_series) / spot_close_series
+    basis_pct = basis_pct.replace([np.inf, -np.inf], np.nan)
+
+    matched_perp["spot_close"] = spot_close_series
+    matched_perp["perp_close"] = perp_close_series
+    matched_perp["basis_pct"] = basis_pct.astype("float64")
+
+    out = align_ohlcv_with_funding(matched_perp, funding_df)
+    out = out.sort_index()
+
+    if "symbol" in perp_df.attrs:
+        out.attrs["symbol"] = perp_df.attrs["symbol"]
+
+    return out
+
