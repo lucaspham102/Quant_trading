@@ -18,8 +18,8 @@ Yêu cầu §2: **KHÔNG đóng cưỡng bức/reset vốn ở biên cửa sổ*
 | 2 | `cross_sectional.py` + tests | DONE | (Chặng 2) |
 | 3 | `sprint6_eval.py` + `run_sprint6.py` + tests | DONE | (Chặng 3) |
 | 4 | Tải funding thật + chạy DEV | DONE | (này) |
-| 4b | Sửa DSR `sr_variance` + holdout stitched | IN_PROGRESS | |
-| 5 | Holdout 1 lần + báo cáo | TODO | |
+| 4b | Sửa DSR `sr_variance` + holdout stitched | DONE | `245c85a` |
+| 5 | Holdout 1 lần + báo cáo | DONE | (này) |
 
 Baseline test: 131 → Chặng1 136 → Chặng2 143 → Chặng3 152 passed.
 
@@ -41,12 +41,18 @@ Baseline test: 131 → Chặng1 136 → Chặng2 143 → Chặng3 152 passed.
 - **(TRUNG) 1d bỏ sót 2/3 kỳ funding**: không ảnh hưởng (ta chạy 1h).
 - Khác: K nhưng fee scenario là môi trường; min lot Coin-M 100$; margin segregation.
 
-## 5. Quyết định sửa (không đổi chiến lược/tiêu chí)
-- Sửa **DSR**: truyền `sr_variance = var(Sharpe_k per-period)` của K cấu hình vào.
-- Sửa **holdout**: chạy 1 lần liền mạch cả dải; tách metric DEV (`< split`) và HOLDOUT (`>= split`) từ cùng đường cong.
-- Giữ nguyên model carry/xs đã khóa; công bố hạn chế basis risk trong báo cáo cuối.
+## 5. KẾT QUẢ CUỐI (DEV + HOLDOUT, `real_taker`) — đã chạy
+Nguồn: `data/sprint6_carry.csv`, `data/sprint6_xs.csv` (có cột `segment`), `docs/sprint6_report.md`.
+- **Carry coinm_1leg**: DEV Sharpe 12.22, alpha_t 17.34, beta 0.0001, DSR 1.0; HOLDOUT net +0.48%, Sharpe 20.6, MaxDD 0%. → **GO**.
+- **Carry spot_perp_2leg**: DEV Sharpe 9.42, alpha_t 14.0; HOLDOUT net +0.32%. → **GO**.
+- **XS momentum 336h/48h** (tốt nhất): DEV Sharpe 0.84, alpha_t 1.47, DSR 0.18; HOLDOUT net +18.37%. Trượt ĐK1–3 → **NO-GO**.
+- **XS reversal**: âm nặng mọi cấu hình → NO-GO.
+- **Phán quyết: Carry GO (kỹ thuật) / XS NO-GO** — NHƯNG Carry GO dựa trên model lý tưởng hóa bỏ qua basis risk MTM (Sharpe thực ước lượng 0.5–1.0 sẽ TRƯỢT ĐK2). Không triển khai vốn thật. Chi tiết hạn chế ở `docs/sprint6_report.md` §3.3.
+- Full test suite: **154 passed** (×2). K: carry=6, xs=12.
 
 ## 6. Cảnh báo session sau
 - KHÔNG đụng master; KHÔNG merge/push/reset --hard/branch -D.
+- Py3.14, pandas 3.0 (không chained assignment; `.as_unit("ns")`). PowerShell `;`. `PYTHONIOENCODING=utf-8` khi in tiếng Việt.
+- codec CLI in tiếng Việt ra file cần `encoding="utf-8"`.
 - Py3.14, pandas 3.0 (không chained assignment; `.as_unit("ns")`). PowerShell `;`. `PYTHONIOENCODING=utf-8` khi in tiếng Việt.
 - codec CLI in tiếng Việt ra file cần `encoding="utf-8"`.
