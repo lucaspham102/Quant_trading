@@ -3,6 +3,20 @@ from pathlib import Path
 from typing import Literal
 
 
+CORE_4_SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT"]
+EXTRA_8_SYMBOLS = [
+    "XRP/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ADA/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+    "DOT/USDT:USDT",
+    "LTC/USDT:USDT",
+    "TRX/USDT:USDT",
+]
+UNIVERSE_12_SYMBOLS = CORE_4_SYMBOLS + EXTRA_8_SYMBOLS
+
+
 @dataclass(frozen=True)
 class TradingConfig:
     # Định danh thị trường & khung thời gian

@@ -418,3 +418,335 @@ def test_invalid_mode_and_empty_data() -> None:
     assert len(empty_res["equity_curve"]) == 0
     assert len(empty_res["trades_df"]) == 0
     assert empty_res["metrics"]["Sharpe"] == 0.0
+
+
+# =====================================================================
+# Sprint 7: Top-K / buffer rank / carry tilt / vol targeting
+# =====================================================================
+
+
+def _make_panel(
+    closes: dict[str, np.ndarray],
+    funding_events: dict[str, np.ndarray] | None = None,
+    last_known_funding: dict[str, np.ndarray] | None = None,
+    start: str = "2024-01-01 00:00:00",
+) -> dict[str, pd.DataFrame]:
+    """Tạo panel dữ liệu tổng hợp đủ cột cho API Sprint 7.
+
+    Mỗi symbol nhận một DataFrame gồm ``close``, ``funding_rate_event`` và
+    ``last_known_funding_rate`` trên DatetimeIndex UTC độ phân giải ns tên
+    ``datetime``. Không gọi mạng, không dùng random.
+    """
+    n_candles = len(next(iter(closes.values())))
+    dates = pd.date_range(
+        start, periods=n_candles, freq="1h", tz="UTC"
+    ).as_unit("ns")
+
+    panel: dict[str, pd.DataFrame] = {}
+    for sym, close_arr in closes.items():
+        close_arr = np.asarray(close_arr, dtype=np.float64)
+        assert close_arr.shape == (n_candles,)
+
+        if funding_events is not None and sym in funding_events:
+            fr = np.asarray(funding_events[sym], dtype=np.float64)
+        else:
+            fr = np.zeros(n_candles, dtype=np.float64)
+
+        if last_known_funding is not None and sym in last_known_funding:
+            lk = np.asarray(last_known_funding[sym], dtype=np.float64)
+        else:
+            lk = fr.copy()
+
+        df = pd.DataFrame(
+            {
+                "close": close_arr,
+                "funding_rate_event": fr,
+                "last_known_funding_rate": lk,
+            },
+            index=dates,
+        )
+        df.index.name = "datetime"
+        panel[sym] = df
+
+    return panel
+
+
+def test_topk1_backward_compatible() -> None:
+    """Top-K=1 tương thích ngược hoàn toàn với hành vi Sprint 6.
+
+    Với 4 symbol, lookback 168h và rebalance 48h:
+    - Mọi nến đang có vị thế chỉ có đúng 2 mã khác 0: một +0.5, một -0.5.
+    - Tổng trọng số bằng 0.
+    - Cấu hình mặc định mới (top_k=1, buffer_rank=0) và cấu hình chỉ định
+      tường minh hai tham số này cho ``returns`` giống nhau tuyệt đối.
+    """
+    n_candles = 600
+    t = np.arange(n_candles, dtype=np.float64)
+    drifts = {
+        "BTC/USDT": 0.0005,
+        "ETH/USDT": -0.0004,
+        "SOL/USDT": 0.0002,
+        "BNB/USDT": -0.0001,
+    }
+    closes = {sym: 100.0 * (1.0 + drift * t) for sym, drift in drifts.items()}
+    data = _make_panel(closes)
+
+    common = dict(
+        mode="momentum",
+        lookback_hours=168,
+        rebalance_hours=48,
+        min_spread=0.0,
+        gross_leverage=1.0,
+    )
+    res_default = run_cross_sectional_portfolio(
+        data, CrossSectionalConfig(**common)
+    )
+    res_explicit = run_cross_sectional_portfolio(
+        data, CrossSectionalConfig(**common, top_k=1, buffer_rank=0)
+    )
+
+    weights_df = res_default["weights_df"]
+    active = weights_df[weights_df.abs().sum(axis=1) > 1e-9]
+    assert len(active) > 0, "Chiến lược phải mở vị thế sau warmup"
+
+    for _, row in active.iterrows():
+        vals = row.to_numpy(dtype=np.float64)
+        nonzero = vals[np.abs(vals) > 1e-9]
+        assert len(nonzero) == 2
+        np.testing.assert_allclose(
+            np.sort(nonzero), np.array([-0.5, 0.5]), atol=1e-12
+        )
+        assert float(vals.sum()) == pytest.approx(0.0, abs=1e-12)
+
+    pd.testing.assert_series_equal(
+        res_default["returns"], res_explicit["returns"], check_exact=True
+    )
+
+
+def test_topk3_12symbols_neutral() -> None:
+    """Top-K=3 trên 12 symbol giữ danh mục cân bằng tuyệt đối.
+
+    12 symbol có drift trải đều từ -0.5 tới +0.5. Tại mọi nến đang có vị thế:
+    6 mã khác 0, trong đó 3 mã +1/6 và 3 mã -1/6; sum(w) == 0 và sum|w| == 1.
+    """
+    n_candles = 900
+    t = np.arange(n_candles, dtype=np.float64)
+    symbols = [f"S{i:02d}/USDT" for i in range(12)]
+    drifts = np.linspace(-0.5, 0.5, num=len(symbols))
+    closes = {
+        sym: 100.0 * np.exp(drift * t / float(n_candles))
+        for sym, drift in zip(symbols, drifts)
+    }
+    data = _make_panel(closes)
+
+    cfg = CrossSectionalConfig(
+        mode="momentum",
+        lookback_hours=336,
+        rebalance_hours=48,
+        min_spread=0.0,
+        top_k=3,
+        buffer_rank=0,
+        gross_leverage=1.0,
+    )
+    weights_df = run_cross_sectional_portfolio(data, cfg)["weights_df"]
+    active = weights_df[weights_df.abs().sum(axis=1) > 1e-9]
+    assert len(active) > 0, "Chiến lược phải mở vị thế sau warmup"
+
+    for _, row in active.iterrows():
+        vals = row.to_numpy(dtype=np.float64)
+        nonzero = vals[np.abs(vals) > 1e-9]
+        assert len(nonzero) == 6
+        positive = nonzero[nonzero > 0.0]
+        negative = nonzero[nonzero < 0.0]
+        assert len(positive) == 3
+        assert len(negative) == 3
+        np.testing.assert_allclose(
+            positive, np.full(3, 1.0 / 6.0), atol=1e-12
+        )
+        np.testing.assert_allclose(
+            negative, np.full(3, -1.0 / 6.0), atol=1e-12
+        )
+        assert float(vals.sum()) == pytest.approx(0.0, abs=1e-12)
+        assert float(np.abs(vals).sum()) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_buffer_rank_reduces_turnover() -> None:
+    """Buffer band giữ vị thế cũ khi thứ hạng dao động nhẹ, giảm turnover.
+
+    Hai rổ 4 symbol (top và bottom) có thứ hạng quay vòng trong nội bộ rổ
+    nhưng không đảo hoàn toàn. ``buffer_rank=2`` phải giữ nguyên rổ đã chọn
+    và có tổng turnover nhỏ hơn ít nhất 5% so với ``buffer_rank=0``, trong
+    khi vẫn duy trì 2 Long + 2 Short cân bằng.
+    """
+    n_candles = 1200
+    t = np.arange(n_candles, dtype=np.float64)
+    symbols = [f"S{i}/USDT" for i in range(8)]
+    period = 192.0
+    amplitude = 0.004
+
+    closes: dict[str, np.ndarray] = {}
+    for i, sym in enumerate(symbols):
+        base = 0.00008 if i < 4 else -0.00008
+        phase = (i % 4) * (np.pi / 2.0)
+        log_price = base * t + amplitude * np.sin(
+            2.0 * np.pi * t / period + phase
+        )
+        closes[sym] = 100.0 * np.exp(log_price)
+
+    data = _make_panel(closes)
+    common = dict(
+        mode="momentum",
+        lookback_hours=168,
+        rebalance_hours=24,
+        min_spread=0.0,
+        top_k=2,
+        gross_leverage=1.0,
+    )
+    res_no_buffer = run_cross_sectional_portfolio(
+        data, CrossSectionalConfig(**common, buffer_rank=0)
+    )
+    res_buffer = run_cross_sectional_portfolio(
+        data, CrossSectionalConfig(**common, buffer_rank=2)
+    )
+
+    turnover_no_buffer = float(res_no_buffer["metrics"]["Turnover"])
+    turnover_buffer = float(res_buffer["metrics"]["Turnover"])
+    assert turnover_no_buffer > 0.0
+    assert turnover_buffer < 0.95 * turnover_no_buffer
+
+    for result in (res_no_buffer, res_buffer):
+        weights_df = result["weights_df"]
+        active = weights_df[weights_df.abs().sum(axis=1) > 1e-9]
+        assert len(active) > 0
+        for _, row in active.iterrows():
+            vals = row.to_numpy(dtype=np.float64)
+            nonzero = vals[np.abs(vals) > 1e-9]
+            assert len(nonzero) == 4
+            positive = nonzero[nonzero > 0.0]
+            negative = nonzero[nonzero < 0.0]
+            assert len(positive) == 2
+            assert len(negative) == 2
+            np.testing.assert_allclose(
+                positive, np.full(2, 0.25), atol=1e-12
+            )
+            np.testing.assert_allclose(
+                negative, np.full(2, -0.25), atol=1e-12
+            )
+            assert float(vals.sum()) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_no_lookahead_with_buffer_and_tilt() -> None:
+    """Buffer band và carry tilt không được gây look-ahead bias.
+
+    Nhân close của toàn bộ symbol với 3 và thay đổi funding từ nến 500 trở
+    đi. Trọng số của mọi nến trước 500 phải giống hệt bản baseline.
+    """
+    n_candles = 700
+    t = np.arange(n_candles, dtype=np.float64)
+    symbols = [f"S{i}/USDT" for i in range(8)]
+
+    closes: dict[str, np.ndarray] = {}
+    funding_events: dict[str, np.ndarray] = {}
+    for i, sym in enumerate(symbols):
+        base = 0.0005 - 0.00012 * i
+        amplitude = 0.003 * (1.0 + 0.1 * i)
+        log_price = base * t + amplitude * np.sin(
+            2.0 * np.pi * t / 53.0 + 0.3 * i
+        )
+        closes[sym] = 100.0 * np.exp(log_price)
+        funding_events[sym] = 0.0002 * np.sin(
+            2.0 * np.pi * t / 37.0 + 0.2 * i
+        )
+
+    data = _make_panel(closes, funding_events)
+
+    cfg = CrossSectionalConfig(
+        mode="momentum",
+        lookback_hours=168,
+        rebalance_hours=48,
+        min_spread=0.0,
+        top_k=2,
+        buffer_rank=1,
+        carry_tilt_weight=0.25,
+        gross_leverage=1.0,
+    )
+    res_base = run_cross_sectional_portfolio(data, cfg)
+
+    change_idx = 500
+    data_changed: dict[str, pd.DataFrame] = {}
+    for sym, df in data.items():
+        changed = df.copy(deep=True)
+        close_col = changed.columns.get_loc("close")
+        event_col = changed.columns.get_loc("funding_rate_event")
+        known_col = changed.columns.get_loc("last_known_funding_rate")
+        changed.iloc[change_idx:, close_col] = (
+            changed.iloc[change_idx:, close_col].to_numpy() * 3.0
+        )
+        changed.iloc[change_idx:, event_col] = (
+            changed.iloc[change_idx:, event_col].to_numpy() + 0.001
+        )
+        changed.iloc[change_idx:, known_col] = (
+            changed.iloc[change_idx:, known_col].to_numpy() + 0.001
+        )
+        data_changed[sym] = changed
+
+    res_changed = run_cross_sectional_portfolio(data_changed, cfg)
+
+    w_base = res_base["weights_df"]
+    w_changed = res_changed["weights_df"]
+    cutoff = w_base.index[change_idx]
+
+    pd.testing.assert_frame_equal(
+        w_base.loc[w_base.index < cutoff],
+        w_changed.loc[w_changed.index < cutoff],
+    )
+
+
+def test_carry_tilt_penalizes_high_funding() -> None:
+    """Carry tilt phạt funding cao khi momentum gần như hòa.
+
+    Tất cả symbol có cùng quỹ đạo giá (momentum bằng nhau), nhưng A luôn có
+    funding +0.001 và F luôn -0.001. Với ``carry_tilt_weight=0.8``, A không
+    được nằm trong rổ Long và F không được nằm trong rổ Short sau warmup.
+    """
+    n_candles = 800
+    t = np.arange(n_candles, dtype=np.float64)
+    symbols = [f"{letter}/USDT" for letter in "ABCDEF"]
+    common_close = 100.0 * np.exp(0.0001 * t)
+
+    closes = {sym: common_close.copy() for sym in symbols}
+    funding_events: dict[str, np.ndarray] = {}
+    last_known: dict[str, np.ndarray] = {}
+    for sym in symbols:
+        if sym == "A/USDT":
+            rate = 0.001
+        elif sym == "F/USDT":
+            rate = -0.001
+        else:
+            rate = 0.0
+
+        events = np.zeros(n_candles, dtype=np.float64)
+        events[::8] = rate
+        funding_events[sym] = events
+        last_known[sym] = np.full(n_candles, rate, dtype=np.float64)
+
+    data = _make_panel(closes, funding_events, last_known)
+    cfg = CrossSectionalConfig(
+        mode="momentum",
+        lookback_hours=168,
+        rebalance_hours=24,
+        min_spread=0.0,
+        top_k=1,
+        buffer_rank=0,
+        carry_tilt_weight=0.8,
+        carry_lookback_periods=21,
+        gross_leverage=1.0,
+    )
+    weights_df = run_cross_sectional_portfolio(data, cfg)["weights_df"]
+
+    warmup_idx = 200
+    tail = weights_df.iloc[warmup_idx:]
+    assert (tail.abs().sum(axis=1) > 1e-9).all()
+    assert (tail["A/USDT"] <= 1e-9).all(), "A không được vào rổ Long"
+    assert (tail["F/USDT"] >= -1e-9).all(), "F không được vào rổ Short"
+    assert (tail["F/USDT"] > 0.0).all(), "F phải được ưu tiên Long"
