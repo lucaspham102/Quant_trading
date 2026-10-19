@@ -126,6 +126,46 @@ def test_dsr_formula_manual() -> None:
     assert res["num_trials"] == num_trials
 
 
+def test_dsr_uses_sr_variance() -> None:
+    """Kiểm tra compute_deflated_sharpe_ratio thực sự sử dụng sr_variance được truyền vào."""
+    s = pd.Series([0.012, -0.005, 0.018, 0.007, -0.003, 0.014, 0.002, -0.001])
+    num_trials = 6
+
+    # 1. Chạy với sr_variance=None
+    res_none = compute_deflated_sharpe_ratio(s, num_trials=num_trials, sr_variance=None)
+
+    # 2. Chạy với sr_variance lớn (phải LỚN HƠN proxy denom/(n-1) để sr_star tăng)
+    large_var = 4.0
+    res_large = compute_deflated_sharpe_ratio(
+        s, num_trials=num_trials, sr_variance=large_var
+    )
+
+    # sr_star phải lớn hơn và dsr_prob phải khác (nhỏ hơn) so với khi sr_variance=None
+    assert res_large["sr_star"] > res_none["sr_star"]
+    assert res_large["dsr_prob"] != pytest.approx(res_none["dsr_prob"])
+    assert res_large["dsr_prob"] < res_none["dsr_prob"]
+
+    # 3. Tính toán bằng tay công thức độc lập với sr_variance cụ thể
+    n = len(s)
+    sr = float(s.mean() / s.std(ddof=1))
+    gamma3 = float(s.skew())
+    gamma4 = float(s.kurt()) + 3.0
+    denom = max(1.0 - gamma3 * sr + ((gamma4 - 1.0) / 4.0) * (sr ** 2), 1e-12)
+
+    g = 0.5772156649
+    e_const = 2.718281828
+    k_val = 6
+    term1 = (1.0 - g) * norm.ppf(1.0 - 1.0 / k_val)
+    term2 = g * norm.ppf(1.0 - 1.0 / (k_val * e_const))
+    expected_sr_star = math.sqrt(large_var) * (term1 + term2)
+    z = (sr - expected_sr_star) * math.sqrt(n - 1.0) / math.sqrt(denom)
+    expected_dsr = float(norm.cdf(z))
+
+    assert res_large["sharpe_per_period"] == pytest.approx(sr)
+    assert res_large["sr_star"] == pytest.approx(expected_sr_star)
+    assert res_large["dsr_prob"] == pytest.approx(expected_dsr)
+
+
 def test_nw_alpha_beta_recovers_beta() -> None:
     """Kiểm tra hồi quy Newey-West khôi phục chính xác hệ số beta từ dữ liệu tổng hợp."""
     rng = np.random.default_rng(123)
@@ -279,10 +319,85 @@ def test_run_sprint6_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     # Kiểm tra cấu trúc file CSV
     carry_res = pd.read_csv(tmp_path / "sprint6_carry.csv")
     assert len(carry_res) == 6  # 2 structures * 3 fee scenarios
+    assert "segment" in carry_res.columns
     assert "sharpe" in carry_res.columns
     assert "dsr_prob" in carry_res.columns
 
     xs_res = pd.read_csv(tmp_path / "sprint6_xs.csv")
     assert len(xs_res) == 12  # 2 modes * 3 lookbacks * 2 rebalances
+    assert "segment" in xs_res.columns
     assert "sharpe" in xs_res.columns
     assert "dsr_prob" in xs_res.columns
+
+
+def test_run_sprint6_holdout_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kiểm tra CLI run_sprint6 chế độ phân đoạn DEV/HOLDOUT liền mạch sinh đủ 2 segment."""
+    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT"]
+
+    # Dữ liệu tổng hợp phủ dài >= 300 ngày 1h (9000 nến 1h từ 2024-01-01 đến 2025-01-10)
+    mock_ohlcv: dict[str, pd.DataFrame] = {}
+    for idx, sym in enumerate(symbols):
+        df_sym = generate_synthetic_ohlcv(
+            n_candles=9000,
+            symbol=sym,
+            timeframe="1h",
+            seed=100 + idx,
+        )
+        df_sym.index.name = "datetime"
+        mock_ohlcv[sym] = df_sym
+
+    def mock_load(symbol: str, timeframe: str = "1h", days: int = 180, **kwargs: object) -> pd.DataFrame:
+        return mock_ohlcv.get(symbol, list(mock_ohlcv.values())[0]).copy()
+
+    # Dữ liệu funding rate 8h định kỳ phủ 1200 mốc = 400 ngày
+    funding_times = pd.date_range("2024-01-01 00:00:00", periods=1200, freq="8h", tz="UTC").as_unit("ns")
+    mock_funding = pd.DataFrame(
+        {
+            "timestamp": (funding_times.asi8 // 1_000_000).astype("int64"),
+            "datetime": funding_times,
+            "funding_rate": 0.0001,
+            "mark_price": 50000.0,
+        }
+    )
+
+    def mock_fetch(symbol: str, start_date: str = "2023-05-07", end_date: str | None = None, **kwargs: object) -> pd.DataFrame:
+        return mock_funding.copy()
+
+    monkeypatch.setattr(run_sprint6, "load_or_fetch_symbol_data", mock_load)
+    monkeypatch.setattr(run_sprint6, "fetch_funding_history", mock_fetch)
+
+    out_md = tmp_path / "r.md"
+    ret = run_sprint6.main(
+        [
+            "--symbols",
+            "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,BNB/USDT:USDT",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-12-31",
+            "--holdout-start",
+            "2024-07-01",
+            "--out-dir",
+            str(tmp_path),
+            "--out-md",
+            str(out_md),
+        ]
+    )
+
+    assert ret == 0
+    carry_csv = tmp_path / "sprint6_carry.csv"
+    xs_csv = tmp_path / "sprint6_xs.csv"
+    assert carry_csv.exists()
+    assert xs_csv.exists()
+    assert out_md.exists()
+
+    carry_df = pd.read_csv(carry_csv)
+    xs_df = pd.read_csv(xs_csv)
+
+    assert "segment" in carry_df.columns
+    assert "segment" in xs_df.columns
+    assert set(carry_df["segment"].unique()) == {"dev", "holdout"}
+    assert set(xs_df["segment"].unique()) == {"dev", "holdout"}
+
+    md_content = out_md.read_text(encoding="utf-8")
+    assert "HOLDOUT" in md_content
