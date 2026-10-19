@@ -1,9 +1,10 @@
 """Động cơ chiến lược Cross-Sectional Market-Neutral đa tài sản.
 
 Bao gồm:
-- CrossSectionalConfig: Cấu hình tham số chiến lược và mô hình chi phí thực thi.
+- CrossSectionalConfig: Cấu hình tham số chiến lược, Top-K, buffer band, carry tilt, vol targeting và mô hình chi phí.
 - run_cross_sectional_portfolio: Mô phỏng danh mục Cross-Sectional Market-Neutral (momentum/reversal)
-  hoàn toàn không có look-ahead bias, tính phí trên turnover và hạch toán funding rate.
+  hoàn toàn không có look-ahead bias, tính phí trên turnover, hạch toán funding rate, hỗ trợ Top-K/Bottom-K
+  có buffer band chống đảo lệnh và vol targeting.
 """
 from __future__ import annotations
 
@@ -27,6 +28,12 @@ class CrossSectionalConfig:
     perp_fee: float = 0.0005
     slippage: float = 0.0002
     initial_capital: float = 400.0
+    top_k: int = 1  # số mã mỗi bên (mặc định 1 để tương thích ngược)
+    buffer_rank: int = 0
+    carry_tilt_weight: float = 0.0  # lambda >= 0
+    vol_target_ann: float | None = None
+    carry_lookback_periods: int = 21  # số kỳ funding trung bình (7 ngày * 3 kỳ)
+    funding_col: str = "last_known_funding_rate"  # fallback sang funding_rate_event nếu thiếu cột
 
 
 def run_cross_sectional_portfolio(
@@ -38,7 +45,7 @@ def run_cross_sectional_portfolio(
 
     Tham số:
         aligned_data: Dict map {symbol: DataFrame có tối thiểu cột close và funding_rate_event}.
-        config: CrossSectionalConfig chứa tham số chiến lược, đòn bẩy và chi phí.
+        config: CrossSectionalConfig chứa tham số chiến lược, Top-K, buffer band, carry tilt, vol targeting và chi phí.
         periods_per_year: Số chu kỳ nến mỗi năm dùng để năm hóa Sharpe và Return (mặc định 8760 cho nến 1h).
 
     Trả về:
@@ -61,6 +68,18 @@ def run_cross_sectional_portfolio(
         raise ValueError(f"gross_leverage phải > 0, nhận: {config.gross_leverage}")
     if config.initial_capital <= 0:
         raise ValueError(f"initial_capital phải > 0, nhận: {config.initial_capital}")
+    if config.top_k < 1:
+        raise ValueError(f"top_k phải >= 1, nhận: {config.top_k}")
+    if config.buffer_rank < 0:
+        raise ValueError(f"buffer_rank phải >= 0, nhận: {config.buffer_rank}")
+    if config.carry_tilt_weight < 0:
+        raise ValueError(
+            f"carry_tilt_weight phải >= 0, nhận: {config.carry_tilt_weight}"
+        )
+    if config.vol_target_ann is not None and config.vol_target_ann <= 0:
+        raise ValueError(
+            f"vol_target_ann nếu khác None phải > 0, nhận: {config.vol_target_ann}"
+        )
 
     empty_idx = pd.DatetimeIndex([], tz="UTC", name="datetime").as_unit("ns")
     empty_metrics = {
@@ -74,6 +93,9 @@ def run_cross_sectional_portfolio(
         "Total Funding Paid": 0.0,
         "Total Funding Collected": 0.0,
         "Total Fees Paid": 0.0,
+        "Avg Top-K Turnover": 0.0,
+        "Num Rebalances": 0,
+        "Vol Target Scale Mean": 0.0,
     }
 
     if not aligned_data:
@@ -108,9 +130,14 @@ def run_cross_sectional_portfolio(
         clean_aligned[sym] = d
 
     symbols = sorted(clean_aligned.keys())
-    if len(symbols) < 2:
+    n_symbols = len(symbols)
+    if n_symbols < 2:
         raise ValueError(
-            f"Chiến lược Cross-Sectional yêu cầu tối thiểu 2 symbol, nhận: {len(symbols)}"
+            f"Chiến lược Cross-Sectional yêu cầu tối thiểu 2 symbol, nhận: {n_symbols}"
+        )
+    if config.top_k * 2 > n_symbols:
+        raise ValueError(
+            f"top_k * 2 ({config.top_k * 2}) vượt quá số lượng symbol ({n_symbols})."
         )
 
     # Trục thời gian chung: union index của các symbol, sort tăng dần
@@ -131,7 +158,6 @@ def run_cross_sectional_portfolio(
             "metrics": empty_metrics,
         }
 
-    n_symbols = len(symbols)
     lookback = config.lookback_hours
 
     # Trích xuất ma trận giá đóng cửa và funding rate event
@@ -139,6 +165,7 @@ def run_cross_sectional_portfolio(
     close_matrix = np.empty((n_steps, n_symbols), dtype=np.float64)
     funding_matrix = np.zeros((n_steps, n_symbols), dtype=np.float64)
     score_matrix = np.full((n_steps, n_symbols), np.nan, dtype=np.float64)
+    f_matrix = np.zeros((n_steps, n_symbols), dtype=np.float64)
 
     for s_idx, sym in enumerate(symbols):
         d = clean_aligned[sym]
@@ -149,8 +176,8 @@ def run_cross_sectional_portfolio(
             fr_series = d["funding_rate_event"].reindex(common_index).fillna(0.0)
             funding_matrix[:, s_idx] = fr_series.to_numpy(dtype=np.float64)
 
-        # Tính điểm số tại nến t CHỈ dùng dữ liệu tới t-1:
-        # S_{i,t} = (Close_{i,t-1}/Close_{i,t-1-L} - 1) / (Std(ret_{i, t-1-L .. t-1}) + 1e-8)
+        # Tính điểm số M tại nến t CHỈ dùng dữ liệu tới t-1:
+        # M = (Close.shift(1)/Close.shift(1+L) - 1) / (rolling_std(ret.shift(1), L) + 1e-8)
         # Sử dụng shift(1) để ngăn chặn tuyệt đối look-ahead bias
         cum_ret = (c_series.shift(1) / c_series.shift(1 + lookback)) - 1.0
         ret_s = c_series.pct_change()
@@ -159,6 +186,21 @@ def run_cross_sectional_portfolio(
         s_series = cum_ret / (rolling_std + 1e-8)
         s_series = s_series.replace([np.inf, -np.inf], np.nan)
         score_matrix[:, s_idx] = s_series.to_numpy(dtype=np.float64)
+
+        # Trích xuất chuỗi funding F cho carry-aware score nếu carry_tilt_weight > 0
+        if config.carry_tilt_weight > 0:
+            if config.funding_col in d.columns:
+                f_raw = d[config.funding_col].reindex(common_index).ffill().fillna(0.0)
+            elif "funding_rate_event" in d.columns:
+                f_raw = d["funding_rate_event"].reindex(common_index).fillna(0.0)
+            else:
+                f_raw = pd.Series(0.0, index=common_index)
+            f_rolling = (
+                f_raw.rolling(window=config.carry_lookback_periods, min_periods=1)
+                .mean()
+                .shift(1)
+            )
+            f_matrix[:, s_idx] = f_rolling.to_numpy(dtype=np.float64)
 
     # Tìm nến đầu tiên đủ lookback (tất cả symbols đều có score không phải NaN)
     valid_score_mask = ~np.isnan(score_matrix).any(axis=1)
@@ -175,6 +217,8 @@ def run_cross_sectional_portfolio(
     total_fees_paid = 0.0
     total_funding_paid = 0.0
     total_turnover = 0.0
+    num_rebalances = 0
+    rebalance_scales: list[float] = []
     trades_list: list[dict[str, Any]] = []
 
     # Nến đầu tiên (t = 0): khởi đầu = initial_capital, R = 0
@@ -197,35 +241,116 @@ def run_cross_sectional_portfolio(
 
         new_weights = current_weights.copy()
         if is_rebalance_candle:
-            scores_k = score_matrix[k]
+            num_rebalances += 1
+            m_k = score_matrix[k]
             # CHỈ khi không có NaN ở bất kỳ symbol nào
-            if not np.isnan(scores_k).any():
+            if not np.isnan(m_k).any():
+                mean_m = float(np.mean(m_k))
+                std_m = float(np.std(m_k, ddof=0))
+                z_mom = (m_k - mean_m) / (std_m + 1e-8)
+
+                sign_mode = 1.0 if config.mode == "momentum" else -1.0
+                if config.carry_tilt_weight > 0:
+                    f_k = f_matrix[k]
+                    valid_f = ~np.isnan(f_k)
+                    z_fund = np.zeros(n_symbols, dtype=np.float64)
+                    if np.any(valid_f):
+                        mean_f = float(np.mean(f_k[valid_f]))
+                        std_f = float(np.std(f_k[valid_f], ddof=0))
+                        z_fund[valid_f] = (f_k[valid_f] - mean_f) / (std_f + 1e-8)
+                    scores_k = sign_mode * z_mom - config.carry_tilt_weight * z_fund
+                else:
+                    scores_k = sign_mode * z_mom
+
                 s_max = float(np.max(scores_k))
                 s_min = float(np.min(scores_k))
                 spread = s_max - s_min
 
                 target_w = np.zeros(n_symbols, dtype=np.float64)
                 if spread >= config.min_spread:
-                    # Sắp xếp các symbol theo score giảm dần (rank1 cao nhất, rank cuối thấp nhất)
+                    # Sắp xếp các symbol theo score giảm dần
                     # Sắp xếp ổn định: ưu tiên điểm số, phụ thuộc s_idx nếu hòa điểm
                     sorted_indices = sorted(
                         range(n_symbols),
                         key=lambda idx: (float(scores_k[idx]), -idx),
                         reverse=True,
                     )
-                    rank1_idx = sorted_indices[0]
-                    rank_last_idx = sorted_indices[-1]
+                    rank_of = [0] * n_symbols
+                    for r, s_idx in enumerate(sorted_indices, start=1):
+                        rank_of[s_idx] = r
 
-                    if config.mode == "momentum":
-                        target_w[rank1_idx] = 0.5 * config.gross_leverage
-                        target_w[rank_last_idx] = -0.5 * config.gross_leverage
-                    elif config.mode == "reversal":
-                        target_w[rank_last_idx] = 0.5 * config.gross_leverage
-                        target_w[rank1_idx] = -0.5 * config.gross_leverage
+                    # Long: giữ các mã thuộc Long kỳ trước nếu rank <= top_k + buffer_rank
+                    long_candidates = [
+                        s
+                        for s in range(n_symbols)
+                        if current_weights[s] > 1e-9
+                        and rank_of[s] <= (config.top_k + config.buffer_rank)
+                    ]
+                    long_candidates.sort(key=lambda s: rank_of[s])
+                    long_basket = long_candidates[: config.top_k]
+
+                    # Nếu chưa đủ top_k thì lấy thêm từ đầu bảng xếp hạng (bỏ qua mã đã có)
+                    if len(long_basket) < config.top_k:
+                        for s in sorted_indices:
+                            if s not in long_basket:
+                                long_basket.append(s)
+                                if len(long_basket) == config.top_k:
+                                    break
+
+                    # Short: giữ các mã thuộc Short kỳ trước nếu rank_từ_dưới <= top_k + buffer_rank
+                    # Không cho 1 mã nằm cả 2 rổ (loại khỏi Short nếu đã nằm trong Long)
+                    short_candidates = [
+                        s
+                        for s in range(n_symbols)
+                        if current_weights[s] < -1e-9
+                        and (n_symbols - rank_of[s] + 1)
+                        <= (config.top_k + config.buffer_rank)
+                        and s not in long_basket
+                    ]
+                    short_candidates.sort(
+                        key=lambda s: n_symbols - rank_of[s] + 1
+                    )
+                    short_basket = short_candidates[: config.top_k]
+
+                    # Nếu chưa đủ thì lấy thêm từ cuối bảng lên (bỏ qua mã đã có / đã nằm trong Long)
+                    if len(short_basket) < config.top_k:
+                        for s in reversed(sorted_indices):
+                            if s not in short_basket and s not in long_basket:
+                                short_basket.append(s)
+                                if len(short_basket) == config.top_k:
+                                    break
+
+                    w_long = config.gross_leverage / (2.0 * config.top_k)
+                    w_short = -config.gross_leverage / (2.0 * config.top_k)
+                    for s in long_basket:
+                        target_w[s] = w_long
+                    for s in short_basket:
+                        target_w[s] = w_short
+
+                # 2. Vol targeting (chỉ khi vol_target_ann khác None)
+                if config.vol_target_ann is not None:
+                    min_periods = max(10, config.lookback_hours // 4)
+                    hist_rets = returns_vals[
+                        max(1, k - config.lookback_hours) : k
+                    ]
+                    if len(hist_rets) >= min_periods:
+                        vol_hist = float(np.std(hist_rets, ddof=1))
+                        vol_ann = vol_hist * math.sqrt(periods_per_year)
+                        scale = float(
+                            np.clip(
+                                config.vol_target_ann / (vol_ann + 1e-12),
+                                0.0,
+                                1.0,
+                            )
+                        )
+                    else:
+                        scale = 1.0
+                    rebalance_scales.append(scale)
+                    target_w = target_w * scale
 
                 new_weights = target_w
 
-        # 2. Tính Turnover và chi phí thực thi tại nến k
+        # 3. Tính Turnover và chi phí thực thi tại nến k
         delta_w = new_weights - current_weights
         turnover_k = float(np.sum(np.abs(delta_w)))
 
@@ -244,7 +369,7 @@ def run_cross_sectional_portfolio(
 
         fee_pct_k = turnover_k * one_way_cost
 
-        # 3. Cập nhật lợi nhuận nến k dùng trọng số đã thiết lập ở nến k-1 (current_weights)
+        # 4. Cập nhật lợi nhuận nến k dùng trọng số đã thiết lập ở nến k-1 (current_weights)
         # R_port,t = sum_i w_{i,t-1} * (Close_{i,t}/Close_{i,t-1} - 1 - funding_rate_event_{i,t}) - FeePct_t
         gross_ret_k = 0.0
         funding_paid_usd_k = 0.0
@@ -300,7 +425,7 @@ def run_cross_sectional_portfolio(
         columns=["time", "symbol", "w_old", "w_new", "turnover"],
     )
 
-    # 4. Tính toán các chỉ số hiệu suất tổng hợp
+    # 5. Tính toán các chỉ số hiệu suất tổng hợp
     total_return_pct = (
         float((equity - config.initial_capital) / config.initial_capital * 100.0)
         if config.initial_capital > 0
@@ -337,6 +462,15 @@ def run_cross_sectional_portfolio(
         float(np.mean(in_market_mask) * 100.0) if n_steps > 0 else 0.0
     )
 
+    avg_topk_turnover = (
+        float(total_turnover / num_rebalances) if num_rebalances > 0 else 0.0
+    )
+    vol_target_scale_mean = (
+        float(np.mean(rebalance_scales))
+        if (config.vol_target_ann is not None and len(rebalance_scales) > 0)
+        else 0.0
+    )
+
     metrics = {
         "Total Return %": total_return_pct,
         "Total Return % ": total_return_pct,
@@ -348,6 +482,9 @@ def run_cross_sectional_portfolio(
         "Total Funding Paid": float(total_funding_paid),
         "Total Funding Collected": float(-total_funding_paid),
         "Total Fees Paid": float(total_fees_paid),
+        "Avg Top-K Turnover": avg_topk_turnover,
+        "Num Rebalances": int(num_rebalances),
+        "Vol Target Scale Mean": vol_target_scale_mean,
     }
 
     return {
