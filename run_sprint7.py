@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -448,7 +449,9 @@ def select_best_from_csv(path: Path, kind: str) -> set[str]:
     """Chọn config tốt nhất trên DEV từ CSV (theo Sharpe, ưu tiên DSR).
 
     Với Carry: chọn 1 cấu hình MTM tốt nhất theo DEV Sharpe.
-    Với XS: chọn 1 cấu hình tốt nhất cho mỗi universe theo DEV Sharpe.
+    Với XS: chọn 1 cấu hình tốt nhất trên rổ 12 coin, sau đó áp dụng ĐÚNG bộ tham số
+    (lookback / buffer / tilt) đó cho rổ 8 coin mới để bảo toàn ý nghĩa kiểm định
+    Out-of-Universe (cùng chiến lược, khác rổ tài sản).
     """
     df = pd.read_csv(path)
     if df.empty:
@@ -462,9 +465,23 @@ def select_best_from_csv(path: Path, kind: str) -> set[str]:
         pool = pool.sort_values(["dev_sharpe", "dev_dsr_prob"], ascending=False)
         selected.add(str(pool.iloc[0]["config_id"]))
     else:
-        for universe, group in df.groupby("universe"):
-            ordered = group.sort_values(["dev_sharpe", "dev_dsr_prob"], ascending=False)
-            selected.add(str(ordered.iloc[0]["config_id"]))
+        pool = df[df["universe"] == "xs12"].copy()
+        if pool.empty:
+            pool = df.copy()
+        ordered = pool.sort_values(["dev_sharpe", "dev_dsr_prob"], ascending=False)
+        best = ordered.iloc[0]
+        config_id = str(best["config_id"])
+        match = re.match(r"^(xs8|xs12)\|lb(\d+)\|buf(\d+)\|tilt([0-9.]+)$", config_id)
+        if match is not None:
+            lookback = int(match.group(2))
+            buffer_rank = int(match.group(3))
+            tilt = float(match.group(4))
+        else:
+            lookback = int(best["lookback_hours"])
+            buffer_rank = int(best["buffer_rank"])
+            tilt = float(best["carry_tilt_weight"])
+        selected.add(f"xs12|lb{lookback}|buf{buffer_rank}|tilt{tilt:g}")
+        selected.add(f"xs8|lb{lookback}|buf{buffer_rank}|tilt{tilt:g}")
     return selected
 
 
@@ -481,6 +498,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.download:
         download_data(args.timeframe, raw_dir, args.start, args.end)
+
+    if args.stage != "dev" and not args.select_csv:
+        raise SystemExit(
+            "Từ chối mở Holdout: bắt buộc truyền --select-csv để khóa cấu hình đã chọn "
+            "trên DEV (chỉ được mở Holdout đúng 1 lần)."
+        )
 
     dev_end = None if args.stage == "dev" else args.dev_end
     data_end = args.dev_end if args.stage == "dev" else args.end
@@ -503,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
                 selected_carry = select_best_from_csv(carry_csv, "carry")
             if xs_csv is not None and xs_csv.exists() and not args.skip_xs:
                 selected_xs = select_best_from_csv(xs_csv, "xs")
+
+    if args.stage != "dev":
+        if not args.skip_carry and not selected_carry:
+            raise SystemExit("Không xác định được cấu hình Carry từ --select-csv; hủy mở Holdout.")
+        if not args.skip_xs and not selected_xs:
+            raise SystemExit("Không xác định được cấu hình Cross-Sectional từ --select-csv; hủy mở Holdout.")
 
     tables: list[str] = []
     summary: dict[str, Any] = {
