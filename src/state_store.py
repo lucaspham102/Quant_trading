@@ -117,6 +117,8 @@ class BotState:
     circuit_breaker_tripped: bool = False
     last_processed_candle_ts: Optional[str] = None
     trade_history: list[dict[str, Any]] = field(default_factory=list)
+    carry_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    carry_last_reconcile_ts: Optional[str] = None
 
 
 class StateStore:
@@ -154,6 +156,15 @@ class StateStore:
         last_ts = raw.get("last_processed_candle_ts")
         raw_history = raw.get("trade_history") or []
 
+        raw_carry = raw.get("carry_positions") or {}
+        carry_positions: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_carry, dict):
+            for k, v in raw_carry.items():
+                if isinstance(v, dict):
+                    carry_positions[str(k)] = dict(v)
+        raw_carry_ts = raw.get("carry_last_reconcile_ts")
+        carry_last_reconcile_ts = str(raw_carry_ts) if raw_carry_ts is not None else None
+
         return BotState(
             open_position=dict(open_pos) if isinstance(open_pos, dict) else None,
             daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
@@ -164,6 +175,8 @@ class StateStore:
             circuit_breaker_tripped=bool(raw.get("circuit_breaker_tripped", False)),
             last_processed_candle_ts=str(last_ts) if last_ts is not None else None,
             trade_history=[trade_record_to_dict(item) for item in raw_history],
+            carry_positions=carry_positions,
+            carry_last_reconcile_ts=carry_last_reconcile_ts,
         )
 
     def sync_to_risk_manager(self, state: BotState, risk_manager: RiskManager) -> Optional[Position]:
