@@ -273,3 +273,267 @@ def test_barbell_overlay_off_matches_carry_exactly() -> None:
 
     overlay_pnl_series = barbell["attribution_series"]["overlay_pnl"]
     assert overlay_pnl_series.abs().max() == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 5. Bộ kiểm định GO / NO-GO Sprint 9 (src/sprint9_eval.py)
+# ---------------------------------------------------------------------------
+import math
+
+from src.sprint9_eval import (
+    build_period_table_for_tier,
+    compute_go_inputs,
+    compute_ols_beta,
+    detect_executor_state_machine,
+    evaluate_sprint9_go_no_go,
+)
+from src.sprint7_eval import equity_from_returns
+
+
+def _passing_full_metrics(**overrides: float) -> dict[str, float]:
+    """Bộ chỉ số toàn chuỗi thỏa cả 4 tiêu chí GO theo docs/go_no_go_sprint9.md.
+
+    Mặc định: annualized 12.5% (>= 10.0), Sharpe 2.1 (>= 1.80), MaxDD 4.5%
+    (<= 8.0), |beta_BTC| = 0.05 (<= 0.15). Mỗi lần gọi trả về dict mới nên các
+    nhánh vi phạm không thể mutate chéo dữ liệu của nhau.
+    """
+    base: dict[str, float] = {
+        "annualized_return_pct": 12.5,
+        "sharpe": 2.1,
+        "maxdd_pct": 4.5,
+        "beta_btc": 0.05,
+    }
+    base.update(overrides)
+    return base
+
+
+def _passing_period_rows() -> list[dict[str, float]]:
+    """Bảng 7 kỳ 6 tháng: 6 kỳ dương (gồm P7 holdout) và 1 kỳ -1.5% (worst).
+
+    P7 (holdout 2026-04-21 -> 2026-10-18) đạt net_return_pct = 2.0% và
+    annualized_return_pct = 9.5% (>= 8.0). Worst period = -1.5% (>= -3.0).
+    Trả về list mới mỗi lần gọi để tránh mutate chéo giữa các assert.
+    """
+    net_returns = [2.0, 1.4, -1.5, 1.9, 2.3, 1.1, 2.0]
+    annualized = [10.5, 9.2, -6.0, 10.1, 11.0, 8.6, 9.5]
+    return [
+        {
+            "period": f"P{i + 1}",
+            "period_id": f"P{i + 1}",
+            "net_return_pct": float(net),
+            "annualized_return_pct": float(ann),
+        }
+        for i, (net, ann) in enumerate(zip(net_returns, annualized))
+    ]
+
+
+def test_evaluate_sprint9_go_no_go_all_conditions_and_holdout_gate() -> None:
+    """Ma trận quyết định Sprint 9: GO khi đủ 4 tiêu chí, NO-GO đúng từng nhánh.
+
+    Mỗi nhánh chỉ thay đổi đúng một tham số trên một bản copy độc lập, sau đó
+    assert ``verdict == 'NO-GO'`` và ``failed`` chứa đúng tên tiêu chí bị trượt.
+    Đặc biệt khóa hành vi holdout gate: kỳ cuối âm, annualized holdout < 8.0%
+    hoặc worst period < -3.0% đều phải hạ ``cond2_consistency``.
+    """
+    baseline = evaluate_sprint9_go_no_go(
+        _passing_full_metrics(), _passing_period_rows()
+    )
+    assert baseline["verdict"] == "GO"
+    assert baseline["failed"] == []
+    assert baseline["pos_periods"] == 6
+    assert baseline["total_periods"] == 7
+    assert baseline["holdout_net_return_pct"] == pytest.approx(2.0)
+    assert baseline["holdout_annualized_return_pct"] == pytest.approx(9.5)
+    assert baseline["details"]["worst_period_return_pct"] == pytest.approx(-1.5)
+
+    def _evaluate(
+        metrics_overrides: dict[str, float] | None = None,
+        period_rows: list[dict[str, float]] | None = None,
+        **kwargs: float | str | bool,
+    ) -> dict:
+        """Chạy đánh giá trên bản copy tươi của dữ liệu gốc."""
+        metrics = _passing_full_metrics(**(metrics_overrides or {}))
+        rows = _passing_period_rows() if period_rows is None else period_rows
+        return evaluate_sprint9_go_no_go(metrics, rows, **kwargs)
+
+    def _assert_failed(result: dict, expected: str) -> None:
+        assert result["verdict"] == "NO-GO"
+        assert result["failed"] == [expected]
+
+    # a. Annualized toàn chuỗi 9.9% < 10.0% -> cond1_return.
+    _assert_failed(
+        _evaluate({"annualized_return_pct": 9.9}), "cond1_return"
+    )
+
+    # b. Chỉ còn 5/7 kỳ dương (P3 và P5 cùng âm) -> cond2_consistency.
+    two_negative_rows = _passing_period_rows()
+    two_negative_rows[4]["net_return_pct"] = -0.8
+    result_b = _evaluate(period_rows=two_negative_rows)
+    assert result_b["pos_periods"] == 5
+    _assert_failed(result_b, "cond2_consistency")
+
+    # c. Kỳ holdout cuối âm (-0.5%) -> cond2_consistency.
+    negative_holdout_rows = _passing_period_rows()
+    negative_holdout_rows[-1]["net_return_pct"] = -0.5
+    _assert_failed(
+        _evaluate(period_rows=negative_holdout_rows), "cond2_consistency"
+    )
+
+    # d. Holdout annualized 7.9% < 8.0% -> cond2_consistency.
+    weak_holdout_rows = _passing_period_rows()
+    weak_holdout_rows[-1]["annualized_return_pct"] = 7.9
+    _assert_failed(
+        _evaluate(period_rows=weak_holdout_rows), "cond2_consistency"
+    )
+
+    # e. Worst period -3.5% < -3.0% -> cond2_consistency.
+    deep_loss_rows = _passing_period_rows()
+    deep_loss_rows[2]["net_return_pct"] = -3.5
+    _assert_failed(_evaluate(period_rows=deep_loss_rows), "cond2_consistency")
+
+    # f. Sharpe 1.79 < 1.80 -> cond3_risk.
+    _assert_failed(_evaluate({"sharpe": 1.79}), "cond3_risk")
+
+    # g. MaxDD 8.5% > 8.0% -> cond3_risk.
+    _assert_failed(_evaluate({"maxdd_pct": 8.5}), "cond3_risk")
+
+    # h. |beta_BTC| 0.18 > 0.15 -> cond3_risk.
+    _assert_failed(_evaluate({"beta_btc": -0.18}), "cond3_risk")
+
+    # i. Có margin call -> cond3_risk (truyền qua keyword).
+    _assert_failed(_evaluate(margin_call_count=1), "cond3_risk")
+
+    # j. execution_mode không phải maker_taker_hedge -> cond4_execution_sync.
+    _assert_failed(_evaluate(execution_mode="real_taker"), "cond4_execution_sync")
+
+    # k. Chưa xác thực máy trạng thái executor -> cond4_execution_sync.
+    _assert_failed(
+        _evaluate(executor_state_machine_verified=False), "cond4_execution_sync"
+    )
+
+    # l. Còn look-ahead bias -> cond4_execution_sync.
+    _assert_failed(_evaluate(has_lookahead_bias=True), "cond4_execution_sync")
+
+    # m. Bảng kỳ rỗng -> cond2_consistency (không đủ 7 kỳ).
+    result_m = _evaluate(period_rows=[])
+    assert result_m["total_periods"] == 0
+    _assert_failed(result_m, "cond2_consistency")
+
+    # Dữ liệu gốc không bị mutate bởi bất kỳ nhánh nào ở trên.
+    assert _passing_full_metrics()["annualized_return_pct"] == pytest.approx(12.5)
+    assert len(_passing_period_rows()) == 7
+    assert _passing_period_rows()[-1]["net_return_pct"] == pytest.approx(2.0)
+
+
+def test_compute_ols_beta_and_go_inputs_math() -> None:
+    """OLS beta đúng độ dốc và các chỉ số GO (net PnL, MaxDD, annualized) hợp lý.
+
+    Khóa công thức: beta = cov(ret, bench) / var(bench) với benchmark biến thiên
+    hằng số phải trả 0.0 (không NaN); equity tăng đơn điệu phải có MaxDD = 0 và
+    Net PnL = final_equity - initial_capital.
+    """
+    rng = np.random.default_rng(7)
+    n = 200
+    bench_values = rng.normal(0.0, 0.01, n)
+    benchmark = pd.Series(bench_values, dtype="float64")
+
+    noise = pd.Series(rng.normal(0.0, 0.001, n), dtype="float64")
+    returns_half = 0.5 * benchmark + noise
+    assert compute_ols_beta(returns_half, benchmark) == pytest.approx(0.5, abs=0.05)
+
+    returns_short = -0.3 * benchmark
+    assert compute_ols_beta(returns_short, benchmark) == pytest.approx(-0.3, abs=0.05)
+
+    constant_benchmark = pd.Series(np.full(n, 0.001), dtype="float64")
+    beta_const = compute_ols_beta(returns_half, constant_benchmark)
+    assert beta_const == pytest.approx(0.0)
+    assert math.isfinite(beta_const)
+
+    # Equity tăng đều ~1%/ngày (24 nến/ngày) bắt đầu từ 3000 USDT.
+    n_bars = 24 * 10
+    index = pd.date_range("2024-01-01", periods=n_bars, freq="1h", tz="UTC")
+    per_bar = (1.01 ** (1.0 / 24.0)) - 1.0
+    returns = pd.Series(np.full(n_bars, per_bar), index=index, dtype="float64")
+    equity = equity_from_returns(returns, initial_capital=INITIAL_CAPITAL)
+    benchmark_indexed = pd.Series(
+        rng.normal(0.0, 0.001, n_bars), index=index, dtype="float64"
+    )
+
+    go = compute_go_inputs(
+        returns=returns,
+        equity_curve=equity,
+        benchmark_returns=benchmark_indexed,
+        initial_capital=INITIAL_CAPITAL,
+    )
+
+    assert go["final_equity"] > INITIAL_CAPITAL
+    assert go["net_pnl"] == pytest.approx(go["final_equity"] - INITIAL_CAPITAL)
+    assert go["maxdd_pct"] == pytest.approx(0.0, abs=1e-6)
+    assert go["annualized_return_pct"] > 0.0
+    assert math.isfinite(go["beta_btc"])
+    assert go["n_bars"] == n_bars
+
+    # Cú sụt -50% giữa chuỗi phải cho MaxDD >= 49.0% (quy ước số dương).
+    drop_values = np.concatenate(
+        [
+            np.full(n_bars // 2 - 1, 0.001),
+            np.array([-0.5]),
+            np.full(n_bars - n_bars // 2, 0.001),
+        ]
+    )
+    drop_returns = pd.Series(drop_values, index=index, dtype="float64")
+    drop_equity = equity_from_returns(drop_returns, initial_capital=INITIAL_CAPITAL)
+    drop_go = compute_go_inputs(
+        returns=drop_returns,
+        equity_curve=drop_equity,
+        benchmark_returns=benchmark_indexed,
+        initial_capital=INITIAL_CAPITAL,
+    )
+    assert drop_go["maxdd_pct"] >= 49.0
+
+
+def test_build_period_table_for_tier_is_compounded_and_seven_periods() -> None:
+    """Bảng 7 kỳ phải nối tiếp lãi kép: vốn đầu kỳ sau = vốn cuối kỳ trước.
+
+    Chuỗi returns 1h dương đều +0.00001 kéo dài đúng 7 * 180 * 24 nến từ
+    2023-05-07 UTC. Kiểm tra số kỳ, nhãn P1..P7, toàn bộ net_return_pct > 0 và
+    ``start_capital`` của P2 bằng ``final_equity`` của P1 (sai số 1e-6) để chứng
+    minh không reset vốn về 3000 USDT ở mỗi kỳ.
+    """
+    n_bars = 7 * 180 * 24
+    index = pd.date_range("2023-05-07", periods=n_bars, freq="1h", tz="UTC")
+    returns = pd.Series(np.full(n_bars, 0.00001), index=index, dtype="float64")
+    benchmark = pd.Series(np.zeros(n_bars), index=index, dtype="float64")
+
+    table = build_period_table_for_tier(
+        returns=returns,
+        benchmark_returns=benchmark,
+        n_periods=7,
+        period_days=180,
+        initial_capital=INITIAL_CAPITAL,
+    )
+
+    assert len(table) == 7
+    assert list(table["period"]) == [f"P{i}" for i in range(1, 8)]
+    assert (table["net_return_pct"] > 0.0).all()
+    assert (table["final_equity"] > table["start_capital"]).all()
+    assert table["start_capital"].iloc[0] == pytest.approx(INITIAL_CAPITAL)
+
+    for i in range(1, 7):
+        assert table["start_capital"].iloc[i] == pytest.approx(
+            table["final_equity"].iloc[i - 1], abs=1e-6
+        )
+
+    holdout_ann = float(table["annualized_return_pct"].iloc[-1])
+    assert math.isfinite(holdout_ann)
+    assert holdout_ann > 0.0
+
+
+def test_detect_executor_state_machine_true() -> None:
+    """CarryLiveExecutor phải có execution_style mặc định và đủ 2 bước máy trạng thái.
+
+    ``detect_executor_state_machine`` trả True khi ``__init__`` có tham số
+    ``execution_style='maker_taker_hedge'`` và lớp cài đặt cả
+    ``place_maker_leg1`` lẫn ``verify_maker_fill_and_hedge_leg2``.
+    """
+    assert detect_executor_state_machine() is True
