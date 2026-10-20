@@ -27,9 +27,22 @@ EXCHANGE_LOT_SPECS: dict[str, dict[str, float]] = {
     "ETH/USDT:USDT": {"step_size": 0.01,  "min_notional": 10.0},
     "SOL/USDT:USDT": {"step_size": 0.1,   "min_notional": 10.0},
     "BNB/USDT:USDT": {"step_size": 0.01,  "min_notional": 10.0},
+    "DOGE/USDT:USDT": {"step_size": 1.0,  "min_notional": 10.0},
+    "XRP/USDT:USDT": {"step_size": 0.1,   "min_notional": 10.0},
+    "AVAX/USDT:USDT": {"step_size": 0.1,  "min_notional": 10.0},
+    "LINK/USDT:USDT": {"step_size": 0.01, "min_notional": 10.0},
 }
 LOT_STEP_SIZES: dict[str, float] = {k: v["step_size"] for k, v in EXCHANGE_LOT_SPECS.items()}
 DEFAULT_MIN_NOTIONAL: float = 10.0
+
+from src.config import CORE_4_SYMBOLS
+
+LIQUID_8_SYMBOLS: list[str] = list(CORE_4_SYMBOLS) + [
+    "DOGE/USDT:USDT",
+    "XRP/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+]
 
 
 def quantize_order_qty(
@@ -1000,5 +1013,695 @@ def run_cross_exchange_carry(
         "fees": float(total_fees_paid),
         "rebalance_fees": float(total_rebalance_fees),
         "turnover": turnover,
+        "metrics": metrics,
+    }
+
+
+
+def run_binance_tier1_plus_carry(
+    multi_aligned_data: dict[str, pd.DataFrame],
+    config: CrossExchangeCarryConfig | None = None,
+    *,
+    variant: Literal["tier1a", "tier1b"] = "tier1a",
+    top_k: int = 4,
+    buffer_rank: int = 3,
+    ema_span: int = 42,
+    min_hold_periods: int = 63,
+    entry_funding_threshold: float = 0.000045,
+    exit_funding_threshold: float = -0.00001,
+    eta: float = 0.80,
+    periods_per_year: int = 8760,
+) -> dict[str, Any]:
+    """Mô phỏng Bar-by-bar chiến lược Binance Single-Venue Tier 1+ Carry.
+
+    Hỗ trợ Chế độ Tier 1A (vũ trụ Core 4 tĩnh) và Tier 1B (vũ trụ Liquid 8 động kèm Patient Buffer).
+    Hiệu suất sử dụng vốn Unified Margin eta=0.80, True Basis MTM bar-by-bar, lượng hóa lot-size.
+
+    Tham số:
+        multi_aligned_data: Dict map {symbol: DataFrame} dữ liệu 1h đồng bộ từ align_multi_exchange_funding.
+        config: Cấu hình CrossExchangeCarryConfig hoặc None (dùng giá trị mặc định).
+        variant: 'tier1a' (core 4 tĩnh) hoặc 'tier1b' (liquid 8 động kèm patient buffer).
+        top_k: Số vị thế tối đa được nắm giữ đồng thời (mặc định 4).
+        buffer_rank: Khoảng đệm thứ hạng bảo vệ trước khi đảo vị thế (mặc định 3).
+        ema_span: Chu kỳ EMA funding 8h (mặc định 42 kỳ 8h = 14 ngày).
+        min_hold_periods: Số kỳ funding tối thiểu phải giữ trước khi thoát/đảo (mặc định 63 kỳ = 21 ngày).
+        entry_funding_threshold: Ngưỡng EWMA funding tối thiểu để mở vị thế (mặc định 0.45 bps/8h).
+        exit_funding_threshold: Ngưỡng EWMA funding đóng vị thế khi âm/hết hấp dẫn (mặc định -0.10 bps/8h).
+        eta: Hệ số hiệu suất sử dụng vốn Unified Margin (mặc định 0.80).
+        periods_per_year: Số nến 1h mỗi năm (mặc định 8760).
+
+    Trả về:
+        Dict chứa equity_curve, returns, trades_df, holdings_log, attribution_series,
+        funding_pnl, basis_pnl, basis_mtm_std, fees, rebalance_fees, turnover,
+        variant, symbol_universe, metrics.
+    """
+    empty_idx = pd.DatetimeIndex([], tz="UTC", name="datetime").as_unit("ns")
+    empty_metrics = {
+        "Total Return %": 0.0,
+        "Total Return % ": 0.0,
+        "Annualized Return %": 0.0,
+        "Sharpe": 0.0,
+        "MaxDD %": 0.0,
+        "Total Funding Collected": 0.0,
+        "Total Fees Paid": 0.0,
+        "Price Rebalances": 0,
+        "Margin Rebalances": 0,
+        "Margin Calls": 0,
+        "Maker No-Fill Count": 0,
+        "Time in Market %": 0.0,
+        "Turnover": 0.0,
+        "Num Entries": 0,
+        "Num Switches": 0,
+        "Num Rebalances": 0,
+        "Total Basis PnL": 0.0,
+        "Total MTM PnL": 0.0,
+        "Net PnL": 0.0,
+        "Forced Exits": 0,
+    }
+
+    trades_cols = [
+        "symbol", "time", "action", "mode", "short_ex", "long_ex",
+        "notional", "fee", "funding_cum", "reason", "score",
+    ]
+    holdings_cols = ["time", "symbols", "modes", "n_active", "total_notional", "equity"]
+    attr_cols = [
+        "funding_pnl", "basis_pnl", "rebalance_fees", "trading_fees",
+        "fees", "net_pnl", "notional_traded",
+    ]
+
+    target_universe = CORE_4_SYMBOLS if variant == "tier1a" else LIQUID_8_SYMBOLS
+
+    if not multi_aligned_data:
+        return {
+            "equity_curve": pd.Series([], index=empty_idx, dtype="float64", name="equity"),
+            "returns": pd.Series([], index=empty_idx, dtype="float64"),
+            "trades_df": pd.DataFrame(columns=trades_cols),
+            "holdings_log": pd.DataFrame(columns=holdings_cols),
+            "attribution_series": pd.DataFrame(columns=attr_cols, index=empty_idx, dtype="float64"),
+            "funding_pnl": 0.0,
+            "basis_pnl": 0.0,
+            "basis_mtm_std": 0.0,
+            "fees": 0.0,
+            "rebalance_fees": 0.0,
+            "turnover": 0.0,
+            "variant": variant,
+            "symbol_universe": [],
+            "metrics": empty_metrics,
+        }
+
+    # 1. Chuẩn hóa DatetimeIndex UTC ns
+    clean_aligned: dict[str, pd.DataFrame] = {}
+    for sym, df in multi_aligned_data.items():
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        if not isinstance(d.index, pd.DatetimeIndex):
+            if "datetime" in d.columns:
+                d = d.set_index("datetime")
+        if not isinstance(d.index, pd.DatetimeIndex):
+            continue
+        idx = pd.DatetimeIndex(d.index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        idx = idx.as_unit("ns")
+        idx.name = "datetime"
+        d.index = idx
+        clean_aligned[sym] = d
+
+    # Lọc universe theo cấu hình variant
+    sym_universe: list[str] = []
+    for s in target_universe:
+        if s in clean_aligned:
+            sym_universe.append(s)
+        elif s.replace(":USDT", "") in clean_aligned:
+            sym_universe.append(s.replace(":USDT", ""))
+        elif f"{s}:USDT" in clean_aligned:
+            sym_universe.append(f"{s}:USDT")
+
+    if not sym_universe:
+        return {
+            "equity_curve": pd.Series([], index=empty_idx, dtype="float64", name="equity"),
+            "returns": pd.Series([], index=empty_idx, dtype="float64"),
+            "trades_df": pd.DataFrame(columns=trades_cols),
+            "holdings_log": pd.DataFrame(columns=holdings_cols),
+            "attribution_series": pd.DataFrame(columns=attr_cols, index=empty_idx, dtype="float64"),
+            "funding_pnl": 0.0,
+            "basis_pnl": 0.0,
+            "basis_mtm_std": 0.0,
+            "fees": 0.0,
+            "rebalance_fees": 0.0,
+            "turnover": 0.0,
+            "variant": variant,
+            "symbol_universe": [],
+            "metrics": empty_metrics,
+        }
+
+    all_ts = sorted(set().union(*(clean_aligned[s].index for s in sym_universe)))
+    if not all_ts:
+        return {
+            "equity_curve": pd.Series([], index=empty_idx, dtype="float64", name="equity"),
+            "returns": pd.Series([], index=empty_idx, dtype="float64"),
+            "trades_df": pd.DataFrame(columns=trades_cols),
+            "holdings_log": pd.DataFrame(columns=holdings_cols),
+            "attribution_series": pd.DataFrame(columns=attr_cols, index=empty_idx, dtype="float64"),
+            "funding_pnl": 0.0,
+            "basis_pnl": 0.0,
+            "basis_mtm_std": 0.0,
+            "fees": 0.0,
+            "rebalance_fees": 0.0,
+            "turnover": 0.0,
+            "variant": variant,
+            "symbol_universe": sym_universe,
+            "metrics": empty_metrics,
+        }
+
+    common_index = pd.DatetimeIndex(all_ts, tz="UTC").as_unit("ns")
+    common_index.name = "datetime"
+    n_steps = len(common_index)
+
+    # 2. Khởi tạo tham số chi phí và hiệu suất vốn
+    initial_capital = float(config.initial_capital) if config is not None else 3000.0
+    one_way_cost = float(config.one_way_cost_spot_perp()) if config is not None else 0.001125
+    lot_quant = bool(getattr(config, "lot_size_quantization", True)) if config is not None else True
+    price_rebalance_trigger_pct = 0.15
+    rebalance_cost_bps = float(getattr(config, "rebalance_cost_bps", 5.0)) if config is not None else 5.0
+    enable_maker_fill = bool(
+        getattr(config, "enable_maker_fill_model", False)
+        and getattr(config, "execution", "maker_taker_hedge") == "maker_taker_hedge"
+    ) if config is not None else False
+    buffer_mult = float(getattr(config, "maker_fill_buffer_bps", 0.5)) * 1e-4 if config is not None else 0.5 * 1e-4
+    order_ttl = int(getattr(config, "maker_order_ttl_bars", 2)) if config is not None else 2
+
+    # 3. Tiền trích xuất mảng numpy tối ưu hiệu năng duyệt bar-by-bar
+    perp_prices: dict[str, np.ndarray] = {}
+    high_prices: dict[str, np.ndarray] = {}
+    low_prices: dict[str, np.ndarray] = {}
+    funding_events: dict[str, np.ndarray] = {}
+    ewma_funding_42: dict[str, np.ndarray] = {}
+    basis_arr: dict[str, np.ndarray] = {}
+
+    for sym in sym_universe:
+        df_sym = clean_aligned[sym].reindex(common_index)
+
+        # Cột giá perp: ưu tiên perp_close > close
+        if "perp_close" in df_sym.columns and df_sym["perp_close"].notna().any():
+            pe_s = df_sym["perp_close"].ffill().bfill()
+        elif "close" in df_sym.columns:
+            pe_s = df_sym["close"].ffill().bfill()
+        else:
+            pe_s = pd.Series(100.0, index=common_index)
+
+        hi_s = df_sym["high"].ffill().bfill() if "high" in df_sym.columns else pe_s
+        lo_s = df_sym["low"].ffill().bfill() if "low" in df_sym.columns else pe_s
+
+        perp_prices[sym] = pe_s.to_numpy(dtype=np.float64)
+        high_prices[sym] = hi_s.to_numpy(dtype=np.float64)
+        low_prices[sym] = lo_s.to_numpy(dtype=np.float64)
+
+        # Cột funding event Binance và EWMA funding 8h reindex 1h shift(1)
+        fe_col = None
+        for cand in ("funding_event_binance", "funding_rate_event", "funding_event"):
+            if cand in df_sym.columns:
+                fe_col = cand
+                break
+
+        if fe_col is not None:
+            funding_events[sym] = df_sym[fe_col].fillna(0.0).to_numpy(dtype=np.float64)
+            fe_s = df_sym[fe_col]
+            mask_8h = (common_index.hour.isin([0, 8, 16])) & (common_index.minute == 0)
+            fe_8h = fe_s.loc[mask_8h].dropna()
+            if not fe_8h.empty:
+                ewma_8h = fe_8h.ewm(span=ema_span, adjust=True).mean()
+                ewma_1h = ewma_8h.reindex(common_index).ffill()
+                ewma_funding_42[sym] = ewma_1h.shift(1).astype("float64").to_numpy(dtype=np.float64)
+            else:
+                ewma_funding_42[sym] = np.full(n_steps, np.nan, dtype=np.float64)
+        elif "ewma_funding_binance" in df_sym.columns:
+            funding_events[sym] = np.zeros(n_steps, dtype=np.float64)
+            ewma_funding_42[sym] = df_sym["ewma_funding_binance"].to_numpy(dtype=np.float64)
+        else:
+            funding_events[sym] = np.zeros(n_steps, dtype=np.float64)
+            ewma_funding_42[sym] = np.full(n_steps, np.nan, dtype=np.float64)
+
+        # Cột basis_pct cho True Basis MTM
+        if "basis_pct" in df_sym.columns:
+            basis_arr[sym] = df_sym["basis_pct"].fillna(0.0).to_numpy(dtype=np.float64)
+        elif "perp_close" in df_sym.columns and "spot_close" in df_sym.columns:
+            sc = df_sym["spot_close"].replace(0.0, np.nan)
+            basis_arr[sym] = ((df_sym["perp_close"] - sc) / sc).fillna(0.0).to_numpy(dtype=np.float64)
+        else:
+            basis_arr[sym] = np.zeros(n_steps, dtype=np.float64)
+
+    # 4. Khởi tạo trạng thái danh mục
+    equity = float(initial_capital)
+    in_position: dict[str, bool] = {s: False for s in sym_universe}
+    periods_held: dict[str, int] = {s: 0 for s in sym_universe}
+    notional: dict[str, float] = {s: 0.0 for s in sym_universe}
+    ref_perp_price: dict[str, float] = {s: 0.0 for s in sym_universe}
+    trade_funding_cum: dict[str, float] = {s: 0.0 for s in sym_universe}
+    prev_basis: dict[str, float] = {s: float(basis_arr[s][0]) if n_steps > 0 else 0.0 for s in sym_universe}
+
+    pending_maker_orders: dict[str, dict[str, Any]] = {}
+
+    total_funding_collected = 0.0
+    total_trading_fees = 0.0
+    total_rebalance_fees = 0.0
+    total_notional_traded = 0.0
+    price_rebalances = 0
+    margin_rebalances = 0
+    maker_no_fill_count = 0
+    num_entries = 0
+    num_switches = 0
+    forced_exits = 0
+
+    trades_list: list[dict[str, Any]] = []
+    holdings_log_list: list[dict[str, Any]] = []
+
+    equity_vals = np.empty(n_steps, dtype=np.float64)
+    in_market_any = np.zeros(n_steps, dtype=bool)
+
+    hourly_funding_pnl = np.zeros(n_steps, dtype=np.float64)
+    hourly_basis_pnl = np.zeros(n_steps, dtype=np.float64)
+    hourly_rebalance_fees = np.zeros(n_steps, dtype=np.float64)
+    hourly_trading_fees = np.zeros(n_steps, dtype=np.float64)
+    hourly_notional_traded = np.zeros(n_steps, dtype=np.float64)
+
+    hours = common_index.hour
+    minutes = common_index.minute
+
+    # 5. Vòng lặp mô phỏng bar-by-bar (1 tầng trên trục thời gian)
+    for t_idx, t in enumerate(common_index):
+        notional_start = {s: notional[s] for s in sym_universe}
+
+        # -------------------------------------------------------------
+        # Bước 1: Mô hình Maker Fill cho pending orders (nếu bật)
+        # -------------------------------------------------------------
+        if pending_maker_orders:
+            for sym in list(pending_maker_orders.keys()):
+                order = pending_maker_orders[sym]
+                hi_t = high_prices[sym][t_idx]
+                limit_p = order["limit_price"]
+                is_filled = not np.isnan(hi_t) and hi_t >= limit_p
+
+                if is_filled and not in_position[sym] and equity > 0:
+                    leg_notional = float(order["notional"])
+                    if lot_quant and leg_notional <= 0.0:
+                        maker_no_fill_count += 1
+                        del pending_maker_orders[sym]
+                        continue
+
+                    fee = leg_notional * float(order["one_way_cost"])
+                    equity -= fee
+                    total_trading_fees += fee
+                    hourly_trading_fees[t_idx] += fee
+                    total_notional_traded += leg_notional
+                    hourly_notional_traded[t_idx] += leg_notional
+
+                    in_position[sym] = True
+                    notional[sym] = leg_notional
+                    periods_held[sym] = 0
+                    trade_funding_cum[sym] = 0.0
+                    ref_perp_price[sym] = perp_prices[sym][t_idx]
+                    num_entries += 1
+
+                    trades_list.append({
+                        "symbol": sym,
+                        "time": t,
+                        "action": "open",
+                        "mode": variant,
+                        "short_ex": "binance",
+                        "long_ex": "spot",
+                        "notional": float(leg_notional),
+                        "fee": float(fee),
+                        "funding_cum": 0.0,
+                        "reason": "OPEN_MAKER_FILLED",
+                        "score": float(order["score"]),
+                    })
+                    del pending_maker_orders[sym]
+                else:
+                    order["ttl_remaining"] -= 1
+                    if order["ttl_remaining"] <= 0:
+                        maker_no_fill_count += 1
+                        del pending_maker_orders[sym]
+
+        # -------------------------------------------------------------
+        # Bước 2: Rebalance ký quỹ khi biến động giá >= ±15%
+        # -------------------------------------------------------------
+        for sym in sym_universe:
+            if in_position[sym]:
+                pe_curr = perp_prices[sym][t_idx]
+                ref_p = ref_perp_price[sym]
+                if ref_p > 0.0 and not np.isnan(pe_curr):
+                    price_move = abs(pe_curr - ref_p) / ref_p
+                    if price_move >= price_rebalance_trigger_pct:
+                        reb_fee = notional[sym] * (rebalance_cost_bps * 1e-4)
+                        equity -= reb_fee
+                        total_rebalance_fees += reb_fee
+                        hourly_rebalance_fees[t_idx] += reb_fee
+                        total_notional_traded += notional[sym]
+                        hourly_notional_traded[t_idx] += notional[sym]
+                        price_rebalances += 1
+                        margin_rebalances += 1
+                        ref_perp_price[sym] = pe_curr
+
+                        trades_list.append({
+                            "symbol": sym,
+                            "time": t,
+                            "action": "rebalance",
+                            "mode": variant,
+                            "short_ex": "binance",
+                            "long_ex": "spot",
+                            "notional": float(notional[sym]),
+                            "fee": float(reb_fee),
+                            "funding_cum": float(trade_funding_cum[sym]),
+                            "reason": "PRICE_REBALANCE_15PCT",
+                            "score": float(ewma_funding_42[sym][t_idx]) if np.isfinite(ewma_funding_42[sym][t_idx]) else 0.0,
+                        })
+
+        # -------------------------------------------------------------
+        # Bước 3: Thu Funding Rate tại các mốc 8h (00, 08, 16 UTC)
+        # -------------------------------------------------------------
+        is_8h_event = (hours[t_idx] in (0, 8, 16)) and (minutes[t_idx] == 0)
+        if is_8h_event:
+            for sym in sym_universe:
+                if in_position[sym]:
+                    fe = float(funding_events[sym][t_idx])
+                    f_pnl = notional[sym] * fe
+                    equity += f_pnl
+                    trade_funding_cum[sym] += f_pnl
+                    total_funding_collected += f_pnl
+                    hourly_funding_pnl[t_idx] += f_pnl
+                    periods_held[sym] += 1
+
+        # -------------------------------------------------------------
+        # Bước 3b: True Basis MTM PnL từng nến 1h
+        # -------------------------------------------------------------
+        for sym in sym_universe:
+            if in_position[sym] and notional_start[sym] > 0.0:
+                delta_basis = -notional_start[sym] * (basis_arr[sym][t_idx] - prev_basis[sym])
+                hourly_basis_pnl[t_idx] += delta_basis
+                equity += delta_basis
+            prev_basis[sym] = float(basis_arr[sym][t_idx])
+
+        # -------------------------------------------------------------
+        # Bước 4: Hysteresis, Patient Buffer & Xoay vòng danh mục (mỗi 8h)
+        # -------------------------------------------------------------
+        if is_8h_event:
+            scores = {s: ewma_funding_42[s][t_idx] for s in sym_universe}
+            ranked_symbols = sorted(
+                sym_universe,
+                key=lambda s: scores[s] if np.isfinite(scores[s]) else -np.inf,
+                reverse=True,
+            )
+            ranks = {s: i + 1 for i, s in enumerate(ranked_symbols)}
+            drop_rank_threshold = top_k + buffer_rank
+
+            closed_this_bar: set[str] = set()
+
+            # 4.1 Kiểm tra thoát vị thế âm sâu/hết hấp dẫn
+            for sym in sym_universe:
+                if in_position[sym]:
+                    sc = scores[sym]
+                    if periods_held[sym] >= min_hold_periods and (not np.isfinite(sc) or sc <= exit_funding_threshold):
+                        pos_notional = notional[sym]
+                        close_fee = pos_notional * one_way_cost
+                        equity -= close_fee
+                        total_trading_fees += close_fee
+                        hourly_trading_fees[t_idx] += close_fee
+                        total_notional_traded += pos_notional
+                        hourly_notional_traded[t_idx] += pos_notional
+                        forced_exits += 1
+
+                        trades_list.append({
+                            "symbol": sym,
+                            "time": t,
+                            "action": "close",
+                            "mode": variant,
+                            "short_ex": "binance",
+                            "long_ex": "spot",
+                            "notional": float(pos_notional),
+                            "fee": float(close_fee),
+                            "funding_cum": float(trade_funding_cum[sym]),
+                            "reason": "EXIT_NEGATIVE_YIELD",
+                            "score": float(sc) if np.isfinite(sc) else 0.0,
+                        })
+
+                        in_position[sym] = False
+                        notional[sym] = 0.0
+                        periods_held[sym] = 0
+                        trade_funding_cum[sym] = 0.0
+                        ref_perp_price[sym] = 0.0
+                        closed_this_bar.add(sym)
+
+            # 4.2 Kiểm tra đảo vị thế theo Patient Buffer (chỉ áp dụng cho Tier 1B)
+            if variant == "tier1b":
+                earmarked_candidates: set[str] = set()
+                for sym in sym_universe:
+                    if in_position[sym] and sym not in closed_this_bar:
+                        sc = scores[sym]
+                        if periods_held[sym] >= min_hold_periods and ranks[sym] > drop_rank_threshold:
+                            cand_found = None
+                            for cand in ranked_symbols:
+                                if (
+                                    not in_position[cand]
+                                    and cand not in pending_maker_orders
+                                    and cand not in earmarked_candidates
+                                    and np.isfinite(scores[cand])
+                                    and scores[cand] >= entry_funding_threshold
+                                ):
+                                    cand_found = cand
+                                    break
+
+                            if cand_found is not None:
+                                earmarked_candidates.add(cand_found)
+                                pos_notional = notional[sym]
+                                close_fee = pos_notional * one_way_cost
+                                equity -= close_fee
+                                total_trading_fees += close_fee
+                                hourly_trading_fees[t_idx] += close_fee
+                                total_notional_traded += pos_notional
+                                hourly_notional_traded[t_idx] += pos_notional
+                                num_switches += 1
+
+                                trades_list.append({
+                                    "symbol": sym,
+                                    "time": t,
+                                    "action": "close",
+                                    "mode": variant,
+                                    "short_ex": "binance",
+                                    "long_ex": "spot",
+                                    "notional": float(pos_notional),
+                                    "fee": float(close_fee),
+                                    "funding_cum": float(trade_funding_cum[sym]),
+                                    "reason": "SWITCH_RANK_DROP",
+                                    "score": float(sc) if np.isfinite(sc) else 0.0,
+                                })
+
+                                in_position[sym] = False
+                                notional[sym] = 0.0
+                                periods_held[sym] = 0
+                                trade_funding_cum[sym] = 0.0
+                                ref_perp_price[sym] = 0.0
+                                closed_this_bar.add(sym)
+
+            # 4.3 Mở vị thế mới cho các slot còn trống
+            active_symbols = [s for s in sym_universe if in_position[s]]
+            n_pending = len(pending_maker_orders)
+            n_slots_available = max(0, top_k - len(active_symbols) - n_pending)
+
+            if n_slots_available > 0 and equity > 0:
+                open_candidates = [
+                    s for s in ranked_symbols
+                    if not in_position[s]
+                    and s not in pending_maker_orders
+                    and np.isfinite(scores[s])
+                    and scores[s] >= entry_funding_threshold
+                ]
+
+                for sym in open_candidates[:n_slots_available]:
+                    allocated = equity / float(top_k)
+                    leg_notional = allocated * float(eta)
+                    sc = scores[sym]
+
+                    pe_prev = perp_prices[sym][t_idx - 1] if t_idx > 0 else perp_prices[sym][t_idx]
+                    if np.isnan(pe_prev) or pe_prev <= 0:
+                        pe_prev = perp_prices[sym][t_idx]
+                    limit_p = pe_prev * (1.0 + buffer_mult)
+
+                    entry_price = float(limit_p if enable_maker_fill else perp_prices[sym][t_idx])
+                    if np.isnan(entry_price) or entry_price <= 0:
+                        entry_price = float(perp_prices[sym][t_idx]) if not np.isnan(perp_prices[sym][t_idx]) and perp_prices[sym][t_idx] > 0 else 1.0
+
+                    if lot_quant:
+                        q_qty, actual_notional = quantize_order_qty(sym, leg_notional, entry_price)
+                        if q_qty <= 0.0 or actual_notional <= 0.0:
+                            maker_no_fill_count += 1
+                            continue
+                        leg_notional = actual_notional
+
+                    if enable_maker_fill:
+                        pending_maker_orders[sym] = {
+                            "notional": float(leg_notional),
+                            "one_way_cost": float(one_way_cost),
+                            "side": "sell",
+                            "limit_price": float(limit_p),
+                            "ttl_remaining": int(order_ttl),
+                            "score": float(sc),
+                        }
+                    else:
+                        fee = leg_notional * one_way_cost
+                        equity -= fee
+                        total_trading_fees += fee
+                        hourly_trading_fees[t_idx] += fee
+                        total_notional_traded += leg_notional
+                        hourly_notional_traded[t_idx] += leg_notional
+
+                        in_position[sym] = True
+                        notional[sym] = leg_notional
+                        periods_held[sym] = 0
+                        trade_funding_cum[sym] = 0.0
+                        ref_perp_price[sym] = perp_prices[sym][t_idx]
+                        num_entries += 1
+
+                        trades_list.append({
+                            "symbol": sym,
+                            "time": t,
+                            "action": "open",
+                            "mode": variant,
+                            "short_ex": "binance",
+                            "long_ex": "spot",
+                            "notional": float(leg_notional),
+                            "fee": float(fee),
+                            "funding_cum": 0.0,
+                            "reason": "OPEN_TIER1_CARRY",
+                            "score": float(sc),
+                        })
+
+            # Snapshot holdings tại mốc 8h
+            act_s = [s for s in sym_universe if in_position[s]]
+            act_m = [variant for _ in act_s]
+            tot_not = sum(notional[s] for s in act_s)
+            holdings_log_list.append({
+                "time": t,
+                "symbols": act_s,
+                "modes": act_m,
+                "n_active": len(act_s),
+                "total_notional": float(tot_not),
+                "equity": float(equity),
+            })
+
+        # -------------------------------------------------------------
+        # Bước 5: Ghi nhận equity và trạng thái từng nến
+        # -------------------------------------------------------------
+        equity_vals[t_idx] = equity
+        in_market_any[t_idx] = any(in_position.values())
+
+    # 6. Xây dựng các DataFrame và Series kết quả
+    equity_curve = pd.Series(equity_vals, index=common_index, dtype="float64", name="equity")
+    returns = equity_curve.pct_change().fillna(0.0)
+
+    trades_df = pd.DataFrame(trades_list) if trades_list else pd.DataFrame(columns=trades_cols)
+    for col in trades_cols:
+        if col not in trades_df.columns:
+            trades_df[col] = np.nan
+
+    holdings_log = pd.DataFrame(holdings_log_list) if holdings_log_list else pd.DataFrame(columns=holdings_cols)
+
+    hourly_fees = hourly_trading_fees + hourly_rebalance_fees
+    hourly_net_pnl = hourly_funding_pnl + hourly_basis_pnl - hourly_fees
+
+    attribution_series = pd.DataFrame(
+        {
+            "funding_pnl": hourly_funding_pnl,
+            "basis_pnl": hourly_basis_pnl,
+            "rebalance_fees": hourly_rebalance_fees,
+            "trading_fees": hourly_trading_fees,
+            "fees": hourly_fees,
+            "net_pnl": hourly_net_pnl,
+            "notional_traded": hourly_notional_traded,
+        },
+        index=common_index,
+        dtype="float64",
+    )
+
+    total_hours = len(common_index)
+    years = total_hours / float(periods_per_year) if periods_per_year > 0 else 0.0
+
+    if initial_capital > 0:
+        total_return_pct = ((equity - initial_capital) / initial_capital) * 100.0
+        if years > 0 and equity > 0:
+            annualized_return_pct = (
+                ((equity / initial_capital) ** (1.0 / years) - 1.0) * 100.0
+            )
+        else:
+            annualized_return_pct = -100.0 if equity <= 0 else 0.0
+    else:
+        total_return_pct = 0.0
+        annualized_return_pct = 0.0
+
+    ret_std = float(returns.std(ddof=1))
+    if ret_std > 1e-12 and len(returns) > 1:
+        sharpe = float(returns.mean() / ret_std * math.sqrt(periods_per_year))
+    else:
+        sharpe = 0.0
+
+    peak = np.maximum.accumulate(equity_vals)
+    valid_peak = peak > 0
+    if np.any(valid_peak):
+        dd = (peak[valid_peak] - equity_vals[valid_peak]) / peak[valid_peak]
+        max_dd_pct = float(np.nanmax(dd) * 100.0)
+    else:
+        max_dd_pct = 0.0
+
+    time_in_market_pct = float(np.mean(in_market_any) * 100.0) if len(in_market_any) > 0 else 0.0
+    turnover = (
+        float(total_notional_traded / initial_capital)
+        if initial_capital > 0
+        else 0.0
+    )
+
+    total_fees_paid = total_trading_fees + total_rebalance_fees
+    total_basis_pnl = float(hourly_basis_pnl.sum())
+    basis_mtm_std = float(np.std(hourly_basis_pnl)) if len(hourly_basis_pnl) > 0 else 0.0
+
+    metrics = {
+        "Total Return %": total_return_pct,
+        "Total Return % ": total_return_pct,
+        "Annualized Return %": annualized_return_pct,
+        "Sharpe": sharpe,
+        "MaxDD %": max_dd_pct,
+        "Total Funding Collected": float(total_funding_collected),
+        "Total Fees Paid": float(total_fees_paid),
+        "Price Rebalances": int(price_rebalances),
+        "Margin Rebalances": int(margin_rebalances),
+        "Margin Calls": 0,
+        "Maker No-Fill Count": int(maker_no_fill_count),
+        "Time in Market %": time_in_market_pct,
+        "Turnover": turnover,
+        "Num Entries": int(num_entries),
+        "Num Switches": int(num_switches),
+        "Num Rebalances": int(price_rebalances),
+        "Total Basis PnL": total_basis_pnl,
+        "Total MTM PnL": total_basis_pnl,
+        "Net PnL": float(equity - initial_capital),
+        "Forced Exits": int(forced_exits),
+    }
+
+    return {
+        "equity_curve": equity_curve,
+        "returns": returns,
+        "trades_df": trades_df,
+        "holdings_log": holdings_log,
+        "attribution_series": attribution_series,
+        "funding_pnl": float(total_funding_collected),
+        "basis_pnl": total_basis_pnl,
+        "basis_mtm_std": basis_mtm_std,
+        "fees": float(total_fees_paid),
+        "rebalance_fees": float(total_rebalance_fees),
+        "turnover": turnover,
+        "variant": variant,
+        "symbol_universe": sym_universe,
         "metrics": metrics,
     }
