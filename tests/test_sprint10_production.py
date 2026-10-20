@@ -353,3 +353,266 @@ def test_default_config_matches_sprint10_spec() -> None:
     assert config.entry_funding_threshold == pytest.approx(0.00005)
     assert config.exit_funding_threshold == pytest.approx(-0.00001)
     assert config.lot_size_quantization is True
+
+
+# ===========================================================================
+# Sprint 10 — Chặng 2: SNR Regime Gate, Volatility Targeting, DD Cushion
+# ===========================================================================
+from src.barbell_portfolio import BarbellConfig, run_barbell_portfolio  # noqa: E402
+
+OVERLAY_SYMBOLS = [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+]
+
+
+def _overlay_index(periods: int) -> pd.DatetimeIndex:
+    """DatetimeIndex 1h UTC ns tên ``datetime`` cho dữ liệu overlay."""
+    index = pd.date_range(
+        "2024-01-01", periods=periods, freq="h", tz="UTC"
+    ).as_unit("ns")
+    index.name = "datetime"
+    return index
+
+
+def _overlay_frame(index: pd.DatetimeIndex, close: np.ndarray) -> pd.DataFrame:
+    """Dựng DataFrame đủ schema cho cả Carry và Overlay với funding/spread = 0.
+
+    ``cross_ex_spread``, ``max_single_funding`` và toàn bộ funding event đều
+    bằng 0 nên Core Carry không bao giờ mở vị thế; nhờ vậy mọi biến động vốn
+    đo được đều quy về Tactical Overlay. Không có ``best_short_ex`` để chắc
+    chắn Chế độ B cũng không có ứng viên.
+    """
+    close_arr = np.asarray(close, dtype="float64")
+    n = len(close_arr)
+    zeros = lambda: np.zeros(n, dtype="float64")  # noqa: E731
+    frame = pd.DataFrame(
+        {
+            "open": close_arr,
+            "high": close_arr * 1.0005,
+            "low": close_arr * 0.9995,
+            "close": close_arr,
+            "volume": np.full(n, 1000.0, dtype="float64"),
+            "perp_close": close_arr,
+            "spot_close": close_arr,
+            "basis_pct": zeros(),
+            "funding_event_binance": zeros(),
+            "funding_event_bybit": zeros(),
+            "ewma_funding_binance": zeros(),
+            "ewma_funding_bybit": zeros(),
+            "max_single_funding": zeros(),
+            "min_single_funding": zeros(),
+            "cross_ex_spread": zeros(),
+        },
+        index=index.copy(),
+    )
+    frame.index.name = "datetime"
+    return frame
+
+
+def _price_path(returns: np.ndarray, start: float = 100.0) -> np.ndarray:
+    """Ghép chuỗi giá từ returns 1h cho trước (giá nến 0 = ``start*(1+r0)``)."""
+    return start * np.cumprod(1.0 + np.asarray(returns, dtype="float64"))
+
+
+def _four_symbol_data(
+    close_map: dict[str, np.ndarray],
+    index: pd.DatetimeIndex,
+) -> dict[str, pd.DataFrame]:
+    """Đóng gói 4 symbol Core-4 thành dict dữ liệu đã đồng bộ."""
+    return {sym: _overlay_frame(index, close_map[sym]) for sym in OVERLAY_SYMBOLS}
+
+
+def _trend_overlay_data(periods: int, noise_amp: float) -> dict[str, pd.DataFrame]:
+    """Trend phân hóa mạnh để SNR gate bật, nhiễu xen kẽ đặt ngược pha.
+
+    Coin 0 tăng 0.05%/h, coin 3 giảm 0.05%/h, 2 coin giữa đi ngang. Nhiễu
+    ``±noise_amp`` xen kẽ và ngược dấu giữa chân long và chân short khiến độ
+    lệch chuẩn của ``r_long - r_short`` tỷ lệ thuận với ``noise_amp`` - đúng
+    biến mà Volatility Targeting dùng để nghịch đảo đòn bẩy.
+    """
+    index = _overlay_index(periods)
+    steps = np.arange(periods, dtype="float64")
+    alternator = np.where(steps % 2 == 0, 1.0, -1.0)
+    base_noise = noise_amp * alternator
+
+    close_map = {
+        OVERLAY_SYMBOLS[0]: _price_path(0.0005 + base_noise),
+        OVERLAY_SYMBOLS[3]: _price_path(-0.0005 - base_noise),
+        OVERLAY_SYMBOLS[1]: _price_path(0.1 * base_noise),
+        OVERLAY_SYMBOLS[2]: _price_path(-0.1 * base_noise),
+    }
+    return _four_symbol_data(close_map, index)
+
+
+def _reversal_overlay_data(
+    periods: int = 1600,
+    reversal_start: int = 1200,
+    noise_amp: float = 0.0005,
+) -> dict[str, pd.DataFrame]:
+    """Trend phân hóa mạnh 1200 nến rồi đảo chiều 0.5%/h trong phần còn lại.
+
+    Cú đảo chiều tạo drawdown sâu cho cặp long-short đang giữ vị thế cũ, đủ để
+    kích hoạt cả mức cắt 50% (DD > 4%) lẫn mức tắt hẳn (DD > 6%).
+    """
+    index = _overlay_index(periods)
+    steps = np.arange(periods, dtype="float64")
+    alternator = np.where(steps % 2 == 0, 1.0, -1.0)
+    base_noise = noise_amp * alternator
+
+    drift_long = np.where(steps < reversal_start, 0.0005, -0.005)
+    drift_short = np.where(steps < reversal_start, -0.0005, 0.005)
+
+    close_map = {
+        OVERLAY_SYMBOLS[0]: _price_path(drift_long + base_noise),
+        OVERLAY_SYMBOLS[3]: _price_path(drift_short - base_noise),
+        OVERLAY_SYMBOLS[1]: _price_path(0.1 * base_noise),
+        OVERLAY_SYMBOLS[2]: _price_path(-0.1 * base_noise),
+    }
+    return _four_symbol_data(close_map, index)
+
+
+def _barbell_config(**overrides: object) -> BarbellConfig:
+    """Config Barbell tất định: Carry tắt giao dịch, các gate bật mặc định."""
+    base: dict[str, object] = {
+        "initial_capital": INITIAL_CAPITAL,
+        "carry_config": _carry_config(),
+        "overlay_lookback_hours": 336,
+        "overlay_rebalance_hours": 48,
+    }
+    base.update(overrides)
+    return BarbellConfig(**base)
+
+
+# ---------------------------------------------------------------------------
+# 7. SNR Gate phải đóng hoàn toàn trong thị trường đi ngang
+# ---------------------------------------------------------------------------
+def test_sideways_market_disables_overlay_by_snr_gate() -> None:
+    """Đi ngang: SNR dispersion < 1.35 nên gate khóa overlay, equity = Carry.
+
+    Đây là bằng chứng lỗi "z-score hằng-đúng" đã bị diệt: 4 coin cùng một
+    sóng sin biên độ 1e-4 và pha lệch rất ít, dispersion gần 0. Vì vậy
+    ``overlay_active_ratio`` phải bằng đúng 0 và đường cong vốn Barbell phải
+    trùng khít đường cong vốn Carry (overlay không được cấp đòn bẩy).
+    """
+    n = 1500
+    index = _overlay_index(n)
+    steps = np.arange(n, dtype="float64")
+
+    close_map: dict[str, np.ndarray] = {}
+    for i, sym in enumerate(OVERLAY_SYMBOLS):
+        phase = 0.05 * i
+        sin_wave = np.sin(2.0 * np.pi * steps / 24.0 + phase)
+        close_map[sym] = 100.0 * (1.0 + 1e-4 * sin_wave)
+
+    data = _four_symbol_data(close_map, index)
+    config = _barbell_config(
+        overlay_lookback_hours=336,
+        overlay_rebalance_hours=48,
+        overlay_min_snr_dispersion=1.35,
+        overlay_exit_snr_dispersion=0.95,
+    )
+    res = run_barbell_portfolio(data, config)
+
+    assert res["overlay_active_ratio"] == pytest.approx(0.0)
+
+    np.testing.assert_allclose(
+        res["equity_curve"].to_numpy(dtype="float64"),
+        res["carry_result"]["equity_curve"].to_numpy(dtype="float64"),
+        rtol=0.0,
+        atol=1e-9,
+    )
+
+    dispersion = res["snr_dispersion"].dropna()
+    assert not dispersion.empty, "Cần ít nhất một nến có SNR hợp lệ để kiểm tra"
+    assert float(dispersion.max()) < 1.35
+
+
+# ---------------------------------------------------------------------------
+# 8. Volatility Targeting: pair vol gấp đôi phải hạ đòn bẩy
+# ---------------------------------------------------------------------------
+def test_vol_targeting_reduces_leverage_when_pair_vol_doubles() -> None:
+    """Biến động cặp long-short gấp đôi phải kéo leverage trung bình xuống < 85%.
+
+    Hai dataset cùng trend phân hóa (gate ON) và chỉ khác biên độ nhiễu xen kẽ
+    (±0.05% so với ±0.10%). Vol Targeting nghịch đảo vol nên B phải bị hạ đòn
+    bẩy rõ rệt; mọi giá trị active vẫn nằm trong dải [0.05, 0.45].
+    """
+    n = 2000
+    data_a = _trend_overlay_data(n, noise_amp=0.0005)
+    data_b = _trend_overlay_data(n, noise_amp=0.0010)
+
+    config = _barbell_config(
+        enable_overlay=True,
+        enable_snr_gate=True,
+        enable_vol_targeting=True,
+        overlay_target_vol_ann=0.065,
+        overlay_vol_lookback=168,
+        overlay_leverage_min=0.05,
+        overlay_leverage_max=0.45,
+        overlay_lookback_hours=336,
+        overlay_rebalance_hours=48,
+    )
+    res_a = run_barbell_portfolio(data_a, config)
+    res_b = run_barbell_portfolio(data_b, config)
+
+    lev_a = res_a["overlay_leverage_series"]
+    lev_b = res_b["overlay_leverage_series"]
+
+    # Gate phải bật ở cả hai dataset, nếu không phép so sánh là vô nghĩa.
+    assert res_a["metrics"]["overlay_gate_on_ratio"] > 0.0
+    assert res_b["metrics"]["overlay_gate_on_ratio"] > 0.0
+
+    assert float(lev_a.mean()) > 0.0
+    assert float(lev_b.mean()) < 0.85 * float(lev_a.mean())
+
+    for series in (lev_a, lev_b):
+        active = series[series > 1e-12]
+        assert not active.empty
+        assert float(active.min()) >= 0.05 - 1e-12
+        assert float(active.max()) <= 0.45 + 1e-12
+        assert 0.05 <= float(series.mean()) <= 0.45
+
+
+# ---------------------------------------------------------------------------
+# 9. Drawdown Cushion: cắt rồi tắt hẳn đòn bẩy sau cú lỗ lớn
+# ---------------------------------------------------------------------------
+def test_drawdown_cushion_scales_down_leverage_after_loss() -> None:
+    """Đảo chiều mạnh sau 1200 nến phải kích hoạt DD Cushion và tắt hẳn leverage.
+
+    Giai đoạn đầu trend phân hóa giữ gate ON và leverage dương. Cú đảo chiều
+    0.5%/h làm equity Barbell sụt quá 4% rồi quá 6% so với đỉnh, nên
+    ``drawdown_cushion_events`` > 0 và đòn bẩy overlay về đúng 0.0 sau mốc đảo
+    chiều, trong khi giai đoạn trước đó vẫn có leverage > 0.
+    """
+    n = 1600
+    reversal_start = 1200
+    data = _reversal_overlay_data(periods=n, reversal_start=reversal_start)
+    config = _barbell_config(
+        enable_overlay=True,
+        enable_snr_gate=True,
+        enable_vol_targeting=True,
+        enable_drawdown_cushion=True,
+        overlay_dd_cut_threshold=0.04,
+        overlay_dd_off_threshold=0.06,
+        overlay_target_vol_ann=0.065,
+        overlay_vol_lookback=168,
+        overlay_leverage_min=0.05,
+        overlay_leverage_max=0.45,
+        overlay_lookback_hours=336,
+        overlay_rebalance_hours=48,
+    )
+    res = run_barbell_portfolio(data, config)
+
+    metrics = res["metrics"]
+    # Tên key thực tế trong src/barbell_portfolio.py là 'drawdown_cushion_events'.
+    assert metrics["drawdown_cushion_events"] > 0
+
+    lev = res["overlay_leverage_series"]
+    assert float(lev.max()) > 0.0
+    assert float(lev.min()) == pytest.approx(0.0)
+    # Sau cú đảo chiều, cushion phải tắt hẳn overlay (leverage = 0 tuyệt đối).
+    assert float(lev.iloc[reversal_start:].min()) == pytest.approx(0.0)
+    assert float(lev.iloc[:reversal_start].max()) > 0.0
