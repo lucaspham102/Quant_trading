@@ -203,9 +203,15 @@ def main(argv: list[str] | None = None) -> int:
 
         if strat == "barbell":
             try:
-                from src.cross_exchange_carry import CORE_4_SYMBOLS
+                from src.cross_exchange_carry import CORE_4_SYMBOLS, LIQUID_8_SYMBOLS
             except (ImportError, AttributeError):
                 CORE_4_SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT"]
+                LIQUID_8_SYMBOLS = list(CORE_4_SYMBOLS) + [
+                    "DOGE/USDT:USDT",
+                    "XRP/USDT:USDT",
+                    "AVAX/USDT:USDT",
+                    "LINK/USDT:USDT",
+                ]
             from src.barbell_portfolio import BarbellConfig
 
             venues: dict[str, Any] = {
@@ -220,8 +226,15 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as e:
                     logger.warning("Could not initialize Bybit exchange for venues: %s", e)
 
-            overlay_cfg = BarbellConfig(initial_capital=float(args.capital))
-            logger.info("Universe: CORE-4 | Venues: %s | Lot quantization: ON", sorted(venues.keys()))
+            overlay_cfg = BarbellConfig(
+                initial_capital=float(args.capital),
+                carry_variant="tier1b",
+                gating_mode="smooth_conviction",
+            )
+            barbell_symbols = list(LIQUID_8_SYMBOLS)
+            logger.info(
+                "Universe: LIQUID-8 | Venues: %s | Lot quantization: ON", sorted(venues.keys())
+            )
 
             executor = CarryLiveExecutor(
                 config=trading_config,
@@ -232,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                 spot_exchange=spot_exchange,
                 capital=float(args.capital),
                 execution_style=args.execution_style,
-                symbols=CORE_4_SYMBOLS,
+                symbols=barbell_symbols,
                 venues=venues,
                 overlay_config=overlay_cfg,
                 enable_lot_quantization=True,

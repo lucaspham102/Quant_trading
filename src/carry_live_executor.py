@@ -16,7 +16,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -155,6 +155,8 @@ class CarryLiveExecutor:
                 for k, v in self.state.carry_positions.items()
                 if isinstance(v, dict)
             }
+
+        self.executor_functional: bool = bool(getattr(self.state, "executor_functional", False))
 
     def _get_exchange(self, name: str) -> Any:
         """Lấy đối tượng sàn giao dịch từ exchange_map hoặc fallback."""
@@ -567,6 +569,166 @@ class CarryLiveExecutor:
             self.state.carry_positions[symbol]["execution_state"] = "IDLE"
         return cancelled
 
+    def execute_maker_then_taker_pair(
+        self,
+        symbol: str,
+        side: str,
+        target_qty: float,
+        ref_price: float,
+        exchange_short: str = "binance",
+        exchange_long: str = "binance_spot",
+        spot_symbol: Optional[str] = None,
+        is_close: bool = False,
+        maker_ttl_sec: float = 60.0,
+        poll_interval_sec: float = 1.0,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+    ) -> dict[str, Any]:
+        """Thuc thi cap lenh Maker roi Taker Hedge (POST_ONLY_LEG_1 -> MARKET_HEDGE_LEG_2)."""
+        sleep_fn = sleep_fn or time.sleep
+        leg1 = self.place_maker_leg1(
+            symbol,
+            side=side,  # type: ignore[arg-type]
+            target_qty=target_qty,
+            ref_price=ref_price,
+            exchange_short=exchange_short,
+            exchange_long=exchange_long,
+            spot_symbol=spot_symbol,
+            is_close=is_close,
+        )
+
+        resolved_spot_symbol = spot_symbol or symbol.split(":")[0]
+        order_sym = resolved_spot_symbol if is_close else symbol
+        leg1_ex_name = (
+            exchange_long
+            if (is_close and exchange_short not in ("binance_spot", "spot"))
+            else exchange_short
+        )
+        leg1_ex = self._get_exchange(leg1_ex_name)
+
+        cancelled = False
+        if self.mode == "live":
+            max_rounds = max(1, int(math.ceil(maker_ttl_sec / max(poll_interval_sec, 1e-3))))
+            for _ in range(max_rounds):
+                sleep_fn(poll_interval_sec)
+                info = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+                order_id = info.get("leg1_order_id")
+                if not order_id:
+                    break
+
+                order_data: Optional[dict[str, Any]] = None
+                if leg1_ex is not None and hasattr(leg1_ex, "fetch_order") and callable(leg1_ex.fetch_order):
+                    try:
+                        order_data = leg1_ex.fetch_order(str(order_id), order_sym)
+                    except Exception as e:
+                        logger.warning("fetch_order %s failed for %s on %s: %s", order_id, order_sym, leg1_ex_name, e)
+
+                if order_data is not None and isinstance(order_data, dict):
+                    raw_st = str(order_data.get("status", "")).lower()
+                    f_qty = float(order_data.get("filled", 0.0) or 0.0)
+                    hedged_now = float(info.get("leg2_hedged_qty", 0.0) or 0.0)
+                    if raw_st in ("closed", "filled"):
+                        l1_status = "FILLED"
+                        exec_state = "POST_ONLY_LEG_1"
+                    elif raw_st in ("canceled", "cancelled", "expired"):
+                        l1_status = "CANCELED" if f_qty <= 1e-12 else "PARTIAL_FILLED"
+                        exec_state = "IDLE" if f_qty <= 1e-12 else "POST_ONLY_LEG_1"
+                    elif raw_st in ("rejected",):
+                        l1_status = "REJECTED"
+                        exec_state = "IDLE"
+                    else:
+                        l1_status = "PARTIAL_FILLED" if f_qty > 1e-12 else "PENDING_MAKER"
+                        exec_state = "POST_ONLY_LEG_1"
+
+                    self._update_leg_state(symbol, l1_status, f_qty, hedged_now, exec_state)
+
+                    if raw_st in ("closed", "filled", "canceled", "cancelled", "rejected", "expired"):
+                        break
+
+        if self.mode == "live":
+            info_after = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+            cur_st = str(info_after.get("leg1_status", "")).lower()
+            cur_filled = float(info_after.get("leg1_filled_qty", 0.0) or 0.0)
+            if cur_st not in ("closed", "filled") and cur_filled < (target_qty * 0.999):
+                cancel_ex_name = (
+                    exchange_long
+                    if (is_close and exchange_short not in ("binance_spot", "spot"))
+                    else exchange_short
+                )
+                cancelled = bool(
+                    self.cancel_maker_leg1(
+                        symbol,
+                        exchange_name=cancel_ex_name,
+                        order_symbol=spot_symbol,
+                        is_close=is_close,
+                    )
+                )
+
+        leg2 = self.verify_maker_fill_and_hedge_leg2(
+            symbol,
+            exchange_short=exchange_short,
+            exchange_long=exchange_long,
+            spot_symbol=spot_symbol,
+            is_close=is_close,
+        )
+
+        filled_qty = float(
+            leg2.get("filled_qty", leg2.get("leg1_filled_qty", 0.0)) or 0.0
+        )
+        hedged_qty = float(
+            leg2.get("hedged_qty", leg2.get("leg2_hedged_qty", leg2.get("hedged", 0.0))) or 0.0
+        )
+        if filled_qty <= 0.0:
+            st_info = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+            filled_qty = float(st_info.get("leg1_filled_qty", 0.0) or 0.0)
+        if hedged_qty <= 0.0:
+            st_info = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+            hedged_qty = float(st_info.get("leg2_hedged_qty", 0.0) or 0.0)
+
+        if filled_qty > 0.0 and hedged_qty > 0.0:
+            self.executor_functional = True
+            self.state.executor_functional = True
+
+        if filled_qty >= target_qty * 0.999:
+            order_status = "filled"
+        elif filled_qty > 0.0:
+            order_status = "partial"
+        else:
+            order_status = "unfilled"
+
+        order_record: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "target_qty": float(target_qty),
+            "filled_qty": float(filled_qty),
+            "hedged_qty": float(hedged_qty),
+            "is_close": bool(is_close),
+            "status": order_status,
+            "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+
+        if hasattr(self.state, "carry_orders"):
+            c_orders = getattr(self.state, "carry_orders")
+            if isinstance(c_orders, list):
+                c_orders.append(order_record)
+            else:
+                setattr(self.state, "carry_orders", [order_record])
+
+        info_final = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+        order_id = leg1.get("leg1_order_id") or info_final.get("leg1_order_id")
+        final_status = str(leg2.get("leg1_status") or info_final.get("leg1_status") or order_status)
+
+        return {
+            "leg1": leg1,
+            "leg2": leg2,
+            "order_id": order_id,
+            "final_status": final_status,
+            "filled_qty": float(filled_qty),
+            "hedged_qty": float(hedged_qty),
+            "leg2_hedged_qty": float(hedged_qty),
+            "functional": bool(self.executor_functional),
+            "cancelled": bool(cancelled),
+        }
+
     def build_barbell_allocations(
         self,
         aligned_universe: dict[str, pd.DataFrame],
@@ -729,6 +891,153 @@ class CarryLiveExecutor:
         mo["overlay_active"] = act
         mo["raw_snr_dispersion"] = raw_disp
         self.state.momentum_overlay = mo
+
+    def execute_overlay_rebalance(
+        self,
+        overlay_allocations: dict[str, Any],
+        aligned_universe: dict[str, pd.DataFrame],
+        min_notional_usd: float = 10.0,
+        min_weight_change: float = 0.08,
+        timestamp: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Tái cân bằng nhánh momentum overlay qua các lệnh perp đơn lẻ."""
+        overlay_active = bool(overlay_allocations.get("overlay_active", False)) if overlay_allocations else False
+        targets: dict[str, float] = {}
+        if overlay_active and overlay_allocations:
+            for entry in overlay_allocations.get("allocations", []):
+                if not isinstance(entry, dict):
+                    continue
+                sym = entry.get("symbol")
+                if not sym:
+                    continue
+                raw_qty = entry.get("qty")
+                if raw_qty is None:
+                    raw_qty = entry.get("target_qty")
+                if raw_qty is None:
+                    continue
+                try:
+                    val = float(raw_qty)
+                except (ValueError, TypeError):
+                    continue
+                side_str = str(entry.get("side", "")).lower()
+                if "short" in side_str or side_str == "sell":
+                    targets[sym] = -abs(val)
+                elif "long" in side_str or side_str == "buy":
+                    targets[sym] = abs(val)
+                else:
+                    targets[sym] = val
+
+        if not hasattr(self.state, "overlay_positions") or not isinstance(self.state.overlay_positions, dict):
+            self.state.overlay_positions = {}
+        if not hasattr(self.state, "overlay_orders") or not isinstance(self.state.overlay_orders, list):
+            self.state.overlay_orders = []
+
+        current: dict[str, float] = {}
+        for sym, pos in self.state.overlay_positions.items():
+            if isinstance(pos, dict):
+                q = float(pos.get("qty", 0.0))
+                s = str(pos.get("side", "")).lower()
+                if s in ("short", "sell") and q > 0:
+                    q = -q
+                current[sym] = q
+            elif isinstance(pos, (int, float)):
+                current[sym] = float(pos)
+            else:
+                current[sym] = 0.0
+
+        orders: list[dict[str, Any]] = []
+        skipped = 0
+        turnover_notional = 0.0
+        all_symbols = sorted(set(targets.keys()) | set(current.keys()))
+
+        for symbol in all_symbols:
+            target = float(targets.get(symbol, 0.0))
+            cur = float(current.get(symbol, 0.0))
+            delta = target - cur
+
+            if abs(delta) < 1e-12:
+                continue
+
+            price = 0.0
+            df = aligned_universe.get(symbol) if aligned_universe else None
+            if df is not None and not df.empty:
+                if "perp_close" in df.columns:
+                    val = df["perp_close"].iloc[-1]
+                elif "close" in df.columns:
+                    val = df["close"].iloc[-1]
+                else:
+                    val = None
+                if val is not None and pd.notna(val) and np.isfinite(val) and float(val) > 0:
+                    price = float(val)
+
+            if price <= 0.0:
+                skipped += 1
+                continue
+
+            delta_notional = abs(delta) * price
+            if delta_notional < min_notional_usd:
+                skipped += 1
+                continue
+
+            qty_q, notional_q = self.quantize_leg(symbol, delta_notional, price)
+            if qty_q <= 0.0:
+                skipped += 1
+                continue
+
+            side = "buy" if delta > 0 else "sell"
+
+            if (
+                self.mode == "live"
+                and self.perp_exchange is not None
+                and hasattr(self.perp_exchange, "create_order")
+                and callable(self.perp_exchange.create_order)
+            ):
+                try:
+                    self.perp_exchange.create_order(symbol, "market", side, qty_q)
+                    status = "filled"
+                except Exception as e:
+                    logger.warning("Overlay rebalance order error for %s %s qty=%s: %s", side, symbol, qty_q, e)
+                    status = "error"
+            else:
+                status = "paper_filled"
+
+            if status != "error":
+                if abs(target) > 0:
+                    self.state.overlay_positions[symbol] = {
+                        "qty": float(target),
+                        "side": "long" if target > 0 else ("short" if target < 0 else "flat"),
+                        "entry_price": float(price),
+                        "ts": str(timestamp or ""),
+                    }
+                else:
+                    self.state.overlay_positions.pop(symbol, None)
+                turnover_notional += float(notional_q)
+
+            reason = "close" if abs(target) < 1e-12 else "delta_rebalance"
+            ts_str = str(timestamp) if timestamp else pd.Timestamp.now(tz="UTC").isoformat()
+            order_record = {
+                "symbol": symbol,
+                "side": side,
+                "qty": float(qty_q),
+                "notional": float(notional_q),
+                "status": status,
+                "ts": ts_str,
+                "reason": reason,
+            }
+            self.state.overlay_orders.append(order_record)
+            orders.append(order_record)
+
+        if any(o.get("status") in ("filled", "paper_filled") for o in orders):
+            self.executor_functional = True
+            self.state.executor_functional = True
+
+        return {
+            "orders": orders,
+            "n_orders": int(len(orders)),
+            "skipped": int(skipped),
+            "turnover_notional": float(turnover_notional),
+            "functional": bool(self.executor_functional),
+        }
 
     def _load_symbol_from_cache(self, symbol: str) -> pd.DataFrame:
         """Đọc và ghép dữ liệu Spot, Perp và Funding từ Parquet cache cục bộ."""
@@ -994,7 +1303,17 @@ class CarryLiveExecutor:
 
         # Lưu trạng thái barbell sleeves
         barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
+        # Lưu trạng thái barbell sleeves
+        barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
         self.persist_sleeve_state(barbell_allocations, timestamp_str)
+        try:
+            self.execute_overlay_rebalance(
+                barbell_allocations.get("momentum_overlay", {}),
+                aligned_universe,
+                timestamp=timestamp_str,
+            )
+        except Exception as _ov_err:  # khong de overlay lam chet reconcile
+            logger.warning("Overlay rebalance skipped: %s", _ov_err)
 
         # 3. MTM + An toàn ký quỹ cho các vị thế đang nắm giữ
         is_new_funding_bar = (

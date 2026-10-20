@@ -156,6 +156,10 @@ class BotState:
     carry_last_reconcile_ts: Optional[str] = None
     carry_sleeve: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh yield sleeve
     momentum_overlay: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh alpha momentum overlay
+    carry_orders: list[dict[str, Any]] = field(default_factory=list)
+    overlay_orders: list[dict[str, Any]] = field(default_factory=list)
+    overlay_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    executor_functional: bool = False
 
 
 class StateStore:
@@ -210,6 +214,23 @@ class StateStore:
         raw_momentum_overlay = raw.get("momentum_overlay") or {}
         momentum_overlay: dict[str, Any] = dict(raw_momentum_overlay) if isinstance(raw_momentum_overlay, dict) else {}
 
+        raw_carry_orders = raw.get("carry_orders") or []
+        carry_orders: list[dict[str, Any]] = [
+            dict(x) for x in raw_carry_orders if isinstance(x, dict)
+        ] if isinstance(raw_carry_orders, list) else []
+
+        raw_overlay_orders = raw.get("overlay_orders") or []
+        overlay_orders: list[dict[str, Any]] = [
+            dict(x) for x in raw_overlay_orders if isinstance(x, dict)
+        ] if isinstance(raw_overlay_orders, list) else []
+
+        raw_overlay_positions = raw.get("overlay_positions") or {}
+        overlay_positions: dict[str, dict[str, Any]] = {
+            str(k): dict(v) for k, v in raw_overlay_positions.items() if isinstance(v, dict)
+        } if isinstance(raw_overlay_positions, dict) else {}
+
+        executor_functional: bool = bool(raw.get("executor_functional", False))
+
         return BotState(
             open_position=dict(open_pos) if isinstance(open_pos, dict) else None,
             daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
@@ -224,6 +245,10 @@ class StateStore:
             carry_last_reconcile_ts=carry_last_reconcile_ts,
             carry_sleeve=carry_sleeve,
             momentum_overlay=momentum_overlay,
+            carry_orders=carry_orders,
+            overlay_orders=overlay_orders,
+            overlay_positions=overlay_positions,
+            executor_functional=executor_functional,
         )
 
     def sync_to_risk_manager(self, state: BotState, risk_manager: RiskManager) -> Optional[Position]:
