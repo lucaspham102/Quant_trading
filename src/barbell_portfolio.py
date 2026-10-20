@@ -331,7 +331,8 @@ def _simulate_barbell_equity(
         if is_funding_bar[t]:
             gross_ret -= float(np.sum(w_cur * funding_arr[t]))
 
-        g_usd = gross_ret * prev_eq
+        g_base = prev_eq if reinvest_profits else float(initial_capital)
+        g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
         is_rebal = (t % rebalance_hours == 0) or w_changed[t]

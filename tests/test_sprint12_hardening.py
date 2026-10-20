@@ -334,8 +334,13 @@ def test_pr5_triggers_at_drawdown_above_threshold(tmp_path: Path) -> None:
     assert perp_market_orders[0]["params"].get("reduceOnly") is True
 
     assert executor.state.overlay_positions == {}
-    assert executor.state.carry_positions[PERP_SYMBOL]["qty"] == 0.0
-    assert executor.state.carry_positions[PERP_SYMBOL]["closed_by"] == "KILL_SWITCH"
+    # Kill-switch phai dong va go bo vi the carry: hoac xoa key, hoac qty ve 0
+    # (ban sua CRITICAL chon xoa key de khong bi tinh la con vi the mo).
+    if PERP_SYMBOL in executor.state.carry_positions:
+        assert executor.state.carry_positions[PERP_SYMBOL]["qty"] == 0.0
+        assert executor.state.carry_positions[PERP_SYMBOL]["closed_by"] == "KILL_SWITCH"
+    else:
+        assert PERP_SYMBOL not in executor.state.carry_positions
 
 
 def test_pr5_does_not_trigger_at_three_percent(tmp_path: Path) -> None:

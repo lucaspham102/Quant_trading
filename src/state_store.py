@@ -212,7 +212,12 @@ class StateStore:
         with open(self.file_path, "r", encoding="utf-8") as f:
             raw: dict[str, Any] = json.load(f)
 
+        had_explicit_initial = "initial_capital" in raw
+
         if strategy is not None and raw.get("strategy") is not None and raw.get("strategy") != strategy:
+            sticky_kill = bool(raw.get("kill_switch_triggered", False))
+            if sticky_kill:
+                logger.error("State cua chien luoc khac dang co kill-switch=True -> giu nguyen co")
             logger.warning(
                 "Strategy mismatch in state file: expected %s, found %s. Resetting state.",
                 strategy,
@@ -224,6 +229,7 @@ class StateStore:
                 initial_capital=cap,
                 peak_equity=cap,
                 strategy=strategy,
+                kill_switch_triggered=sticky_kill,
             )
 
         open_pos = raw.get("open_position")
@@ -303,14 +309,26 @@ class StateStore:
         if initial_capital is not None:
             has_open_positions = bool(state.carry_positions or state.overlay_positions or state.open_position)
             if not has_open_positions:
-                if abs(state.initial_capital - cap) > 1e-9 or abs(state.current_equity - cap) > 1e-9:
+                if not had_explicit_initial:
                     state.initial_capital = cap
                     state.current_equity = cap
                     state.daily_start_equity = cap
-                    if state.peak_equity <= 0.0:
-                        state.peak_equity = cap
-                    else:
-                        state.peak_equity = max(state.peak_equity, cap)
+                    state.peak_equity = max(state.peak_equity, cap)
+                elif abs(state.current_equity - state.initial_capital) < 1e-9:
+                    state.initial_capital = cap
+                    state.current_equity = cap
+                    state.daily_start_equity = cap
+                    state.peak_equity = max(state.peak_equity, cap)
+                else:
+                    old_init = state.initial_capital
+                    state.initial_capital = cap
+                    state.peak_equity = max(state.peak_equity, state.current_equity)
+                    logger.warning(
+                        "Khong dong bo equity vi da co lai/lo thuc hien (current_equity=%.2f != initial_capital cu=%.2f). Giu nguyen current_equity va daily_start_equity, cap nhat initial_capital=%.2f",
+                        state.current_equity,
+                        old_init,
+                        cap,
+                    )
             else:
                 raw_init = raw.get("initial_capital")
                 try:

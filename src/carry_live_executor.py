@@ -299,8 +299,44 @@ class CarryLiveExecutor:
             except Exception as e:
                 logger.warning("fetch_order_book failed for %s on %s: %s", order_symbol, ex_name, e)
 
+        book_ok = (
+            best_bid is not None
+            and best_ask is not None
+            and best_bid > 0
+            and best_ask > best_bid
+        )
+
+        if not book_ok and self.mode in ("live", "testnet"):
+            logger.error("SPREAD_UNKNOWN %s: khong lay duoc orderbook -> huy dat lenh", symbol)
+            leg1_status = "SKIPPED"
+            execution_state = "IDLE"
+            self._update_leg_state(symbol, leg1_status, 0.0, 0.0, execution_state)
+            skip_state = {
+                "symbol": symbol,
+                "spot_symbol": resolved_spot_symbol,
+                "leg1_order_id": None,
+                "leg1_status": leg1_status,
+                "leg1_filled_qty": 0.0,
+                "leg2_hedged_qty": 0.0,
+                "execution_state": execution_state,
+                "skip_reason": "SPREAD_UNKNOWN",
+                "spread_bps": 0.0,
+            }
+            self._leg_states.setdefault(symbol, {}).update(skip_state)
+            if symbol in self.state.carry_positions:
+                self.state.carry_positions[symbol].update(skip_state)
+            return {
+                "status": "skipped",
+                "reason": "SPREAD_UNKNOWN",
+                "spread_bps": 0.0,
+                "symbol": symbol,
+                "order_id": None,
+                "filled": 0.0,
+                "qty": 0.0,
+            }
+
         spread_bps = 0.0
-        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0 and best_ask >= best_bid:
+        if book_ok:
             mid = (best_bid + best_ask) / 2.0
             if mid > 0:
                 spread_bps = (best_ask - best_bid) / mid * 10000.0
@@ -1333,7 +1369,23 @@ class CarryLiveExecutor:
             drift_qty = spot_qty - perp_qty
             drift_usd = abs(drift_qty) * price
 
-            if drift_usd >= self.min_notional_usd:
+            step = LOT_STEP_SIZES.get(sym)
+            if step is None and ":" in sym:
+                step = LOT_STEP_SIZES.get(sym.split(":")[0])
+            if step and price > 0.0:
+                min_repairable_usd = step * price * 1.02
+            else:
+                min_repairable_usd = 0.0
+            threshold = max(self.min_notional_usd, min_repairable_usd)
+
+            if pos.get("drift_unrepairable", False):
+                if drift_usd >= threshold * 5:
+                    pos.pop("drift_unrepairable", None)
+                    pos.pop("drift_unrepairable_usd", None)
+                else:
+                    continue
+
+            if drift_usd >= threshold:
                 drift_items.append({
                     "symbol": sym,
                     "action": "REPAIR_DELTA_DRIFT",
@@ -1354,6 +1406,11 @@ class CarryLiveExecutor:
 
         qty_q, notional_q = self.quantize_leg(symbol, abs(drift_qty) * price, price)
         if qty_q <= 0.0:
+            pos = self.state.carry_positions.get(symbol)
+            if pos is not None and isinstance(pos, dict):
+                pos["drift_unrepairable"] = True
+                pos["drift_unrepairable_usd"] = item.get("drift_usd")
+            logger.warning("repair_delta_drift %s: qty_q <= 0, marking drift_unrepairable", symbol)
             return {
                 "status": "skipped",
                 "reason": "BELOW_LOT_STEP",
@@ -1387,6 +1444,8 @@ class CarryLiveExecutor:
                 pos["qty"] = float(new_perp)
                 pos["leg2_hedged_qty"] = float(new_perp)
                 pos["notional_usdt"] = float(new_perp * price)
+                pos.pop("drift_unrepairable", None)
+                pos.pop("drift_unrepairable_usd", None)
             logger.info("REPAIR_DELTA_DRIFT %s: drift=%.4f (%.2f USD)", symbol, drift_qty, drift_usd)
 
         res: dict[str, Any] = {
@@ -1403,6 +1462,31 @@ class CarryLiveExecutor:
     def check_kill_switch(self, current_equity: float) -> bool:
         """Kiem tra nguong drawdown toi da va kich hoat Kill-Switch neu vi pham."""
         current_equity = float(current_equity)
+        try:
+            if hasattr(self.state, "carry_positions") and isinstance(self.state.carry_positions, dict):
+                mtm_unrealized = 0.0
+                has_mtm = False
+                for p in self.state.carry_positions.values():
+                    if isinstance(p, dict):
+                        q = float(p.get("qty", 0.0) or 0.0)
+                        sp_now = p.get("current_spot_price") or p.get("spot_price")
+                        pe_now = p.get("current_perp_price") or p.get("perp_price")
+                        sp_entry = p.get("entry_spot_price")
+                        pe_entry = p.get("entry_perp_price")
+                        if (
+                            q > 0
+                            and sp_now is not None
+                            and pe_now is not None
+                            and sp_entry is not None
+                            and pe_entry is not None
+                        ):
+                            mtm_unrealized += q * (float(sp_now) - float(sp_entry)) - q * (float(pe_now) - float(pe_entry))
+                            has_mtm = True
+                if has_mtm:
+                    current_equity += mtm_unrealized
+        except Exception as _mtm_err:
+            logger.debug("MTM equity update skipped: %s", _mtm_err)
+
         peak = max(float(getattr(self.state, "peak_equity", 0.0) or 0.0), current_equity)
         self.state.peak_equity = peak
 
@@ -1429,9 +1513,11 @@ class CarryLiveExecutor:
                         except Exception as e:
                             logger.warning("Error cancelling maker leg1 for %s on kill switch: %s", sym, e)
 
+            closed_carry_count = 0
             if hasattr(self.state, "carry_positions") and isinstance(self.state.carry_positions, dict):
                 for sym, pos in list(self.state.carry_positions.items()):
                     if not isinstance(pos, dict):
+                        self.state.carry_positions.pop(sym, None)
                         continue
                     qty = float(pos.get("qty", 0.0) or 0.0)
                     if self.mode in ("live", "testnet") and qty > 0:
@@ -1447,10 +1533,55 @@ class CarryLiveExecutor:
                         except Exception as e_perp:
                             logger.warning("Kill switch close perp failed for %s: %s", sym, e_perp)
 
-                    pos["qty"] = 0.0
-                    pos["closed_by"] = "KILL_SWITCH"
+                    closed_carry_count += 1
+                    self.state.carry_positions.pop(sym, None)
 
-            self.state.overlay_positions = {}
+            closed_overlay_count = 0
+            if hasattr(self.state, "overlay_positions") and isinstance(self.state.overlay_positions, dict):
+                for sym, pos in list(self.state.overlay_positions.items()):
+                    if isinstance(pos, dict):
+                        qty = float(pos.get("qty", 0.0) or 0.0)
+                        side_str = str(pos.get("side", "")).lower()
+                        if side_str in ("short", "sell") and qty > 0:
+                            qty = -qty
+                        price = float(pos.get("entry_price", 0.0) or pos.get("price", 0.0) or 0.0)
+                    elif isinstance(pos, (int, float)):
+                        qty = float(pos)
+                        price = 0.0
+                    else:
+                        continue
+
+                    if abs(qty) <= 1e-12:
+                        continue
+
+                    side = "sell" if qty > 0 else "buy"
+                    if price <= 0.0:
+                        price = 1.0
+
+                    q_close, _ = self.quantize_leg(sym, abs(qty) * price, price)
+                    if q_close <= 0.0:
+                        q_close = abs(qty)
+
+                    if (
+                        self.mode in ("live", "testnet")
+                        and self.perp_exchange is not None
+                        and hasattr(self.perp_exchange, "create_order")
+                        and callable(self.perp_exchange.create_order)
+                    ):
+                        try:
+                            self.perp_exchange.create_order(sym, "market", side, q_close)
+                        except Exception as e_ov:
+                            logger.warning("Kill switch close overlay failed for %s %s qty=%.4f: %s", side, sym, q_close, e_ov)
+
+                    closed_overlay_count += 1
+
+                self.state.overlay_positions = {}
+
+            logger.info(
+                "KILL-SWITCH dong vi the hoan tat: carry_closed=%d, overlay_closed=%d",
+                closed_carry_count,
+                closed_overlay_count,
+            )
 
             try:
                 self.state_store.save(self.state)
@@ -1783,6 +1914,33 @@ class CarryLiveExecutor:
                     self.state.current_equity += mtm_pnl + funding_collected - close_fee
                     del self.state.carry_positions[sym]
 
+        # PR-kill-switch: Kiem tra lai kill-switch giua chu ky sau khi dong vi the 5a va truoc khi mo moi 5b/5c
+        _kill_after_close = False
+        try:
+            _eq_now = float(getattr(self.state, "current_equity", self.capital))
+            if self.check_kill_switch(_eq_now):
+                logger.error("KILL-SWITCH kich hoat giua chu ky -> huy bo cac lenh mo moi")
+                _kill_after_close = True
+                plan = {
+                    "timestamp": timestamp_str,
+                    "equity": _eq_now,
+                    "actions": [],
+                    "active_positions": dict(self.state.carry_positions),
+                    "margin_health_summary": "KILL_SWITCH_ACTIVE",
+                    "table_ascii": f"=== KILL SWITCH TRIGGERED | Equity: {_eq_now:.2f} USDT ===",
+                    "sleeves": barbell_allocations,
+                    "kill_switch": True,
+                    "kill_switch_triggered": True,
+                }
+                self.state.carry_last_reconcile_ts = timestamp_str
+                try:
+                    self.state_store.save(self.state)
+                except Exception as _sv_err:
+                    logger.warning("Error saving state after kill switch: %s", _sv_err)
+                return plan
+        except Exception as _ks_err:
+            logger.warning("Kill-switch re-check failed: %s", _ks_err)
+
         # b) Cân bằng ký quỹ REBALANCE_MARGIN
         for sym in self.symbols:
             if resolved_actions.get(sym) == "REBALANCE_MARGIN" and sym in self.state.carry_positions:
@@ -2024,7 +2182,7 @@ class CarryLiveExecutor:
             "margin_health_summary": summary_str,
             "table_ascii": "",
             "sleeves": barbell_allocations,
-            "kill_switch": False,
+            "kill_switch": bool(getattr(self.state, "kill_switch_triggered", False)) or _kill_after_close,
         }
         plan["table_ascii"] = self.format_status_table(plan)
         return plan
