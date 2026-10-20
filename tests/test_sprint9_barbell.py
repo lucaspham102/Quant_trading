@@ -156,7 +156,8 @@ def test_maker_taker_hedge_cost_is_20bps_round_trip() -> None:
 
     Chân 1 Maker 2 bps + adverse selection 1 bp, Chân 2 Taker 5 bps + slippage
     2 bps -> 10 bps/chiều, 20 bps khứ hồi. Spot-Perp dùng override 11.25
-    bps/chiều -> 22.5 bps khứ hồi. Ngưỡng entry mỗi 8h = round-trip / 12 kỳ.
+    bps/chiều -> 22.5 bps khứ hồi. Sprint 10 nới horizon thu hồi phí lên 42 kỳ
+    (14 ngày) và đặt sàn entry 0.50 bps/8h.
     """
     config = CrossExchangeCarryConfig()
 
@@ -167,9 +168,11 @@ def test_maker_taker_hedge_cost_is_20bps_round_trip() -> None:
     assert config.round_trip_cost_perp_perp() == pytest.approx(0.0020)
     assert config.one_way_cost_spot_perp() == pytest.approx(0.001125)
     assert config.round_trip_cost_spot_perp() == pytest.approx(0.00225)
+    assert config.max_payback_periods == 42
     assert config.min_entry_rate_per_8h("perp_perp_spread") == pytest.approx(
-        0.0020 / 12.0
+        0.0020 / 42.0
     )
+    assert config.entry_funding_threshold == pytest.approx(0.00005)
 
     # Đẳng thức kế toán: khứ hồi luôn gấp đôi một chiều.
     assert config.round_trip_cost_perp_perp() == pytest.approx(

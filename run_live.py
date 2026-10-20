@@ -200,6 +200,45 @@ def main(argv: list[str] | None = None) -> int:
             timeframe=args.timeframe,
             state_file_path=state_path,
         )
+
+        if strat == "barbell":
+            try:
+                from src.cross_exchange_carry import CORE_4_SYMBOLS
+            except (ImportError, AttributeError):
+                CORE_4_SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT"]
+            from src.barbell_portfolio import BarbellConfig
+
+            venues: dict[str, Any] = {
+                "binance": perp_exchange,
+                "binance_spot": spot_exchange,
+            }
+            if not (args.synthetic or in_pytest):
+                try:
+                    import ccxt
+
+                    venues["bybit"] = ccxt.bybit({"enableRateLimit": True})
+                except Exception as e:
+                    logger.warning("Could not initialize Bybit exchange for venues: %s", e)
+
+            overlay_cfg = BarbellConfig(initial_capital=float(args.capital))
+            logger.info("Universe: CORE-4 | Venues: %s | Lot quantization: ON", sorted(venues.keys()))
+
+            executor = CarryLiveExecutor(
+                config=trading_config,
+                carry_config=carry_config,
+                mode=args.mode,
+                state_store=StateStore(state_path),
+                perp_exchange=perp_exchange,
+                spot_exchange=spot_exchange,
+                capital=float(args.capital),
+                execution_style=args.execution_style,
+                symbols=CORE_4_SYMBOLS,
+                venues=venues,
+                overlay_config=overlay_cfg,
+                enable_lot_quantization=True,
+            )
+            return executor.run_loop(once=bool(args.once))
+
         executor = CarryLiveExecutor(
             config=trading_config,
             carry_config=carry_config,
