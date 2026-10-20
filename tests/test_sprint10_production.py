@@ -709,6 +709,7 @@ def _s10c3_executor(
     return CarryLiveExecutor(
         carry_config=DynamicCarryConfig(),
         mode=mode,  # type: ignore[arg-type]
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
         capital=3000.0,
         exchange_map=exchange_map,
         state_store=StateStore(state_path),

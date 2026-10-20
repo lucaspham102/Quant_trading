@@ -1,6 +1,7 @@
 """Lưu trữ trạng thái nguyên tử (Atomic JSON StateStore) cho vận hành 24/7."""
 import dataclasses
 import json
+import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -12,6 +13,8 @@ import pandas as pd
 
 from src.backtester import TradeRecord
 from src.risk_manager import Position, RiskManager
+
+logger = logging.getLogger(__name__)
 
 
 def _to_utc_timestamp(ts: pd.Timestamp | str) -> pd.Timestamp:
@@ -160,6 +163,10 @@ class BotState:
     overlay_orders: list[dict[str, Any]] = field(default_factory=list)
     overlay_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     executor_functional: bool = False
+    initial_capital: float = 400.0
+    peak_equity: float = 400.0
+    strategy: Optional[str] = None
+    kill_switch_triggered: bool = False
 
 
 class StateStore:
@@ -182,16 +189,49 @@ class StateStore:
         os.replace(tmp_path, self.file_path)
         return self.file_path
 
-    def load(self, default_equity: float = 400.0, normalize_carry: bool = False) -> BotState:
+    def load(
+        self,
+        default_equity: float = 400.0,
+        normalize_carry: bool = False,
+        initial_capital: Optional[float] = None,
+        strategy: Optional[str] = None,
+        reset: bool = False,
+    ) -> BotState:
         """Đọc trạng thái từ đĩa; nếu file chưa tồn tại thì trả về BotState mặc định."""
-        if not self.file_path.exists():
-            eq = float(default_equity)
-            return BotState(daily_start_equity=eq, current_equity=eq)
+        cap = float(initial_capital) if initial_capital is not None else float(default_equity)
+
+        if reset or not self.file_path.exists():
+            return BotState(
+                daily_start_equity=cap,
+                current_equity=cap,
+                initial_capital=cap,
+                peak_equity=cap,
+                strategy=strategy,
+            )
 
         with open(self.file_path, "r", encoding="utf-8") as f:
             raw: dict[str, Any] = json.load(f)
 
-        eq = float(default_equity)
+        had_explicit_initial = "initial_capital" in raw
+
+        if strategy is not None and raw.get("strategy") is not None and raw.get("strategy") != strategy:
+            sticky_kill = bool(raw.get("kill_switch_triggered", False))
+            if sticky_kill:
+                logger.error("State cua chien luoc khac dang co kill-switch=True -> giu nguyen co")
+            logger.warning(
+                "Strategy mismatch in state file: expected %s, found %s. Resetting state.",
+                strategy,
+                raw.get("strategy"),
+            )
+            return BotState(
+                daily_start_equity=cap,
+                current_equity=cap,
+                initial_capital=cap,
+                peak_equity=cap,
+                strategy=strategy,
+                kill_switch_triggered=sticky_kill,
+            )
+
         open_pos = raw.get("open_position")
         utc_date = raw.get("current_utc_date")
         last_ts = raw.get("last_processed_candle_ts")
@@ -204,7 +244,7 @@ class StateStore:
                 if isinstance(v, dict):
                     pos_dict = dict(v)
                     if normalize_carry:
-                        pos_dict = normalize_carry_position(pos_dict, default_capital=eq)
+                        pos_dict = normalize_carry_position(pos_dict, default_capital=cap)
                     carry_positions[str(k)] = pos_dict
         raw_carry_ts = raw.get("carry_last_reconcile_ts")
         carry_last_reconcile_ts = str(raw_carry_ts) if raw_carry_ts is not None else None
@@ -231,11 +271,22 @@ class StateStore:
 
         executor_functional: bool = bool(raw.get("executor_functional", False))
 
-        return BotState(
+        raw_init_cap = raw.get("initial_capital")
+        raw_peak_eq = raw.get("peak_equity")
+        raw_strat = raw.get("strategy")
+        raw_kill = raw.get("kill_switch_triggered", False)
+
+        cur_eq = float(raw.get("current_equity", cap))
+        init_cap = float(raw_init_cap) if raw_init_cap is not None else cap
+        peak_eq = float(raw_peak_eq) if raw_peak_eq is not None else max(cur_eq, init_cap)
+        strat = str(raw_strat) if raw_strat is not None else None
+        kill_switch = bool(raw_kill)
+
+        state = BotState(
             open_position=dict(open_pos) if isinstance(open_pos, dict) else None,
             daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
-            daily_start_equity=float(raw.get("daily_start_equity", eq)),
-            current_equity=float(raw.get("current_equity", eq)),
+            daily_start_equity=float(raw.get("daily_start_equity", cap)),
+            current_equity=cur_eq,
             current_utc_date=str(utc_date) if utc_date is not None else None,
             consecutive_losses=int(raw.get("consecutive_losses", 0)),
             circuit_breaker_tripped=bool(raw.get("circuit_breaker_tripped", False)),
@@ -249,7 +300,61 @@ class StateStore:
             overlay_orders=overlay_orders,
             overlay_positions=overlay_positions,
             executor_functional=executor_functional,
+            initial_capital=init_cap,
+            peak_equity=peak_eq,
+            strategy=strat,
+            kill_switch_triggered=kill_switch,
         )
+
+        if initial_capital is not None:
+            has_open_positions = bool(state.carry_positions or state.overlay_positions or state.open_position)
+            if not has_open_positions:
+                if not had_explicit_initial:
+                    state.initial_capital = cap
+                    state.current_equity = cap
+                    state.daily_start_equity = cap
+                    state.peak_equity = max(state.peak_equity, cap)
+                elif abs(state.current_equity - state.initial_capital) < 1e-9:
+                    state.initial_capital = cap
+                    state.current_equity = cap
+                    state.daily_start_equity = cap
+                    state.peak_equity = max(state.peak_equity, cap)
+                else:
+                    old_init = state.initial_capital
+                    state.initial_capital = cap
+                    state.peak_equity = max(state.peak_equity, state.current_equity)
+                    logger.warning(
+                        "Khong dong bo equity vi da co lai/lo thuc hien (current_equity=%.2f != initial_capital cu=%.2f). Giu nguyen current_equity va daily_start_equity, cap nhat initial_capital=%.2f",
+                        state.current_equity,
+                        old_init,
+                        cap,
+                    )
+            else:
+                raw_init = raw.get("initial_capital")
+                try:
+                    file_init_cap = float(raw_init) if raw_init is not None else None
+                except (ValueError, TypeError):
+                    file_init_cap = None
+
+                if file_init_cap is not None and file_init_cap > 0:
+                    state.initial_capital = file_init_cap
+                else:
+                    state.initial_capital = state.current_equity
+
+                state.peak_equity = max(state.peak_equity, state.current_equity)
+
+                if abs(state.current_equity - cap) > 1e-9 or abs(state.initial_capital - cap) > 1e-9:
+                    logger.warning(
+                        "State has open positions; keeping existing equity %.2f and capital %.2f (differs from CLI capital %.2f)",
+                        state.current_equity,
+                        state.initial_capital,
+                        cap,
+                    )
+
+        if strategy is not None and state.strategy is None:
+            state.strategy = strategy
+
+        return state
 
     def sync_to_risk_manager(self, state: BotState, risk_manager: RiskManager) -> Optional[Position]:
         """Khôi phục 100% trạng thái vào risk_manager và trả về Position đang mở (nếu có)."""

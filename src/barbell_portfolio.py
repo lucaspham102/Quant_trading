@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -74,6 +74,7 @@ class BarbellConfig:
     smooth_leverage_max: float = 0.50
     min_weight_change_to_trade: float = 0.08
     overlay_quantize_legs: bool = True
+    reinvest_profits: bool = True
 
 
 def compute_snr_dispersion(
@@ -209,8 +210,13 @@ def _simulate_barbell_equity(
     dd_cut: float,
     dd_off: float,
     enable_dd_cushion: bool,
+    reinvest_profits: bool = True,
+    carry_dollar_pnl: Optional[np.ndarray] = None,
 ) -> dict[str, Any]:
-    """Mô phỏng động cơ vốn Barbell với lượng hóa lot-size và quản trị drawdown."""
+    """Mô phỏng động cơ vốn Barbell với lượng hóa lot-size và quản trị drawdown.
+
+    reinvest_profits=False: mo phong neo von tinh tai initial_capital (cash drag), khong dung de tai lap so Sprint 11.
+    """
     bars = len(raw_weights)
     symbols = list(raw_weights.columns)
     n_sym = len(symbols)
@@ -325,7 +331,8 @@ def _simulate_barbell_equity(
         if is_funding_bar[t]:
             gross_ret -= float(np.sum(w_cur * funding_arr[t]))
 
-        g_usd = gross_ret * prev_eq
+        g_base = prev_eq if reinvest_profits else float(initial_capital)
+        g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
         is_rebal = (t % rebalance_hours == 0) or w_changed[t]
@@ -337,7 +344,10 @@ def _simulate_barbell_equity(
             target = raw_w_arr[t] * L_eff
             w_q = target.copy()
 
-            eq_mid = prev_eq + carry_returns[t] * prev_eq + g_usd
+            if reinvest_profits:
+                eq_mid = prev_eq + carry_returns[t] * prev_eq + g_usd
+            else:
+                eq_mid = float(initial_capital)
             if eq_mid <= 0.0:
                 eq_mid = 0.0
 
@@ -372,7 +382,14 @@ def _simulate_barbell_equity(
         n_usd = g_usd - fee
         net_usd[t] = n_usd
 
-        eq_t = prev_eq + carry_returns[t] * prev_eq + n_usd
+        if reinvest_profits:
+            eq_t = prev_eq + carry_returns[t] * prev_eq + n_usd
+        else:
+            if carry_dollar_pnl is not None and t < len(carry_dollar_pnl):
+                carry_usd = float(carry_dollar_pnl[t])
+            else:
+                carry_usd = float(carry_returns[t]) * float(initial_capital)
+            eq_t = prev_eq + carry_usd + n_usd
         equity[t] = eq_t
         if eq_t > peak:
             peak = eq_t
@@ -561,6 +578,7 @@ def run_barbell_portfolio(
             "carry_variant": config.carry_variant,
             "gating_mode": config.gating_mode,
             "carry_fallback": False,
+            "reinvest_profits": bool(config.reinvest_profits),
         }
         return {
             "equity_curve": empty_eq,
@@ -582,6 +600,7 @@ def run_barbell_portfolio(
             "carry_variant": config.carry_variant,
             "gating_mode": config.gating_mode,
             "carry_fallback": False,
+            "reinvest_profits": bool(config.reinvest_profits),
             "go_no_go_inputs": {
                 "annualized_return_pct": 0.0,
                 "sharpe": 0.0,
@@ -848,6 +867,16 @@ def run_barbell_portfolio(
         quantization_events = 0
         skipped_rebalances = 0
     else:
+        try:
+            carry_attr_src = carry_result["attribution_series"]
+            carry_dollar_pnl_arr = (
+                carry_attr_src["funding_pnl"].reindex(common_index).fillna(0.0)
+                + carry_attr_src["basis_pnl"].reindex(common_index).fillna(0.0)
+                - carry_attr_src["fees"].reindex(common_index).fillna(0.0)
+            ).to_numpy(dtype=np.float64)
+        except Exception:
+            carry_dollar_pnl_arr = np.zeros(len(common_index), dtype=np.float64)
+
         sim_res = _simulate_barbell_equity(
             raw_weights=raw_weights_aligned[close_matrix.columns],
             close_matrix=close_matrix,
@@ -862,6 +891,8 @@ def run_barbell_portfolio(
             dd_cut=config.overlay_dd_cut_threshold,
             dd_off=config.overlay_dd_off_threshold,
             enable_dd_cushion=config.enable_drawdown_cushion,
+            reinvest_profits=bool(config.reinvest_profits),
+            carry_dollar_pnl=carry_dollar_pnl_arr,
         )
 
         equity_curve = pd.Series(
@@ -925,7 +956,10 @@ def run_barbell_portfolio(
     else:
         equity_prev = equity_curve.shift(1).fillna(config.initial_capital)
         carry_eq_prev = carry_result["equity_curve"].shift(1).fillna(config.initial_capital)
-        scale_ratio = np.where(carry_eq_prev > 0.0, equity_prev / carry_eq_prev, 1.0)
+        if bool(getattr(config, "reinvest_profits", True)):
+            scale_ratio = np.where(carry_eq_prev > 0.0, equity_prev / carry_eq_prev, 1.0)
+        else:
+            scale_ratio = np.ones(len(common_index), dtype=np.float64)
         carry_funding = carry_attr["funding_pnl"].reindex(common_index).fillna(0.0) * scale_ratio
         carry_basis = carry_attr["basis_pnl"].reindex(common_index).fillna(0.0) * scale_ratio
         carry_fees = carry_attr["fees"].reindex(common_index).fillna(0.0) * scale_ratio
@@ -1049,6 +1083,7 @@ def run_barbell_portfolio(
         "carry_variant": config.carry_variant,
         "gating_mode": config.gating_mode,
         "carry_fallback": carry_fallback,
+        "reinvest_profits": bool(config.reinvest_profits),
     }
 
     go_no_go_inputs = {
@@ -1081,6 +1116,7 @@ def run_barbell_portfolio(
         "carry_variant": config.carry_variant,
         "gating_mode": config.gating_mode,
         "carry_fallback": carry_fallback,
+        "reinvest_profits": bool(config.reinvest_profits),
         "go_no_go_inputs": go_no_go_inputs,
         "overlay_active_ratio": overlay_active_ratio,
         "overlay_leverage_series": leverage_series,

@@ -258,6 +258,37 @@ def run_sprint11_tiers(
             h_rets = res_h.get("returns")
             h_days = float(len(h_rets) / 24.0) if isinstance(h_rets, pd.Series) and len(h_rets) > 0 else 0.0
 
+            # 2b. Holdout theo phuong phap cua so lien tuc (slice tu ket qua toan ky)
+            h_start_ts = pd.Timestamp(split_date, tz="UTC")
+            h_end_ts = pd.Timestamp(holdout_end, tz="UTC")
+            h_net_pnl = 0.0
+            h_carry_slice = 0.0
+            h_overlay_slice = 0.0
+            h_fees_slice = 0.0
+            h_equity_start = float(capital)
+            h_compound_slice_pct = 0.0
+            if isinstance(attr_df, pd.DataFrame) and not attr_df.empty:
+                m = (attr_df.index >= h_start_ts) & (attr_df.index <= h_end_ts)
+                if bool(m.any()):
+                    h_net_pnl = float(attr_df.loc[m, "net_pnl"].sum())
+                    if "funding_pnl" in attr_df.columns and "basis_pnl" in attr_df.columns:
+                        h_carry_slice = float(attr_df.loc[m, "funding_pnl"].sum() + attr_df.loc[m, "basis_pnl"].sum())
+                    if "overlay_pnl" in attr_df.columns:
+                        h_overlay_slice = float(attr_df.loc[m, "overlay_pnl"].sum())
+                    if "fees" in attr_df.columns:
+                        h_fees_slice = float(attr_df.loc[m, "fees"].sum())
+            eq_full = res.get("equity_curve")
+            if isinstance(eq_full, pd.Series) and len(eq_full) > 0:
+                before = eq_full[eq_full.index < h_start_ts]
+                if len(before) > 0:
+                    h_equity_start = float(before.iloc[-1])
+            if isinstance(rets, pd.Series) and len(rets) > 0:
+                mr = (rets.index >= h_start_ts) & (rets.index <= h_end_ts)
+                if bool(mr.any()):
+                    h_compound_slice_pct = float((np.prod(1.0 + rets[mr].to_numpy(dtype=np.float64)) - 1.0) * 100.0)
+            h_ret_active_pct = (h_net_pnl / float(capital) * 100.0) if float(capital) > 0.0 else 0.0
+            h_ret_compound_pct = (h_net_pnl / h_equity_start * 100.0) if h_equity_start > 0.0 else 0.0
+
             accounting_gap = float(abs(net_attr_sum - (final_eq - capital)))
 
             row = {
@@ -284,9 +315,17 @@ def run_sprint11_tiers(
                 "positive_periods": int(pos_periods),
                 "total_periods": 7,
                 "periods": periods_list,
-                "holdout_return_pct": h_ret_pct,
-                "holdout_carry_pnl": h_carry_pnl,
-                "holdout_overlay_net_pnl": h_ov_net,
+                "holdout_return_pct": h_compound_slice_pct,
+                "holdout_net_pnl": h_net_pnl,
+                "holdout_fees": h_fees_slice,
+                "holdout_equity_start": h_equity_start,
+                "holdout_return_on_active_capital_pct": h_ret_active_pct,
+                "holdout_return_on_compounded_equity_pct": h_ret_compound_pct,
+                "holdout_return_resim_pct": h_ret_pct,
+                "holdout_net_pnl_resim": float(h_final_eq - float(capital)),
+                "reinvest_profits": bool(getattr(cfg, "reinvest_profits", True)),
+                "holdout_carry_pnl": (h_carry_slice if not (h_carry_slice == 0.0 and h_carry_pnl > 0.0) else h_carry_pnl),
+                "holdout_overlay_net_pnl": (h_overlay_slice if not (h_overlay_slice == 0.0 and h_ov_net != 0.0) else h_ov_net),
                 "holdout_days": h_days,
                 "accounting_gap": accounting_gap,
                 "executor_functional": False,
@@ -320,6 +359,14 @@ def run_sprint11_tiers(
                 "positive_periods": 0,
                 "total_periods": 7,
                 "holdout_return_pct": 0.0,
+                "holdout_net_pnl": 0.0,
+                "holdout_fees": 0.0,
+                "holdout_equity_start": 0.0,
+                "holdout_return_on_active_capital_pct": 0.0,
+                "holdout_return_on_compounded_equity_pct": 0.0,
+                "holdout_return_resim_pct": 0.0,
+                "holdout_net_pnl_resim": 0.0,
+                "reinvest_profits": True,
                 "holdout_carry_pnl": 0.0,
                 "holdout_overlay_net_pnl": 0.0,
                 "holdout_days": 0.0,
@@ -532,6 +579,9 @@ def evaluate_sprint11_go_no_go(
     holdout_ret = float(primary.get("holdout_return_pct", 0.0))
     holdout_carry = float(primary.get("holdout_carry_pnl", 0.0))
     holdout_overlay = float(primary.get("holdout_overlay_net_pnl", 0.0))
+    holdout_resim = float(primary.get("holdout_return_resim_pct", 0.0))
+    holdout_ret_active = float(primary.get("holdout_return_on_active_capital_pct", 0.0))
+    holdout_ret_compound = float(primary.get("holdout_return_on_compounded_equity_pct", 0.0))
     sharpe = float(primary.get("sharpe", 0.0))
     maxdd = float(abs(primary.get("maxdd_pct", primary.get("maxdd", 0.0))))
     beta_btc = float(primary.get("beta_btc", primary.get("beta", 0.0)))
@@ -575,6 +625,21 @@ def evaluate_sprint11_go_no_go(
             "note": (
                 f"Holdout: ret={holdout_ret:.2f}% (>= {SPRINT11_GO_CRITERIA['holdout_return_pct']}%), "
                 f"carry_pnl={holdout_carry:.2f} (> 0), overlay_net_pnl={holdout_overlay:.2f} (> 0)"
+            ),
+        },
+        {
+            "name": "holdout_consistency_resim",
+            "value": {
+                "return_pct": holdout_resim,
+                "carry_pnl": holdout_carry,
+                "overlay_net_pnl": holdout_overlay,
+            },
+            "threshold": "ret >= 3.5% (phuong phap re-sim tu 3000, khoa Sprint 11)",
+            "passed": bool(holdout_resim >= 3.5 and holdout_carry > 0.0 and holdout_overlay > 0.0),
+            "note": (
+                f"Re-sim: ret={holdout_resim:.2f}%"
+                if (holdout_resim >= 3.5 and holdout_carry > 0.0 and holdout_overlay > 0.0)
+                else f"Re-sim: ret={holdout_resim:.2f}% (< 3.5%)"
             ),
         },
         {
@@ -626,6 +691,13 @@ def evaluate_sprint11_go_no_go(
             "passed": bool(exec_ok),
             "note": f"Executor functional: {exec_ok} (threshold == True)",
         },
+        {
+            "name": "holdout_active_capital_info",
+            "value": holdout_ret_active,
+            "threshold": "> 0 (chi de bao cao)",
+            "passed": True,
+            "note": f"active={holdout_ret_active:.2f}%, compound={holdout_ret_compound:.2f}%",
+        },
     ]
 
     reasons = [c["note"] for c in criteria if not c["passed"]]
@@ -666,6 +738,9 @@ def build_sprint11_summary_rows(payload: dict[str, Any]) -> list[dict[str, Any]]
             "positive_periods": int(r.get("positive_periods", 0)),
             "holdout%": float(r.get("holdout_return_pct", 0.0)),
             "holdout_return_pct": float(r.get("holdout_return_pct", 0.0)),
+            "holdout_active%": float(r.get("holdout_return_on_active_capital_pct", 0.0)),
+            "holdout_compound%": float(r.get("holdout_return_on_compounded_equity_pct", 0.0)),
+            "reinvest": bool(r.get("reinvest_profits", True)),
             "carry_pnl": float(r.get("carry_pnl", 0.0)),
             "overlay_net": float(r.get("overlay_net_pnl", 0.0)),
             "overlay_net_pnl": float(r.get("overlay_net_pnl", 0.0)),

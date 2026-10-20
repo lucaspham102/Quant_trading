@@ -66,14 +66,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("paper", "live"),
+        choices=("paper", "live", "testnet"),
         default="paper",
-        help="Chế độ thực thi: paper hoặc live (mặc định: paper)",
+        help="Chế độ thực thi: paper, live hoặc testnet (mặc định: paper)",
     )
     parser.add_argument(
         "--once",
         action="store_true",
         help="Chạy đúng 1 chu kỳ kiểm tra nến đóng rồi thoát",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help="Xoa trang thai cu va khoi tao lai von theo --capital",
+    )
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=None,
+        help="So chu ky daemon can chay truoc khi thoat",
+    )
+    parser.add_argument(
+        "--interval-sec",
+        type=float,
+        default=60.0,
+        help="So giay giua 2 chu ky",
     )
     parser.add_argument(
         "--symbol",
@@ -151,6 +168,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     in_pytest = "PYTEST_CURRENT_TEST" in os.environ
 
+    api_key = os.environ.get("BINANCE_API_KEY")
+    api_secret = os.environ.get("BINANCE_API_SECRET")
+    has_api_keys = bool(api_key and api_secret)
+
+    exec_mode = args.mode
+    if args.mode == "live":
+        if not has_api_keys:
+            logger.error("Live mode: thieu BINANCE_API_KEY hoac BINANCE_API_SECRET trong env.")
+            return 2
+    elif args.mode == "testnet":
+        if not has_api_keys:
+            logger.warning("Testnet: thieu API key, chay Public Live Feed Paper Mode")
+            exec_mode = "paper"
+
     if args.state_file is not None:
         state_path = Path(args.state_file)
     elif in_pytest:
@@ -163,10 +194,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("=" * 60)
         if strat == "barbell":
             logger.info("QUANT TRADING BOT STARTING (BARBELL CARRY SLEEVE)")
-            logger.info("Mode: %s | Strategy: barbell (paper cross-exchange carry sleeve)", args.mode)
+            logger.info("Mode: %s (exec_mode=%s) | Strategy: barbell (paper cross-exchange carry sleeve)", args.mode, exec_mode)
         else:
             logger.info("QUANT TRADING BOT STARTING (DYNAMIC CARRY)")
-            logger.info("Mode: %s | Strategy: %s", args.mode, strat)
+            logger.info("Mode: %s (exec_mode=%s) | Strategy: %s", args.mode, exec_mode, strat)
         logger.info(
             "Capital: %.2f USDT | Execution Style: %s",
             args.capital,
@@ -184,8 +215,21 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 import ccxt
 
-                perp_exchange = ccxt.binanceusdm({"enableRateLimit": True})
-                spot_exchange = ccxt.binance({"enableRateLimit": True})
+                ex_cfg: dict[str, Any] = {"enableRateLimit": True}
+                if has_api_keys and args.mode in ("live", "testnet"):
+                    ex_cfg["apiKey"] = api_key
+                    ex_cfg["secret"] = api_secret
+
+                perp_exchange = ccxt.binanceusdm(dict(ex_cfg))
+                spot_exchange = ccxt.binance(dict(ex_cfg))
+
+                if args.mode == "testnet" and has_api_keys:
+                    for ex in (perp_exchange, spot_exchange):
+                        if hasattr(ex, "set_sandbox_mode") and callable(ex.set_sandbox_mode):
+                            try:
+                                ex.set_sandbox_mode(True)
+                            except Exception as ex_err:
+                                logger.warning("Could not set sandbox mode: %s", ex_err)
             except Exception as e:
                 logger.warning(
                     "Could not initialize live exchanges (%s), falling back to offline cache",
@@ -222,7 +266,19 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     import ccxt
 
-                    venues["bybit"] = ccxt.bybit({"enableRateLimit": True})
+                    bybit_cfg: dict[str, Any] = {"enableRateLimit": True}
+                    bybit_key = os.environ.get("BYBIT_API_KEY")
+                    bybit_secret = os.environ.get("BYBIT_API_SECRET")
+                    if bybit_key and bybit_secret and args.mode in ("live", "testnet"):
+                        bybit_cfg["apiKey"] = bybit_key
+                        bybit_cfg["secret"] = bybit_secret
+                    bybit_ex = ccxt.bybit(bybit_cfg)
+                    if args.mode == "testnet" and hasattr(bybit_ex, "set_sandbox_mode") and callable(bybit_ex.set_sandbox_mode):
+                        try:
+                            bybit_ex.set_sandbox_mode(True)
+                        except Exception as ex_err:
+                            logger.warning("Could not set sandbox mode on bybit: %s", ex_err)
+                    venues["bybit"] = bybit_ex
                 except Exception as e:
                     logger.warning("Could not initialize Bybit exchange for venues: %s", e)
 
@@ -239,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             executor = CarryLiveExecutor(
                 config=trading_config,
                 carry_config=carry_config,
-                mode=args.mode,
+                mode=exec_mode,
                 state_store=StateStore(state_path),
                 perp_exchange=perp_exchange,
                 spot_exchange=spot_exchange,
@@ -249,20 +305,34 @@ def main(argv: list[str] | None = None) -> int:
                 venues=venues,
                 overlay_config=overlay_cfg,
                 enable_lot_quantization=True,
+                initial_capital=float(args.capital),
+                reset_state=bool(args.reset_state),
+                strategy=strat,
             )
-            return executor.run_loop(once=bool(args.once))
+            return executor.run_loop(
+                once=bool(args.once),
+                cycles=args.cycles,
+                interval_sec=float(args.interval_sec),
+            )
 
         executor = CarryLiveExecutor(
             config=trading_config,
             carry_config=carry_config,
-            mode=args.mode,
+            mode=exec_mode,
             state_store=StateStore(state_path),
             perp_exchange=perp_exchange,
             spot_exchange=spot_exchange,
             capital=float(args.capital),
             execution_style=args.execution_style,
+            initial_capital=float(args.capital),
+            reset_state=bool(args.reset_state),
+            strategy=strat,
         )
-        return executor.run_loop(once=bool(args.once))
+        return executor.run_loop(
+            once=bool(args.once),
+            cycles=args.cycles,
+            interval_sec=float(args.interval_sec),
+        )
 
     config = dataclasses.replace(
         TradingConfig(),
@@ -299,9 +369,9 @@ def main(argv: list[str] | None = None) -> int:
         data_loader = DataLoader(config)
 
     ml_filter = MetaLabelFilter(config) if config.use_ml else None
-    executor = LiveExecutor(
+    executor_directional = LiveExecutor(
         config=config,
-        mode=args.mode,
+        mode=exec_mode if exec_mode in ("paper", "live") else "paper",
         data_loader=data_loader,
         strategy=Strategy(config),
         risk_manager=RiskManager(config),
@@ -309,7 +379,14 @@ def main(argv: list[str] | None = None) -> int:
         notifier=TelegramNotifier(env_file=None if in_pytest else Path(".env")),
         ml_filter=ml_filter,
     )
-    return executor.run_loop(once=bool(args.once))
+    try:
+        return executor_directional.run_loop(
+            once=bool(args.once),
+            cycles=args.cycles,
+            interval_sec=float(args.interval_sec),
+        )
+    except TypeError:
+        return executor_directional.run_loop(once=bool(args.once))
 
 
 if __name__ == "__main__":
