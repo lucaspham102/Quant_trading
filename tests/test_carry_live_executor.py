@@ -139,6 +139,7 @@ def _make_executor(
         symbols=symbols if symbols is not None else ["AAA/USDT:USDT"],
         state_store=StateStore(state_path),
         raw_data_dir=resolved_raw,
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
     )
 
 
@@ -501,6 +502,7 @@ def test_maker_taker_hedge_state_machine_full_and_partial_fill(tmp_path: Path) -
         perp_exchange=perp_fake,
         spot_exchange=spot_fake,
         state_store=StateStore(state_path),
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
     )
 
     leg1_res = executor.place_maker_leg1(
@@ -600,6 +602,7 @@ def test_maker_taker_hedge_leg1_rejected_or_unfilled_never_fires_market_leg2(
             perp_exchange=perp_fake,
             spot_exchange=spot_fake,
             state_store=StateStore(tmp_path / f"state_{terminal_status}.json"),
+            max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
         )
 
         leg1_res = executor.place_maker_leg1(
@@ -648,6 +651,7 @@ def test_unfilled_maker_leg1_is_cancelled_and_never_orphaned(tmp_path: Path) -> 
         perp_exchange=perp_fake,
         spot_exchange=spot_fake,
         state_store=StateStore(tmp_path / "state.json"),
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
     )
 
     executor.place_maker_leg1(

@@ -78,6 +78,7 @@ def _make_paper_executor(
         config=config,
         carry_config=DynamicCarryConfig(),
         symbols=list(symbols) if symbols is not None else [PERP_SYMBOL],
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
         state_store=StateStore(state_path),
         raw_data_dir=raw_dir,
     )
@@ -94,6 +95,7 @@ def _make_live_executor(
         execution_style="maker_taker_hedge",
         capital=3000.0,
         exchange_map={"binance": perp_fake, "binance_spot": spot_fake},
+        max_allowed_spread_bps=10_000.0,  # fixture book rong 20 bps: tat guard spread de test state machine
         perp_exchange=perp_fake,
         spot_exchange=spot_fake,
         state_store=StateStore(state_path),
