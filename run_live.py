@@ -87,9 +87,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--strategy",
-        choices=("directional", "dynamic_carry"),
+        choices=("directional", "dynamic_carry", "barbell"),
         default="directional",
-        help="Chien luoc van hanh: directional (mac dinh) hoac dynamic_carry (Sprint 8)",
+        help="Chiến lược vận hành: directional (mặc định), dynamic_carry, hoặc barbell (Sprint 9)",
+    )
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=3000.0,
+        help="Mức vốn vận hành cho chiến lược carry (mặc định: 3000.0 USDT)",
+    )
+    parser.add_argument(
+        "--execution-style",
+        choices=("maker_taker_hedge", "real_taker"),
+        default="maker_taker_hedge",
+        help="Cơ chế khớp lệnh: maker_taker_hedge (mặc định Sprint 9) hoặc real_taker",
     )
     parser.add_argument(
         "--strategy-mode",
@@ -146,10 +158,20 @@ def main(argv: list[str] | None = None) -> int:
     else:
         state_path = TradingConfig().state_file_path
 
-    if getattr(args, "strategy", "directional") == "dynamic_carry":
+    strat = getattr(args, "strategy", "directional")
+    if strat in ("dynamic_carry", "barbell"):
         logger.info("=" * 60)
-        logger.info("QUANT TRADING BOT STARTING (DYNAMIC CARRY)")
-        logger.info("Mode: %s | Strategy: dynamic_carry", args.mode)
+        if strat == "barbell":
+            logger.info("QUANT TRADING BOT STARTING (BARBELL CARRY SLEEVE)")
+            logger.info("Mode: %s | Strategy: barbell (paper cross-exchange carry sleeve)", args.mode)
+        else:
+            logger.info("QUANT TRADING BOT STARTING (DYNAMIC CARRY)")
+            logger.info("Mode: %s | Strategy: %s", args.mode, strat)
+        logger.info(
+            "Capital: %.2f USDT | Execution Style: %s",
+            args.capital,
+            args.execution_style,
+        )
         logger.info("State file: %s", state_path)
         logger.info("=" * 60)
 
@@ -172,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                 perp_exchange = None
                 spot_exchange = None
 
-        carry_config = DynamicCarryConfig()
+        carry_config = DynamicCarryConfig(initial_capital=float(args.capital))
         trading_config = dataclasses.replace(
             TradingConfig(),
             timeframe=args.timeframe,
@@ -185,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
             state_store=StateStore(state_path),
             perp_exchange=perp_exchange,
             spot_exchange=spot_exchange,
+            capital=float(args.capital),
+            execution_style=args.execution_style,
         )
         return executor.run_loop(once=bool(args.once))
 

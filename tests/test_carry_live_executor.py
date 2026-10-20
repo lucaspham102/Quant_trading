@@ -407,3 +407,262 @@ def test_reconcile_once_empty_or_partial_universe_does_not_crash(tmp_path: Path)
     assert isinstance(partial_plan["actions"], list)
     partial_actions = {action.symbol: action.action for action in partial_plan["actions"]}
     assert partial_actions["BBB/USDT:USDT"] == "SKIP"
+
+
+# ---------------------------------------------------------------------------
+# 6. Máy trạng thái maker_then_taker hedge (GO-4)
+# ---------------------------------------------------------------------------
+
+
+class FakeExchange:
+    """Sàn giả thuần Python, không gọi mạng, cho test máy trạng thái Chân 1/Chân 2.
+
+    Ghi lại mọi lệnh vào ``self.orders`` dưới dạng dict để test kiểm tra
+    ``type``/``side``/``amount``/``params``. Kết quả ``fetch_order`` được điều
+    khiển qua ``self.order_status`` để mô phỏng open/partial/closed/canceled/rejected.
+    """
+
+    def __init__(
+        self,
+        order_status: dict[str, Any] | None = None,
+        bids: Sequence[Sequence[float]] | None = None,
+        asks: Sequence[Sequence[float]] | None = None,
+    ) -> None:
+        self.orders: list[dict[str, Any]] = []
+        self.order_status: dict[str, Any] = (
+            dict(order_status)
+            if order_status is not None
+            else {"id": "leg1-1", "status": "open", "filled": 0.0}
+        )
+        self.bids = [list(level) for level in (bids or [[99.9, 10]])]
+        self.asks = [list(level) for level in (asks or [[100.1, 10]])]
+        self.cancelled: list[dict[str, Any]] = []
+
+    def milliseconds(self) -> int:
+        """Mốc thời gian cố định, không phụ thuộc đồng hồ thật."""
+        return 1_700_000_000_000
+
+    def fetch_order_book(self, symbol: str, limit: int = 5) -> dict[str, Any]:
+        """Order book tĩnh: best bid 99.9, best ask 100.1."""
+        return {"bids": [list(level) for level in self.bids], "asks": [list(level) for level in self.asks]}
+
+    def create_order(
+        self,
+        symbol: str,
+        type: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Ghi nhận lệnh; limit trả về open, market trả về closed đã khớp đủ amount."""
+        self.orders.append(
+            {
+                "symbol": symbol,
+                "type": type,
+                "side": side,
+                "amount": float(amount),
+                "price": None if price is None else float(price),
+                "params": dict(params) if params is not None else {},
+            }
+        )
+        if type == "limit":
+            return {"id": "leg1-1", "status": "open", "filled": 0.0}
+        return {"id": f"m{len(self.orders)}", "status": "closed", "filled": float(amount)}
+
+    def fetch_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Trả dữ liệu trạng thái do test điều khiển qua ``self.order_status``."""
+        return dict(self.order_status)
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Ghi nhận lệnh hủy để test chống bỏ quên lệnh treo (orphaned order)."""
+        self.cancelled.append({"id": order_id, "symbol": symbol})
+        return {"id": order_id, "status": "canceled"}
+
+
+def test_maker_taker_hedge_state_machine_full_and_partial_fill(tmp_path: Path) -> None:
+    """Chân 1 Post-Only (GTX) -> partial 0.6 hedge 0.6 -> fill đủ 1.0 hedge thêm 0.4.
+
+    Khóa hành vi GO-4: không hedge vượt ``filled_qty``, partial fill chỉ hedge phần
+    đã khớp, và state Chân 1/Chân 2 được ghi đúng vào ``carry_positions``.
+
+    Lưu ý API thật: ``place_maker_leg1``/``verify_maker_fill_and_hedge_leg2`` chỉ
+    cập nhật state trong bộ nhớ; chỉ ``reconcile_once`` mới gọi ``state_store.save``.
+    Vì vậy test chủ động gọi ``save`` trước khi đọc JSON trên đĩa.
+    """
+    perp_fake = FakeExchange()
+    spot_fake = FakeExchange()
+    state_path = tmp_path / "state.json"
+    executor = CarryLiveExecutor(
+        mode="live",
+        execution_style="maker_taker_hedge",
+        capital=3000.0,
+        exchange_map={"binance": perp_fake, "binance_spot": spot_fake},
+        perp_exchange=perp_fake,
+        spot_exchange=spot_fake,
+        state_store=StateStore(state_path),
+    )
+
+    leg1_res = executor.place_maker_leg1(
+        "BTC/USDT:USDT",
+        "sell",
+        1.0,
+        100.0,
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol="BTC/USDT",
+    )
+
+    assert leg1_res["leg1_order_id"] == "leg1-1"
+    assert leg1_res["leg1_status"] == "PENDING_MAKER"
+    assert leg1_res["limit_price"] == pytest.approx(100.1)
+
+    limit_orders = [o for o in perp_fake.orders if o["type"] == "limit"]
+    assert len(limit_orders) == 1
+    leg1_order = limit_orders[0]
+    assert leg1_order["symbol"] == "BTC/USDT:USDT"
+    assert leg1_order["side"] == "sell"
+    assert leg1_order["amount"] == pytest.approx(1.0)
+    assert leg1_order["params"].get("postOnly") is True
+    assert leg1_order["params"].get("timeInForce") == "GTX"
+
+    # Lần 1: Chân 1 mới khớp một phần 0.6 -> Chân 2 chỉ được hedge đúng 0.6.
+    perp_fake.order_status = {"id": "leg1-1", "status": "open", "filled": 0.6}
+    first = executor.verify_maker_fill_and_hedge_leg2(
+        "BTC/USDT:USDT",
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol="BTC/USDT",
+    )
+
+    market_orders_first = [o for o in spot_fake.orders if o["type"] == "market"]
+    assert len(market_orders_first) == 1
+    assert market_orders_first[0]["symbol"] == "BTC/USDT"
+    assert market_orders_first[0]["side"] == "buy"
+    assert market_orders_first[0]["amount"] == pytest.approx(0.6)
+    assert first["fired_market"] is True
+    assert first["leg1_status"] == "PARTIAL_FILLED"
+    assert first["leg1_filled_qty"] == pytest.approx(0.6)
+    assert first["leg2_hedged_qty"] == pytest.approx(0.6)
+    # Module gán HEDGED ngay khi delta đã hedge đủ filled_qty hiện tại
+    # (MARKET_HEDGE_LEG_2 chỉ dùng khi vẫn còn delta chưa hedge).
+    assert first["execution_state"] == "HEDGED"
+
+    # Lần 2: Chân 1 khớp đủ 1.0 -> chỉ hedge phần chênh lệch 0.4, không hedge lại 1.0.
+    perp_fake.order_status = {"id": "leg1-1", "status": "closed", "filled": 1.0}
+    second = executor.verify_maker_fill_and_hedge_leg2(
+        "BTC/USDT:USDT",
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol="BTC/USDT",
+    )
+
+    market_orders_second = [o for o in spot_fake.orders if o["type"] == "market"]
+    assert len(market_orders_second) == 2
+    assert market_orders_second[1]["amount"] == pytest.approx(0.4)
+    assert second["fired_market"] is True
+    assert second["leg1_status"] == "FILLED"
+    assert second["leg1_filled_qty"] == pytest.approx(1.0)
+    assert second["leg2_hedged_qty"] == pytest.approx(1.0)
+    assert second["execution_state"] == "HEDGED"
+    assert executor._leg_states["BTC/USDT:USDT"]["leg2_hedged_qty"] == pytest.approx(1.0)
+    assert [o for o in perp_fake.orders if o["type"] == "market"] == []
+
+    executor.state_store.save(executor.state)
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    saved_pos = payload["carry_positions"]["BTC/USDT:USDT"]
+    assert saved_pos["leg1_status"] == "FILLED"
+    assert saved_pos["leg1_filled_qty"] == pytest.approx(1.0)
+    assert saved_pos["leg2_hedged_qty"] == pytest.approx(1.0)
+    assert saved_pos["execution_state"] == "HEDGED"
+
+
+def test_maker_taker_hedge_leg1_rejected_or_unfilled_never_fires_market_leg2(
+    tmp_path: Path,
+) -> None:
+    """Chân 1 canceled/rejected với filled=0 tuyệt đối không bắn Market Chân 2.
+
+    Lặp cả hai trạng thái kết thúc ``canceled`` và ``rejected``; mỗi biến thể dùng
+    state file riêng để không phụ thuộc thứ tự test.
+    """
+    expected_leg1_status = {"canceled": "CANCELED", "rejected": "REJECTED"}
+
+    for terminal_status in ("canceled", "rejected"):
+        perp_fake = FakeExchange(
+            order_status={"id": "leg1-1", "status": terminal_status, "filled": 0.0}
+        )
+        spot_fake = FakeExchange()
+        executor = CarryLiveExecutor(
+            mode="live",
+            execution_style="maker_taker_hedge",
+            capital=3000.0,
+            exchange_map={"binance": perp_fake, "binance_spot": spot_fake},
+            perp_exchange=perp_fake,
+            spot_exchange=spot_fake,
+            state_store=StateStore(tmp_path / f"state_{terminal_status}.json"),
+        )
+
+        leg1_res = executor.place_maker_leg1(
+            "BTC/USDT:USDT",
+            "sell",
+            1.0,
+            100.0,
+            exchange_short="binance",
+            exchange_long="binance_spot",
+            spot_symbol="BTC/USDT",
+        )
+        assert leg1_res["leg1_order_id"] == "leg1-1"
+        assert leg1_res["leg1_status"] == "PENDING_MAKER"
+
+        verify_res = executor.verify_maker_fill_and_hedge_leg2(
+            "BTC/USDT:USDT",
+            exchange_short="binance",
+            exchange_long="binance_spot",
+            spot_symbol="BTC/USDT",
+        )
+
+        assert verify_res["leg1_status"] == expected_leg1_status[terminal_status]
+        assert verify_res["leg1_filled_qty"] == pytest.approx(0.0)
+        assert verify_res["leg2_hedged_qty"] == pytest.approx(0.0)
+        assert verify_res["fired_market"] is False
+        assert verify_res["execution_state"] == "IDLE"
+        assert [o for o in perp_fake.orders if o["type"] == "market"] == []
+        assert [o for o in spot_fake.orders if o["type"] == "market"] == []
+
+
+def test_unfilled_maker_leg1_is_cancelled_and_never_orphaned(tmp_path: Path) -> None:
+    """Lệnh Post-Only không khớp phải bị HỦY trên sàn, không để lệnh mồ côi.
+
+    Rủi ro thực chiến: bắn GTX rồi xóa khỏi state mà không cancel thì lệnh vẫn
+    treo trên sàn; khi giá quét qua sẽ tạo vị thế trần trụi ngoài tầm kiểm soát.
+    """
+    perp_fake = FakeExchange(
+        order_status={"id": "leg1-1", "status": "open", "filled": 0.0}
+    )
+    spot_fake = FakeExchange()
+    executor = CarryLiveExecutor(
+        mode="live",
+        execution_style="maker_taker_hedge",
+        capital=3000.0,
+        exchange_map={"binance": perp_fake, "binance_spot": spot_fake},
+        perp_exchange=perp_fake,
+        spot_exchange=spot_fake,
+        state_store=StateStore(tmp_path / "state.json"),
+    )
+
+    executor.place_maker_leg1(
+        "BTC/USDT:USDT",
+        "sell",
+        1.0,
+        100.0,
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol="BTC/USDT",
+    )
+
+    assert executor.cancel_maker_leg1("BTC/USDT:USDT", exchange_name="binance") is True
+    assert perp_fake.cancelled == [{"id": "leg1-1", "symbol": "BTC/USDT:USDT"}]
+    assert executor.state.carry_positions["BTC/USDT:USDT"]["leg1_status"] == "CANCELED"
+    assert executor.state.carry_positions["BTC/USDT:USDT"]["execution_state"] == "IDLE"
+    assert [o for o in perp_fake.orders if o["type"] == "market"] == []
+    assert [o for o in spot_fake.orders if o["type"] == "market"] == []
