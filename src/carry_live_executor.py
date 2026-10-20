@@ -86,7 +86,7 @@ class CarryLiveExecutor:
         self,
         config: TradingConfig = TradingConfig(timeframe="1h"),
         carry_config: DynamicCarryConfig = DynamicCarryConfig(),
-        mode: Literal["paper", "live"] = "paper",
+        mode: Literal["paper", "live", "testnet"] = "paper",
         symbols: Sequence[str] = UNIVERSE_12_SYMBOLS,
         state_store: Optional[StateStore] = None,
         perp_exchange: Any = None,
@@ -101,9 +101,12 @@ class CarryLiveExecutor:
         venues: Optional[dict[str, Any]] = None,
         overlay_config: Optional[BarbellConfig] = None,
         enable_lot_quantization: bool = True,
+        initial_capital: Optional[float] = None,
+        reset_state: bool = False,
+        strategy: Optional[str] = None,
     ) -> None:
-        if mode not in ("paper", "live"):
-            raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper' hoac 'live'.")
+        if mode not in ("paper", "live", "testnet"):
+            raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper', 'live' hoac 'testnet'.")
         if execution_style not in ("maker_taker_hedge", "real_taker"):
             raise ValueError(
                 f"execution_style khong hop le: {execution_style!r}, phai la 'maker_taker_hedge' hoac 'real_taker'."
@@ -111,12 +114,15 @@ class CarryLiveExecutor:
 
         self.config = config
         self.carry_config = carry_config
-        self.mode: Literal["paper", "live"] = mode
+        self.mode: Literal["paper", "live", "testnet"] = mode
         self.symbols: list[str] = list(symbols)
         self.raw_data_dir = Path(raw_data_dir)
         self.lookback_hours = int(lookback_hours)
         self.execution_style: Literal["maker_taker_hedge", "real_taker"] = execution_style
-        self.capital: float = float(capital if capital is not None else carry_config.initial_capital)
+        if initial_capital is not None:
+            self.capital = float(initial_capital)
+        else:
+            self.capital = float(capital if capital is not None else carry_config.initial_capital)
         self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
         self.maker_no_fill_count: int = 0
         self._leg_states: dict[str, dict[str, Any]] = {}
@@ -147,6 +153,18 @@ class CarryLiveExecutor:
             state_store if state_store is not None else StateStore(config.state_file_path)
         )
         self.state: BotState = self.state_store.load(default_equity=self.capital)
+        if initial_capital is not None or reset_state or strategy is not None:
+            self.state = self.state_store.load(
+                default_equity=float(initial_capital or self.capital),
+                normalize_carry=True,
+                initial_capital=initial_capital,
+                strategy=strategy,
+                reset=reset_state,
+            )
+            try:
+                self.state_store.save(self.state)
+            except Exception as e:
+                logger.warning("Could not persist reloaded state in __init__: %s", e)
         if not isinstance(self.state.carry_positions, dict):
             self.state.carry_positions = {}
         else:
@@ -157,6 +175,10 @@ class CarryLiveExecutor:
             }
 
         self.executor_functional: bool = bool(getattr(self.state, "executor_functional", False))
+
+    @property
+    def current_equity(self) -> float:
+        return float(getattr(self.state, "current_equity", self.capital))
 
     def _get_exchange(self, name: str) -> Any:
         """Lấy đối tượng sàn giao dịch từ exchange_map hoặc fallback."""
@@ -299,7 +321,7 @@ class CarryLiveExecutor:
 
         target_qty = q_qty
         err_msg: Optional[str] = None
-        if self.mode == "live":
+        if self.mode in ("live", "testnet"):
             if leg1_ex is None or not hasattr(leg1_ex, "create_order") or not callable(leg1_ex.create_order):
                 err_msg = f"Exchange {ex_name} does not support create_order"
                 leg1_order_id = None
@@ -415,7 +437,7 @@ class CarryLiveExecutor:
         leg1_side = leg_info.get("side", "sell")
         resolved_spot_symbol = spot_symbol or leg_info.get("spot_symbol") or symbol.split(":")[0]
 
-        if self.mode == "live" and leg1_order_id:
+        if self.mode in ("live", "testnet") and leg1_order_id:
             ex_leg1_name = exchange_short if not is_close else (
                 exchange_short if exchange_short in ("binance_spot", "spot") else exchange_long
             )
@@ -495,7 +517,7 @@ class CarryLiveExecutor:
             ex_leg2 = self._get_exchange(ex_leg2_name)
             is_spot_hedge = ex_leg2_name in ("binance_spot", "spot")
 
-            if self.mode == "live":
+            if self.mode in ("live", "testnet"):
                 if ex_leg2 is None or not hasattr(ex_leg2, "create_order") or not callable(ex_leg2.create_order):
                     raise RuntimeError(f"Exchange {ex_leg2_name} does not support create_order for market hedge")
                 if is_spot_hedge:
@@ -551,7 +573,7 @@ class CarryLiveExecutor:
         )
 
         cancelled = True
-        if self.mode == "live" and order_id:
+        if self.mode in ("live", "testnet") and order_id:
             ex = self._get_exchange(exchange_name)
             if ex is not None and hasattr(ex, "cancel_order"):
                 try:
@@ -606,7 +628,7 @@ class CarryLiveExecutor:
         leg1_ex = self._get_exchange(leg1_ex_name)
 
         cancelled = False
-        if self.mode == "live":
+        if self.mode in ("live", "testnet"):
             max_rounds = max(1, int(math.ceil(maker_ttl_sec / max(poll_interval_sec, 1e-3))))
             for _ in range(max_rounds):
                 sleep_fn(poll_interval_sec)
@@ -644,7 +666,7 @@ class CarryLiveExecutor:
                     if raw_st in ("closed", "filled", "canceled", "cancelled", "rejected", "expired"):
                         break
 
-        if self.mode == "live":
+        if self.mode in ("live", "testnet"):
             info_after = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
             cur_st = str(info_after.get("leg1_status", "")).lower()
             cur_filled = float(info_after.get("leg1_filled_qty", 0.0) or 0.0)
@@ -987,7 +1009,7 @@ class CarryLiveExecutor:
             side = "buy" if delta > 0 else "sell"
 
             if (
-                self.mode == "live"
+                self.mode in ("live", "testnet")
                 and self.perp_exchange is not None
                 and hasattr(self.perp_exchange, "create_order")
                 and callable(self.perp_exchange.create_order)
@@ -1410,7 +1432,7 @@ class CarryLiveExecutor:
                     hedged = float(leg2_res.get("leg2_hedged_qty", 0.0))
                     filled = float(leg2_res.get("leg1_filled_qty", 0.0))
 
-                    if filled <= 1e-12 and self.mode == "live":
+                    if filled <= 1e-12 and self.mode in ("live", "testnet"):
                         # Lenh ban spot Post-Only khong khop -> huy de khong treo lenh.
                         spot_cancel_ex = (
                             pos.get("exchange_long", "binance_spot")
@@ -1447,7 +1469,7 @@ class CarryLiveExecutor:
                         if filled <= 1e-12:
                             self.maker_no_fill_count += 1
                 else:
-                    if self.mode == "live":
+                    if self.mode in ("live", "testnet"):
                         if (
                             not self.spot_exchange
                             or not hasattr(self.spot_exchange, "create_order")
@@ -1481,7 +1503,7 @@ class CarryLiveExecutor:
                 effective_margin = float(pos.get("margin_allocated_usdt", 0.0)) + unrealized_mtm
                 v_i = qty * sp_curr + effective_margin
 
-                if self.mode == "live":
+                if self.mode in ("live", "testnet"):
                     if (
                         not self.spot_exchange
                         or not hasattr(self.spot_exchange, "create_order")
@@ -1578,7 +1600,7 @@ class CarryLiveExecutor:
                     else:
                         # Chan 1 khong khop: PHAI huy lenh treo truoc khi xoa state
                         # de tranh lenh mo coi (orphaned post-only order).
-                        if self.mode == "live":
+                        if self.mode in ("live", "testnet"):
                             cancel_ex = (
                                 self.state.carry_positions.get(sym, {}).get("exchange_short")
                                 or self._leg_states.get(sym, {}).get("exchange_short")
@@ -1595,7 +1617,7 @@ class CarryLiveExecutor:
                     fee = target_notional * self.carry_config.one_way_cost()
                     margin_alloc = (allocated_capital - target_notional) - fee
 
-                    if self.mode == "live":
+                    if self.mode in ("live", "testnet"):
                         if (
                             not self.spot_exchange
                             or not hasattr(self.spot_exchange, "create_order")
@@ -1782,7 +1804,13 @@ class CarryLiveExecutor:
         lines.append(sep)
         return "\n".join(lines)
 
-    def run_loop(self, once: bool = False, max_iterations: Optional[int] = None) -> int:
+    def run_loop(
+        self,
+        once: bool = False,
+        max_iterations: Optional[int] = None,
+        cycles: Optional[int] = None,
+        interval_sec: Optional[float] = None,
+    ) -> int:
         """Vận hành vòng lặp điều phối CarryLiveExecutor (24/7 hoặc chạy một lần --once)."""
         logger.info(
             "Starting CarryLiveExecutor run_loop (mode=%s, style=%s, capital=%.2f, once=%s)",
@@ -1791,6 +1819,8 @@ class CarryLiveExecutor:
             self.capital,
             once,
         )
+        effective_max = cycles if cycles is not None else max_iterations
+        sleep_sec = float(interval_sec) if interval_sec is not None else 60.0
         iterations = 0
         try:
             while True:
@@ -1798,6 +1828,29 @@ class CarryLiveExecutor:
                 try:
                     plan = self.reconcile_once()
                     logger.info("\n%s", plan["table_ascii"])
+                    cur_eq = float(getattr(self.state, "current_equity", self.capital))
+                    peak_eq = float(getattr(self.state, "peak_equity", cur_eq))
+                    dd_pct = ((peak_eq - cur_eq) / peak_eq * 100.0) if peak_eq > 0 else 0.0
+                    ks_status = bool(getattr(self.state, "kill_switch_triggered", False))
+                    carry_spots = sum(
+                        float(p.get("qty", 0.0)) * float(p.get("entry_spot_price", 0.0))
+                        for p in self.state.carry_positions.values()
+                    )
+                    carry_perps = sum(
+                        float(p.get("leg2_hedged_qty", p.get("qty", 0.0))) * float(p.get("entry_perp_price", 0.0))
+                        for p in self.state.carry_positions.values()
+                    )
+                    logger.info(
+                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=0.00 vs Short=0.00) | Kill-Switch=%s",
+                        iterations,
+                        self.capital,
+                        cur_eq,
+                        peak_eq,
+                        dd_pct,
+                        carry_spots,
+                        carry_perps,
+                        ks_status,
+                    )
                 except Exception as e:
                     logger.error("Error in reconcile_once: %s", e, exc_info=True)
                     if once:
@@ -1806,11 +1859,11 @@ class CarryLiveExecutor:
                 if once:
                     return 0
 
-                if max_iterations is not None and iterations >= max_iterations:
-                    logger.info("Reached max_iterations (%d), exiting loop.", max_iterations)
+                if effective_max is not None and iterations >= effective_max:
+                    logger.info("Reached max iterations/cycles (%d), exiting loop.", effective_max)
                     return 0
 
-                time.sleep(60)
+                time.sleep(sleep_sec)
         except KeyboardInterrupt:
             logger.info("CarryLiveExecutor interrupted by user.")
             return 0
