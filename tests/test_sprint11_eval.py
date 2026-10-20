@@ -62,6 +62,7 @@ def _good_row(**overrides: Any) -> dict[str, Any]:
         "annualized_return_pct": 10.36,
         "positive_periods": 7,
         "holdout_return_pct": 4.0,
+        "holdout_return_resim_pct": 4.0,
         "holdout_carry_pnl": 50.0,
         "holdout_overlay_net_pnl": 60.0,
         "sharpe": 1.86,
@@ -207,7 +208,9 @@ def test_evaluate_go_when_all_criteria_pass() -> None:
     assert result["go"] is True
     assert result["reasons"] == []
     assert result["primary_combo"] == "tier1b/smooth_conviction"
-    assert len(result["criteria"]) == 10
+    assert len(result["criteria"]) >= 10
+    names = {criterion["name"] for criterion in result["criteria"]}
+    assert {"holdout_consistency", "holdout_consistency_resim"} <= names
     assert all(criterion["passed"] for criterion in result["criteria"])
 
 
