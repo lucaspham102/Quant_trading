@@ -286,12 +286,17 @@ def check_executor_parity() -> dict[str, Any]:
 def evaluate_sprint10_go_no_go(
     tier_payload: dict[str, Any],
     is_barbell: bool = False,
+    executor_functional: bool = False,
 ) -> dict[str, Any]:
     """Phán quyết GO / NO-GO Sprint 10 theo tiêu chí docs/go_no_go_sprint10.md.
 
     Tham số:
         tier_payload: Dict dữ liệu của Tier (chứa row, result, periods).
         is_barbell: True nếu kiểm định Tier 4 Barbell Portfolio.
+        executor_functional: True CHỈ KHI đã xác minh executor thực thi thật cả
+            2 nhánh (carry + overlay) và định tuyến đa sàn bằng smoke/integration
+            test. Mặc định False vì kiểm tra tĩnh (đọc source) không đủ chứng minh
+            GO-5; tránh tạo PASS giả.
 
     Trả về:
         Dict gồm: verdict ('GO' hoặc 'NO-GO'), failed (list tên tiêu chí fail),
@@ -389,7 +394,7 @@ def evaluate_sprint10_go_no_go(
 
     # GO-5: Production Executor Parity
     parity_res = check_executor_parity()
-    cond5_passed = bool(parity_res.get("passed", False))
+    cond5_passed = bool(parity_res.get("passed", False)) and bool(executor_functional)
 
     conditions = {
         "cond1_return": {
@@ -429,7 +434,11 @@ def evaluate_sprint10_go_no_go(
         },
         "cond5_executor_parity": {
             "passed": cond5_passed,
-            "detail": f"Executor parity passed: {cond5_passed} (missing: {parity_res.get('missing', [])})",
+            "detail": (
+                f"Static parity: {bool(parity_res.get('passed', False))} "
+                f"(missing: {parity_res.get('missing', [])}); "
+                f"functional executor verified: {bool(executor_functional)}"
+            ),
         },
     }
 

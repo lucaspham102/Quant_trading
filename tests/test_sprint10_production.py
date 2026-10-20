@@ -1247,7 +1247,7 @@ def test_evaluate_sprint10_go_no_go_all_conditions_pass_and_fail(
     )
 
     payload = _s10c4_go_payload()
-    ok = evaluate_sprint10_go_no_go(payload, is_barbell=True)
+    ok = evaluate_sprint10_go_no_go(payload, is_barbell=True, executor_functional=True)
 
     assert ok["verdict"] == "GO"
     assert ok["failed"] == []
@@ -1255,7 +1255,7 @@ def test_evaluate_sprint10_go_no_go_all_conditions_pass_and_fail(
 
     bad_risk = _s10c4_go_payload()
     bad_risk["row"]["sharpe"] = 1.0
-    risk_verdict = evaluate_sprint10_go_no_go(bad_risk, is_barbell=True)
+    risk_verdict = evaluate_sprint10_go_no_go(bad_risk, is_barbell=True, executor_functional=True)
 
     assert risk_verdict["verdict"] == "NO-GO"
     assert risk_verdict["failed"] == ["cond3_risk"]
@@ -1263,7 +1263,7 @@ def test_evaluate_sprint10_go_no_go_all_conditions_pass_and_fail(
 
     bad_regime = _s10c4_go_payload()
     bad_regime["row"]["overlay_active_ratio"] = 0.95
-    regime_verdict = evaluate_sprint10_go_no_go(bad_regime, is_barbell=True)
+    regime_verdict = evaluate_sprint10_go_no_go(bad_regime, is_barbell=True, executor_functional=True)
 
     assert regime_verdict["verdict"] == "NO-GO"
     assert regime_verdict["failed"] == ["cond4_regime_and_mtm"]
