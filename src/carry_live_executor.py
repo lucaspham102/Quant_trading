@@ -444,6 +444,46 @@ class CarryLiveExecutor:
             "execution_state": exec_state,
         }
 
+    def cancel_maker_leg1(
+        self,
+        symbol: str,
+        exchange_name: str = "binance",
+        order_symbol: Optional[str] = None,
+        is_close: bool = False,
+    ) -> bool:
+        """Huy lep lenh Post-Only Chan 1 con treo de KHONG bao gio de lai lenh mo coi.
+
+        Rui ro thuc te: neu dat limit Post-Only ma khong huy, lenh se nam tren san
+        va co the khop luc gia quet qua, tao vi the Short/Long tran trui ma bot
+        khong quan ly duoc. Ham nay dam bao moi lenh khong khop deu duoc huy.
+
+        Tra ve True neu da goi cancel_order (hoac khong co lenh de huy).
+        """
+        info = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+        order_id = info.get("leg1_order_id")
+        target_symbol = order_symbol or (
+            (info.get("spot_symbol") or symbol.split(":")[0]) if is_close else symbol
+        )
+
+        cancelled = True
+        if self.mode == "live" and order_id:
+            ex = self._get_exchange(exchange_name)
+            if ex is not None and hasattr(ex, "cancel_order"):
+                try:
+                    ex.cancel_order(str(order_id), target_symbol)
+                except Exception as e:  # pragma: no cover - phu thuoc API san
+                    logger.warning("cancel_order %s failed for %s: %s", order_id, symbol, e)
+                    cancelled = False
+            else:
+                logger.warning("Exchange %s does not support cancel_order; order %s may be orphaned", exchange_name, order_id)
+
+        info["leg1_status"] = "CANCELED"
+        info["execution_state"] = "IDLE"
+        if symbol in self.state.carry_positions:
+            self.state.carry_positions[symbol]["leg1_status"] = "CANCELED"
+            self.state.carry_positions[symbol]["execution_state"] = "IDLE"
+        return cancelled
+
     def _load_symbol_from_cache(self, symbol: str) -> pd.DataFrame:
         """Đọc và ghép dữ liệu Spot, Perp và Funding từ Parquet cache cục bộ."""
         clean_sym = _clean_symbol_name(symbol)
@@ -800,6 +840,15 @@ class CarryLiveExecutor:
                     hedged = float(leg2_res.get("leg2_hedged_qty", 0.0))
                     filled = float(leg2_res.get("leg1_filled_qty", 0.0))
 
+                    if filled <= 1e-12 and self.mode == "live":
+                        # Lenh ban spot Post-Only khong khop -> huy de khong treo lenh.
+                        self.cancel_maker_leg1(
+                            sym,
+                            exchange_name="binance_spot",
+                            order_symbol=spot_sym,
+                            is_close=True,
+                        )
+
                     if hedged > 1e-12:
                         entry_spot = float(pos.get("entry_spot_price", sp_curr))
                         entry_perp = float(pos.get("entry_perp_price", pe_curr))
@@ -952,6 +1001,14 @@ class CarryLiveExecutor:
                         }
                         self.state.current_equity -= fee
                     else:
+                        # Chan 1 khong khop: PHAI huy lenh treo truoc khi xoa state
+                        # de tranh lenh mo coi (orphaned post-only order).
+                        if self.mode == "live":
+                            self.cancel_maker_leg1(
+                                sym,
+                                exchange_name="binance",
+                                order_symbol=sym,
+                            )
                         self.state.carry_positions.pop(sym, None)
                         self.maker_no_fill_count += 1
                 else:

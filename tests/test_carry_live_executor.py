@@ -436,6 +436,7 @@ class FakeExchange:
         )
         self.bids = [list(level) for level in (bids or [[99.9, 10]])]
         self.asks = [list(level) for level in (asks or [[100.1, 10]])]
+        self.cancelled: list[dict[str, Any]] = []
 
     def milliseconds(self) -> int:
         """Mốc thời gian cố định, không phụ thuộc đồng hồ thật."""
@@ -472,6 +473,11 @@ class FakeExchange:
     def fetch_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
         """Trả dữ liệu trạng thái do test điều khiển qua ``self.order_status``."""
         return dict(self.order_status)
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Ghi nhận lệnh hủy để test chống bỏ quên lệnh treo (orphaned order)."""
+        self.cancelled.append({"id": order_id, "symbol": symbol})
+        return {"id": order_id, "status": "canceled"}
 
 
 def test_maker_taker_hedge_state_machine_full_and_partial_fill(tmp_path: Path) -> None:
@@ -622,3 +628,41 @@ def test_maker_taker_hedge_leg1_rejected_or_unfilled_never_fires_market_leg2(
         assert verify_res["execution_state"] == "IDLE"
         assert [o for o in perp_fake.orders if o["type"] == "market"] == []
         assert [o for o in spot_fake.orders if o["type"] == "market"] == []
+
+
+def test_unfilled_maker_leg1_is_cancelled_and_never_orphaned(tmp_path: Path) -> None:
+    """Lệnh Post-Only không khớp phải bị HỦY trên sàn, không để lệnh mồ côi.
+
+    Rủi ro thực chiến: bắn GTX rồi xóa khỏi state mà không cancel thì lệnh vẫn
+    treo trên sàn; khi giá quét qua sẽ tạo vị thế trần trụi ngoài tầm kiểm soát.
+    """
+    perp_fake = FakeExchange(
+        order_status={"id": "leg1-1", "status": "open", "filled": 0.0}
+    )
+    spot_fake = FakeExchange()
+    executor = CarryLiveExecutor(
+        mode="live",
+        execution_style="maker_taker_hedge",
+        capital=3000.0,
+        exchange_map={"binance": perp_fake, "binance_spot": spot_fake},
+        perp_exchange=perp_fake,
+        spot_exchange=spot_fake,
+        state_store=StateStore(tmp_path / "state.json"),
+    )
+
+    executor.place_maker_leg1(
+        "BTC/USDT:USDT",
+        "sell",
+        1.0,
+        100.0,
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol="BTC/USDT",
+    )
+
+    assert executor.cancel_maker_leg1("BTC/USDT:USDT", exchange_name="binance") is True
+    assert perp_fake.cancelled == [{"id": "leg1-1", "symbol": "BTC/USDT:USDT"}]
+    assert executor.state.carry_positions["BTC/USDT:USDT"]["leg1_status"] == "CANCELED"
+    assert executor.state.carry_positions["BTC/USDT:USDT"]["execution_state"] == "IDLE"
+    assert [o for o in perp_fake.orders if o["type"] == "market"] == []
+    assert [o for o in spot_fake.orders if o["type"] == "market"] == []

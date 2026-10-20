@@ -424,7 +424,10 @@ def run_barbell_portfolio(
         {
             "funding_pnl": carry_funding,
             "basis_pnl": carry_basis,
-            "overlay_pnl": hourly_overlay_pnl,
+            # Cot overlay_pnl trong attribution la GROSS (da cong lai phan phi
+            # overlay) de dang thuc: funding + basis + overlay_pnl - fees == net_pnl.
+            # Con so "overlay_pnl" tra ve o top-level van la NET (sau phi).
+            "overlay_pnl": hourly_overlay_pnl + hourly_overlay_fees,
             "carry_fees": carry_fees,
             "overlay_fees": hourly_overlay_fees,
             "fees": total_fees_series,
