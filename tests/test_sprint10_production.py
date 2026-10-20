@@ -999,3 +999,354 @@ def test_persist_sleeve_state_roundtrip(tmp_path: Path) -> None:
     # carry_positions cũ không bị ghi đè bởi persist sleeve state.
     assert loaded.carry_positions[BTC]["execution_state"] == "HEDGED"
     assert loaded.carry_positions[BTC]["qty"] == pytest.approx(0.5)
+
+
+# ===========================================================================
+# Sprint 10 — Chặng 4: Attribution theo kỳ, GO/NO-GO 5 tiêu chí, executor
+# parity và mô phỏng 4 Tier + bảng tổng hợp 21 cột
+# ===========================================================================
+from src.sprint10_eval import (  # noqa: E402
+    build_sprint10_summary_rows,
+    check_executor_parity,
+    compute_period_contributions,
+    evaluate_sprint10_go_no_go,
+    run_sprint10_tiers,
+)
+
+SUMMARY_COLUMNS = (
+    "tier",
+    "tier_name",
+    "final_equity",
+    "annualized_return_pct",
+    "sharpe",
+    "maxdd_pct",
+    "beta_btc",
+    "net_pnl",
+    "positive_periods",
+    "total_periods",
+    "holdout_annualized_pct",
+    "worst_period_pct",
+    "fees",
+    "funding_pnl",
+    "basis_pnl",
+    "basis_mtm_std",
+    "overlay_active_ratio",
+    "overlay_mean_leverage",
+    "snr_dispersion_mean",
+    "verdict",
+    "failed_conditions",
+)
+
+
+def _s10c4_attribution_index(periods: int = 10) -> pd.DatetimeIndex:
+    """DatetimeIndex 1 giờ UTC dùng cho chuỗi attribution giả lập."""
+    return pd.date_range("2024-01-01", periods=periods, freq="h", tz="UTC")
+
+
+def _s10c4_go_payload() -> dict[str, Any]:
+    """Payload Tier 4 giả lập thỏa cả 5 tiêu chí GO của Sprint 10.
+
+    ``periods`` có 7 kỳ: 6 kỳ +2.0% và kỳ holdout cuối -1.0% nhưng annualized
+    +9.0% (vẫn qua ngưỡng 8%). ``attribution_series`` dương ở mọi thành phần
+    trong kỳ holdout để cond2 (nhánh Barbell) đạt, kèm ``basis_mtm_std`` và
+    ``overlay_active_ratio`` nằm trong dải hợp lệ cho cond4.
+    """
+    attr_index = _s10c4_attribution_index(8)
+    attribution = pd.DataFrame(
+        {
+            "funding_pnl": np.full(8, 1.0, dtype="float64"),
+            "basis_pnl": np.full(8, 2.0, dtype="float64"),
+            "overlay_pnl": np.full(8, 3.0, dtype="float64"),
+            "fees": np.full(8, 0.5, dtype="float64"),
+            "net_pnl": np.full(8, 5.5, dtype="float64"),
+        },
+        index=attr_index,
+    )
+
+    net_returns = [2.0] * 6 + [-1.0]
+    period_rows = []
+    for i, net_return in enumerate(net_returns):
+        is_holdout = i == len(net_returns) - 1
+        period_rows.append(
+            {
+                "period": f"P{i + 1}",
+                "period_id": f"P{i + 1}",
+                "start": attr_index[i],
+                "end": attr_index[i + 1],
+                "net_return_pct": net_return,
+                "annualized_return_pct": 9.0 if is_holdout else 12.0,
+                "positive": net_return > 0.0,
+            }
+        )
+
+    return {
+        "tier_name": "Tier 4 — Production Barbell (test)",
+        "row": {
+            "annualized_return_pct": 12.0,
+            "sharpe": 2.0,
+            "maxdd_pct": 5.0,
+            "beta_btc": 0.05,
+        },
+        "periods": pd.DataFrame(period_rows),
+        "result": {
+            "attribution_series": attribution,
+            "basis_mtm_std": 0.1,
+            "overlay_active_ratio": 0.5,
+            "metrics": {"Margin Calls": 0},
+        },
+    }
+
+
+def _s10c4_synthetic_frame(
+    index: pd.DatetimeIndex,
+    close: np.ndarray,
+    basis_pct: np.ndarray,
+    funding_binance: float,
+    funding_bybit: float,
+) -> pd.DataFrame:
+    """Dựng schema đa sàn đầy đủ cho 4 Tier, funding chỉ trả tại mốc 8h UTC.
+
+    ``ewma_funding_*`` và ``max_single_funding`` giữ hằng số để yield kỳ vọng
+    ổn định; ``funding_event_*`` chỉ khác 0 tại 00/08/16 UTC đúng quy ước.
+    """
+    close_arr = np.asarray(close, dtype="float64")
+    n = len(close_arr)
+    is_event = ((index.hour % 8) == 0) & (index.minute == 0)
+    event_binance = np.where(is_event, funding_binance, 0.0)
+    event_bybit = np.where(is_event, funding_bybit, 0.0)
+    frame = pd.DataFrame(
+        {
+            "open": close_arr,
+            "high": close_arr * 1.0005,
+            "low": close_arr * 0.9995,
+            "close": close_arr,
+            "volume": np.full(n, 1000.0, dtype="float64"),
+            "perp_close": close_arr,
+            "spot_close": close_arr,
+            "basis_pct": np.asarray(basis_pct, dtype="float64"),
+            "funding_event_binance": event_binance,
+            "funding_event_bybit": event_bybit,
+            "ewma_funding_binance": np.full(n, funding_binance, dtype="float64"),
+            "ewma_funding_bybit": np.full(n, funding_bybit, dtype="float64"),
+            "max_single_funding": np.full(n, funding_binance, dtype="float64"),
+            "min_single_funding": np.full(n, funding_bybit, dtype="float64"),
+            "cross_ex_spread": np.full(n, funding_binance - funding_bybit, dtype="float64"),
+        },
+        index=index.copy(),
+    )
+    frame.index.name = "datetime"
+    return frame
+
+
+def _s10c4_synthetic_data(periods: int = 700) -> tuple[dict[str, pd.DataFrame], pd.Series]:
+    """Dựng 4 symbol × ``periods`` nến 1h với basis sin ±10 bps và funding 2 sàn.
+
+    Giá phân hóa nhẹ (drift ±1-2 bps/giờ) để maker Post-Only luôn khớp, funding
+    Binance 1.5 bps / Bybit 0.5 bps đủ vượt ngưỡng entry 0.5 bps/8h. Trả về
+    ``(multi_aligned_data, btc_benchmark_returns)``.
+    """
+    index = pd.date_range(
+        "2024-01-01", periods=periods, freq="h", tz="UTC"
+    ).as_unit("ns")
+    index.name = "datetime"
+
+    steps = np.arange(periods, dtype="float64")
+    basis_pct = 0.001 * np.sin(2.0 * np.pi * steps / 48.0)
+
+    starts = (65000.0, 3000.0, 150.0, 600.0)
+    drifts = (0.0001, 0.00005, -0.00005, -0.0001)
+
+    data: dict[str, pd.DataFrame] = {}
+    close_map: dict[str, np.ndarray] = {}
+    for symbol, start, drift in zip(OVERLAY_SYMBOLS, starts, drifts):
+        close = start * np.cumprod(1.0 + np.full(periods, drift, dtype="float64"))
+        close_map[symbol] = close
+        data[symbol] = _s10c4_synthetic_frame(
+            index,
+            close,
+            basis_pct,
+            funding_binance=0.00015,
+            funding_bybit=0.00005,
+        )
+
+    btc_returns = (
+        pd.Series(close_map[OVERLAY_SYMBOLS[0]], index=index)
+        .pct_change()
+        .fillna(0.0)
+        .astype("float64")
+    )
+    return data, btc_returns
+
+
+# ---------------------------------------------------------------------------
+# 15. Bóc tách đóng góp PnL theo cửa sổ thời gian [start, end)
+# ---------------------------------------------------------------------------
+def test_compute_period_contributions_slices_attribution_correctly() -> None:
+    """Chỉ cộng các bar trong [index[2], index[5]) và chịu được cột thiếu.
+
+    Mỗi bar có funding 1.0 / basis 2.0 / overlay 3.0 / fees 0.5 / net 5.5 nên
+    cửa sổ 3 bar phải cho 3.0 / 6.0 / 9.0 / 1.5 / 16.5. Khi attribution chỉ có
+    ``funding_pnl``, các thành phần còn lại trả 0.0 thay vì ném KeyError.
+    """
+    index = _s10c4_attribution_index(10)
+    attribution = pd.DataFrame(
+        {
+            "funding_pnl": np.full(10, 1.0, dtype="float64"),
+            "basis_pnl": np.full(10, 2.0, dtype="float64"),
+            "overlay_pnl": np.full(10, 3.0, dtype="float64"),
+            "fees": np.full(10, 0.5, dtype="float64"),
+            "net_pnl": np.full(10, 5.5, dtype="float64"),
+        },
+        index=index,
+    )
+
+    contrib = compute_period_contributions(
+        {"attribution_series": attribution},
+        index[2],
+        index[5],
+    )
+
+    assert contrib["funding_pnl"] == pytest.approx(3.0)
+    assert contrib["basis_pnl"] == pytest.approx(6.0)
+    assert contrib["overlay_pnl"] == pytest.approx(9.0)
+    assert contrib["fees"] == pytest.approx(1.5)
+    assert contrib["net_pnl"] == pytest.approx(16.5)
+
+    partial = pd.DataFrame(
+        {"funding_pnl": np.full(10, 1.0, dtype="float64")},
+        index=index,
+    )
+    partial_contrib = compute_period_contributions(
+        {"attribution_series": partial},
+        index[2],
+        index[5],
+    )
+
+    assert partial_contrib["funding_pnl"] == pytest.approx(3.0)
+    assert partial_contrib["basis_pnl"] == pytest.approx(0.0)
+    assert partial_contrib["overlay_pnl"] == pytest.approx(0.0)
+    assert partial_contrib["fees"] == pytest.approx(0.0)
+    assert partial_contrib["net_pnl"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 16. GO/NO-GO: đủ 5 tiêu chí -> GO; hạ Sharpe hoặc lệch regime -> NO-GO
+# ---------------------------------------------------------------------------
+def test_evaluate_sprint10_go_no_go_all_conditions_pass_and_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payload chuẩn phải cho GO; mỗi vi phạm đơn lẻ phải chỉ đúng tiêu chí fail.
+
+    Executor parity được mock để cô lập 4 tiêu chí định lượng. Bản sao hạ
+    ``sharpe`` xuống 1.0 phải fail ``cond3_risk``; bản sao đẩy
+    ``overlay_active_ratio`` lên 0.95 phải fail ``cond4_regime_and_mtm``.
+    """
+    monkeypatch.setattr(
+        "src.sprint10_eval.check_executor_parity",
+        lambda: {"passed": True, "checks": {}, "missing": []},
+    )
+
+    payload = _s10c4_go_payload()
+    ok = evaluate_sprint10_go_no_go(payload, is_barbell=True)
+
+    assert ok["verdict"] == "GO"
+    assert ok["failed"] == []
+    assert all(cond["passed"] for cond in ok["conditions"].values())
+
+    bad_risk = _s10c4_go_payload()
+    bad_risk["row"]["sharpe"] = 1.0
+    risk_verdict = evaluate_sprint10_go_no_go(bad_risk, is_barbell=True)
+
+    assert risk_verdict["verdict"] == "NO-GO"
+    assert risk_verdict["failed"] == ["cond3_risk"]
+    assert risk_verdict["conditions"]["cond3_risk"]["passed"] is False
+
+    bad_regime = _s10c4_go_payload()
+    bad_regime["row"]["overlay_active_ratio"] = 0.95
+    regime_verdict = evaluate_sprint10_go_no_go(bad_regime, is_barbell=True)
+
+    assert regime_verdict["verdict"] == "NO-GO"
+    assert regime_verdict["failed"] == ["cond4_regime_and_mtm"]
+    assert regime_verdict["conditions"]["cond4_regime_and_mtm"]["passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# 17. Executor parity: đủ thành phần quantize/cancel/barbell/sleeve/overlay
+# ---------------------------------------------------------------------------
+def test_check_executor_parity_detects_required_components() -> None:
+    """Quét source thực tế phải thấy đủ 5 thành phần GO-5 và không thiếu gì.
+
+    Đây là kiểm tra tích hợp trên ``src/carry_live_executor.py`` và
+    ``src/state_store.py``: thiếu bất kỳ hàm/khóa nào sẽ khiến ``passed`` False
+    và tên đó xuất hiện trong ``missing``.
+    """
+    parity = check_executor_parity()
+
+    assert parity["passed"] is True
+    assert parity["missing"] == []
+
+    checks = parity["checks"]
+    for required in (
+        "quantize_leg",
+        "cancel_maker_leg1",
+        "build_barbell_allocations",
+        "carry_sleeve",
+        "momentum_overlay",
+    ):
+        assert required in checks
+        assert checks[required] is True
+
+
+# ---------------------------------------------------------------------------
+# 18. Chạy 4 Tier trên dữ liệu tổng hợp và xuất bảng 21 cột
+# ---------------------------------------------------------------------------
+def test_run_sprint10_tiers_and_summary_rows_on_synthetic_data() -> None:
+    """4 Tier phải trả kỳ hợp lệ, bảng tổng hợp đủ 21 cột và True Basis MTM chạy.
+
+    Dữ liệu 700 nến với basis sin ±10 bps để Tier 1 (single Binance) thực sự
+    giữ vị thế và phát sinh Basis MTM; nhờ đó ``basis_mtm_std > 0`` chứng minh
+    MTM không còn là hằng 0. Tier 4 phải có tỷ lệ overlay hoạt động trong
+    [0, 1] và không dòng nào có ``final_equity`` NaN.
+    """
+    data, btc_returns = _s10c4_synthetic_data(periods=700)
+
+    tiers = run_sprint10_tiers(
+        data,
+        btc_returns,
+        initial_capital=3000.0,
+        n_periods=2,
+        period_days=14,
+    )
+
+    expected_tiers = {
+        "tier1_single_binance",
+        "tier2_best_venue",
+        "tier3_hybrid_perp_perp",
+        "tier4_production_barbell",
+    }
+    assert set(tiers) == expected_tiers
+
+    for tier_key in expected_tiers:
+        periods = tiers[tier_key]["periods"]
+        assert isinstance(periods, pd.DataFrame)
+        assert not periods.empty, f"{tier_key} phải có ít nhất một kỳ"
+        assert len(periods) == 2
+
+    rows = build_sprint10_summary_rows(tiers)
+    assert len(rows) == 4
+    assert len(SUMMARY_COLUMNS) == 21
+
+    by_tier = {str(row["tier"]): row for row in rows}
+    for row in rows:
+        for column in SUMMARY_COLUMNS:
+            assert column in row, f"Thiếu cột {column} ở {row.get('tier')}"
+        assert np.isfinite(float(row["final_equity"]))
+
+    tier1 = by_tier["tier1_single_binance"]
+    assert float(tier1["basis_mtm_std"]) > 0.0, (
+        "True Basis MTM phải phát sinh khi basis_pct dao động và có vị thế"
+    )
+
+    tier4 = by_tier["tier4_production_barbell"]
+    overlay_ratio = float(tier4["overlay_active_ratio"])
+    assert 0.0 <= overlay_ratio <= 1.0
