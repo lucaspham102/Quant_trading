@@ -17,7 +17,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.cross_exchange_carry import CrossExchangeCarryConfig, run_cross_exchange_carry
+from src.cross_exchange_carry import (
+    CrossExchangeCarryConfig,
+    run_binance_tier1_plus_carry,
+    run_cross_exchange_carry,
+)
 from src.cross_sectional import CrossSectionalConfig, run_cross_sectional_portfolio
 
 
@@ -60,6 +64,16 @@ class BarbellConfig:
     enable_drawdown_cushion: bool = True
     overlay_dd_cut_threshold: float = 0.04
     overlay_dd_off_threshold: float = 0.06
+
+    # Cấu hình mới Sprint 11
+    carry_variant: str = "tier1b"            # "tier1a" | "tier1b" | "legacy"
+    gating_mode: str = "hard_binary"         # "hard_binary" | "smooth_conviction"
+    carry_tilt_weight: float = 0.20
+    smooth_target_vol_ann: float = 0.075
+    smooth_leverage_min: float = 0.15
+    smooth_leverage_max: float = 0.50
+    min_weight_change_to_trade: float = 0.08
+    overlay_quantize_legs: bool = True
 
 
 def compute_snr_dispersion(
@@ -178,6 +192,216 @@ def build_overlay_data(
     return overlay_data
 
 
+from src.cross_exchange_carry import quantize_order_qty
+
+
+def _simulate_barbell_equity(
+    raw_weights: pd.DataFrame,      # trọng số unit-gross theo nến (đã reindex common_index, fillna 0)
+    close_matrix: pd.DataFrame,     # giá đóng cửa theo nến, cùng cột
+    funding_matrix: pd.DataFrame,   # funding_rate_event theo nến, cùng cột
+    target_leverage: np.ndarray,    # L_t mỗi nến (trước DD cushion)
+    carry_returns: np.ndarray,      # lợi nhuận carry 1h
+    initial_capital: float,
+    rebalance_hours: int,
+    one_way_cost: float,
+    quantize: bool,
+    min_weight_change: float,
+    dd_cut: float,
+    dd_off: float,
+    enable_dd_cushion: bool,
+) -> dict[str, Any]:
+    """Mô phỏng động cơ vốn Barbell với lượng hóa lot-size và quản trị drawdown."""
+    bars = len(raw_weights)
+    symbols = list(raw_weights.columns)
+    n_sym = len(symbols)
+
+    equity = np.zeros(bars, dtype=np.float64)
+    returns = np.zeros(bars, dtype=np.float64)
+    gross_usd = np.zeros(bars, dtype=np.float64)
+    fees_usd = np.zeros(bars, dtype=np.float64)
+    net_usd = np.zeros(bars, dtype=np.float64)
+    weights = np.zeros((bars, n_sym), dtype=np.float64)
+    leverage = np.zeros(bars, dtype=np.float64)
+
+    quantization_events = 0
+    skipped_rebalances = 0
+    turnover_weight = 0.0
+    pending_initial_fee = 0.0
+
+    if bars == 0:
+        return {
+            "equity": equity,
+            "returns": returns,
+            "gross_usd": gross_usd,
+            "fees_usd": fees_usd,
+            "net_usd": net_usd,
+            "weights": weights,
+            "leverage": leverage,
+            "quantization_events": quantization_events,
+            "skipped_rebalances": skipped_rebalances,
+            "turnover_weight": turnover_weight,
+        }
+
+    raw_w_arr = raw_weights.to_numpy(dtype=np.float64)
+    close_arr = close_matrix.to_numpy(dtype=np.float64)
+    funding_arr = funding_matrix.to_numpy(dtype=np.float64)
+
+    ret_arr = np.zeros_like(close_arr)
+    if bars > 1:
+        prev_close = close_arr[:-1]
+        diff_close = close_arr[1:] - prev_close
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ret_step = np.where(prev_close > 0.0, diff_close / prev_close, 0.0)
+            ret_arr[1:] = np.nan_to_num(ret_step, nan=0.0)
+
+    is_funding_bar = np.zeros(bars, dtype=bool)
+    if isinstance(raw_weights.index, pd.DatetimeIndex):
+        hours = raw_weights.index.hour
+        minutes = raw_weights.index.minute
+        is_funding_bar = np.isin(hours, [0, 8, 16]) & (minutes == 0)
+
+    w_changed = np.zeros(bars, dtype=bool)
+    if bars > 1:
+        diff_w = np.abs(raw_w_arr[1:] - raw_w_arr[:-1])
+        w_changed[1:] = np.max(diff_w, axis=1) > 1e-12
+
+    equity[0] = initial_capital
+    peak = initial_capital
+    w_cur = np.zeros(n_sym, dtype=np.float64)
+    current_leverage = 0.0
+
+    for t in range(bars):
+        if t == 0:
+            gross_usd[0] = 0.0
+            fees_usd[0] = 0.0
+            net_usd[0] = 0.0
+            returns[0] = 0.0
+            equity[0] = initial_capital
+            peak = initial_capital
+
+            L_eff = float(target_leverage[0]) if len(target_leverage) > 0 else 0.0
+            current_leverage = L_eff
+            target = raw_w_arr[0] * L_eff
+            w_q = target.copy()
+
+            if quantize and initial_capital > 0.0:
+                for i in range(n_sym):
+                    if abs(target[i]) > 1e-12:
+                        sym = symbols[i]
+                        px = close_arr[0, i]
+                        target_val = abs(target[i]) * initial_capital
+                        q, actual = quantize_order_qty(sym, target_val, px)
+                        w_q_i = float(np.sign(target[i]) * (actual / initial_capital)) if q > 0 else 0.0
+                        if abs(w_q_i - target[i]) > 1e-12:
+                            quantization_events += 1
+                        w_q[i] = w_q_i
+                    else:
+                        w_q[i] = 0.0
+
+            delta_w = np.abs(w_q - w_cur)
+            if np.any(delta_w > 1e-12):
+                turnover_weight += float(np.sum(delta_w))
+                w_cur = w_q.copy()
+
+            pending_initial_fee = float(np.sum(np.abs(w_q)) * initial_capital * one_way_cost)
+
+            leverage[0] = current_leverage
+            weights[0] = w_cur.copy()
+            continue
+
+        prev_eq = equity[t - 1]
+        dd_t = 1.0 - (prev_eq / peak) if peak > 0.0 else 0.0
+        if enable_dd_cushion:
+            if dd_t > dd_off:
+                mult = 0.0
+            elif dd_t > dd_cut:
+                mult = 0.5
+            else:
+                mult = 1.0
+        else:
+            mult = 1.0
+
+        gross_ret = float(np.sum(w_cur * ret_arr[t]))
+        if is_funding_bar[t]:
+            gross_ret -= float(np.sum(w_cur * funding_arr[t]))
+
+        g_usd = gross_ret * prev_eq
+        gross_usd[t] = g_usd
+
+        is_rebal = (t % rebalance_hours == 0) or w_changed[t]
+        fee = 0.0
+
+        if is_rebal:
+            L_eff = float(target_leverage[t] * mult)
+            current_leverage = L_eff
+            target = raw_w_arr[t] * L_eff
+            w_q = target.copy()
+
+            eq_mid = prev_eq + carry_returns[t] * prev_eq + g_usd
+            if eq_mid <= 0.0:
+                eq_mid = 0.0
+
+            if quantize and eq_mid > 0.0:
+                for i in range(n_sym):
+                    if abs(target[i]) > 1e-12:
+                        sym = symbols[i]
+                        px = close_arr[t, i]
+                        target_val = abs(target[i]) * eq_mid
+                        q, actual = quantize_order_qty(sym, target_val, px)
+                        w_q_i = float(np.sign(target[i]) * (actual / eq_mid)) if q > 0 else 0.0
+                        if abs(w_q_i - target[i]) > 1e-12:
+                            quantization_events += 1
+                        w_q[i] = w_q_i
+                    else:
+                        w_q[i] = 0.0
+
+            sign_q = np.where(w_q > 1e-12, 1, np.where(w_q < -1e-12, -1, 0))
+            sign_cur = np.where(w_cur > 1e-12, 1, np.where(w_cur < -1e-12, -1, 0))
+            max_diff = float(np.max(np.abs(w_q - w_cur))) if n_sym > 0 else 0.0
+
+            if np.array_equal(sign_q, sign_cur) and (max_diff < min_weight_change):
+                fee = 0.0
+                skipped_rebalances += 1
+            else:
+                trade_w = np.abs(w_q - w_cur)
+                fee = float(np.sum(trade_w) * eq_mid * one_way_cost)
+                turnover_weight += float(np.sum(trade_w))
+                w_cur = w_q.copy()
+
+        fees_usd[t] = fee
+        n_usd = g_usd - fee
+        net_usd[t] = n_usd
+
+        eq_t = prev_eq + carry_returns[t] * prev_eq + n_usd
+        equity[t] = eq_t
+        if eq_t > peak:
+            peak = eq_t
+
+        returns[t] = (eq_t / prev_eq - 1.0) if prev_eq > 0.0 else 0.0
+        leverage[t] = current_leverage
+        weights[t] = w_cur.copy()
+
+        if t == 1 and bars > 1:
+            fees_usd[1] += pending_initial_fee
+            net_usd[1] -= pending_initial_fee
+            equity[1] -= pending_initial_fee
+            returns[1] = (equity[1] / equity[0] - 1.0) if equity[0] > 0.0 else 0.0
+            peak = max(equity[0], equity[1])
+
+    return {
+        "equity": equity,
+        "returns": returns,
+        "gross_usd": gross_usd,
+        "fees_usd": fees_usd,
+        "net_usd": net_usd,
+        "weights": weights,
+        "leverage": leverage,
+        "quantization_events": quantization_events,
+        "skipped_rebalances": skipped_rebalances,
+        "turnover_weight": turnover_weight,
+    }
+
+
 def run_barbell_portfolio(
     multi_aligned_data: dict[str, pd.DataFrame],
     config: BarbellConfig,
@@ -203,12 +427,13 @@ def run_barbell_portfolio(
         Dict chứa đầy đủ:
         - equity_curve: pd.Series đường cong vốn 1h (khởi đầu = initial_capital).
         - returns: pd.Series tỷ suất lợi nhuận 1h Barbell.
-        - carry_result: Dict gốc từ run_cross_exchange_carry.
+        - carry_result: Dict gốc từ run_cross_exchange_carry hoặc run_binance_tier1_plus_carry.
         - overlay_result: Dict gốc từ run_cross_sectional_portfolio.
         - overlay_weights: pd.DataFrame trọng số overlay đã scale theo leverage_series.
         - attribution_series: pd.DataFrame phân rã PnL 1h.
         - funding_pnl, basis_pnl, overlay_pnl, fees, turnover: Các giá trị tổng hợp lũy kế.
         - metrics: Dict các chỉ số hiệu suất chuẩn Sprint 9 và Sprint 10.
+        - carry_variant, gating_mode: Tên cấu hình sleeve và chế độ gating.
         - go_no_go_inputs: Dict chứa annualized_return_pct, sharpe, maxdd_pct, net_pnl, final_equity.
         - overlay_active_ratio: Tỷ lệ nến overlay tham gia thị trường.
         - overlay_leverage_series: Chuỗi đòn bẩy overlay theo giờ.
@@ -265,6 +490,26 @@ def run_barbell_portfolio(
         )
     if config.overlay_min_snr_dispersion < 0.0 or config.overlay_exit_snr_dispersion < 0.0:
         raise ValueError("Ngưỡng SNR dispersion phải >= 0")
+    if config.carry_variant not in {"tier1a", "tier1b", "legacy"}:
+        raise ValueError(
+            f"carry_variant phải thuộc {{'tier1a', 'tier1b', 'legacy'}}, nhận: {config.carry_variant}"
+        )
+    if config.gating_mode not in {"hard_binary", "smooth_conviction"}:
+        raise ValueError(
+            f"gating_mode phải thuộc {{'hard_binary', 'smooth_conviction'}}, nhận: {config.gating_mode}"
+        )
+    if config.carry_tilt_weight < 0.0:
+        raise ValueError(
+            f"carry_tilt_weight phải >= 0, nhận: {config.carry_tilt_weight}"
+        )
+    if not (0.0 < config.smooth_leverage_min <= config.smooth_leverage_max <= 1.0):
+        raise ValueError(
+            f"smooth_leverage_min và smooth_leverage_max không hợp lệ (yêu cầu 0 < min <= max <= 1.0), nhận: min={config.smooth_leverage_min}, max={config.smooth_leverage_max}"
+        )
+    if config.min_weight_change_to_trade < 0.0:
+        raise ValueError(
+            f"min_weight_change_to_trade phải >= 0, nhận: {config.min_weight_change_to_trade}"
+        )
 
     # 2. Xử lý trường hợp dữ liệu rỗng
     if not multi_aligned_data:
@@ -308,6 +553,14 @@ def run_barbell_portfolio(
             "overlay_mean_leverage": 0.0,
             "snr_dispersion_mean": 0.0,
             "drawdown_cushion_events": 0,
+            "overlay_gross_pnl": 0.0,
+            "overlay_net_pnl": 0.0,
+            "overlay_fees": 0.0,
+            "overlay_quantization_events": 0,
+            "overlay_skipped_rebalances": 0,
+            "carry_variant": config.carry_variant,
+            "gating_mode": config.gating_mode,
+            "carry_fallback": False,
         }
         return {
             "equity_curve": empty_eq,
@@ -319,9 +572,16 @@ def run_barbell_portfolio(
             "funding_pnl": 0.0,
             "basis_pnl": 0.0,
             "overlay_pnl": 0.0,
+            "overlay_fees": 0.0,
+            "overlay_turnover_scaled": 0.0,
+            "overlay_quantization_events": 0,
+            "overlay_skipped_rebalances": 0,
             "fees": 0.0,
             "turnover": 0.0,
             "metrics": empty_metrics,
+            "carry_variant": config.carry_variant,
+            "gating_mode": config.gating_mode,
+            "carry_fallback": False,
             "go_no_go_inputs": {
                 "annualized_return_pct": 0.0,
                 "sharpe": 0.0,
@@ -339,11 +599,27 @@ def run_barbell_portfolio(
     if carry_cfg.initial_capital != config.initial_capital:
         carry_cfg = replace(carry_cfg, initial_capital=config.initial_capital)
 
-    carry_result = run_cross_exchange_carry(
-        multi_aligned_data,
-        config=carry_cfg,
-        periods_per_year=periods_per_year,
-    )
+    carry_fallback = False
+    if config.carry_variant in ("tier1a", "tier1b"):
+        carry_result = run_binance_tier1_plus_carry(
+            multi_aligned_data,
+            config=carry_cfg,
+            variant=config.carry_variant,
+            periods_per_year=periods_per_year,
+        )
+        if len(carry_result["equity_curve"]) == 0:
+            carry_result = run_cross_exchange_carry(
+                multi_aligned_data,
+                config=carry_cfg,
+                periods_per_year=periods_per_year,
+            )
+            carry_fallback = True
+    else:
+        carry_result = run_cross_exchange_carry(
+            multi_aligned_data,
+            config=carry_cfg,
+            periods_per_year=periods_per_year,
+        )
 
     common_index = carry_result["equity_curve"].index
     symbols = list(multi_aligned_data.keys())
@@ -369,8 +645,8 @@ def run_barbell_portfolio(
             slippage=ov_slippage,
             initial_capital=config.initial_capital,
             top_k=config.overlay_top_k,
-            buffer_rank=config.overlay_buffer_rank,
-            carry_tilt_weight=0.0,
+            buffer_rank=max(1, config.overlay_buffer_rank),
+            carry_tilt_weight=config.carry_tilt_weight,
             vol_target_ann=None,
         )
         overlay_result = run_cross_sectional_portfolio(
@@ -443,44 +719,81 @@ def run_barbell_portfolio(
 
     for t in range(n_bars):
         if rebal_mask.iloc[t]:
-            # Đánh giá SNR Regime Gate (Hysteresis)
-            if config.enable_snr_gate:
-                d_val = raw_snr_dispersion.iloc[t]
-                if pd.notna(d_val):
-                    if not gate_state and d_val >= config.overlay_min_snr_dispersion:
-                        gate_state = True
-                    elif gate_state and d_val <= config.overlay_exit_snr_dispersion:
-                        gate_state = False
-                gate_val = 1.0 if gate_state else 0.0
-            else:
-                gate_val = 1.0
-
-            # Đánh giá Volatility Targeting
             w_row = raw_weights_aligned.iloc[t]
             pos_syms = w_row[w_row > 1e-12].index.tolist()
             neg_syms = w_row[w_row < -1e-12].index.tolist()
 
-            if len(pos_syms) == 0 or len(neg_syms) == 0:
-                l_val = 0.0 if config.enable_vol_targeting else config.overlay_gross_leverage
-            elif not config.enable_vol_targeting:
-                l_val = config.overlay_gross_leverage
+            if config.gating_mode == "smooth_conviction":
+                if len(pos_syms) == 0 or len(neg_syms) == 0:
+                    L_t = 0.0
+                    gate_val = 0.0
+                    l_val = L_t
+                else:
+                    d_val = raw_snr_dispersion.iloc[t]
+                    if pd.isna(d_val) or d_val < 0.25:
+                        c_t = 0.0
+                    else:
+                        c_t = float(np.clip(d_val / 1.00, 0.50, 1.00))
+
+                    w_pos = w_row[pos_syms]
+                    w_neg = w_row[neg_syms].abs()
+                    r_long = (ret_matrix[pos_syms] * (w_pos / w_pos.sum())).sum(axis=1)
+                    r_short = (ret_matrix[neg_syms] * (w_neg / w_neg.sum())).sum(axis=1)
+                    r_diff = r_long - r_short
+
+                    start_idx = max(0, t - config.overlay_vol_lookback)
+                    slice_diff = r_diff.iloc[start_idx:t]
+
+                    pair_std = float(slice_diff.std(ddof=1)) if len(slice_diff) > 1 else 0.0
+                    sigma_pair_ann = pair_std * math.sqrt(periods_per_year)
+                    if np.isnan(sigma_pair_ann) or sigma_pair_ann < 0.08:
+                        sigma_pair = 0.08
+                    else:
+                        sigma_pair = max(sigma_pair_ann, 0.08)
+
+                    L_t = c_t * float(
+                        np.clip(
+                            config.smooth_target_vol_ann / sigma_pair,
+                            config.smooth_leverage_min,
+                            config.smooth_leverage_max,
+                        )
+                    )
+                    gate_val = 1.0 if c_t > 0.0 else 0.0
+                    l_val = L_t
             else:
-                w_pos = w_row[pos_syms]
-                w_neg = w_row[neg_syms].abs()
-                r_long = (ret_matrix[pos_syms] * (w_pos / w_pos.sum())).sum(axis=1)
-                r_short = (ret_matrix[neg_syms] * (w_neg / w_neg.sum())).sum(axis=1)
-                r_diff = r_long - r_short
+                # Đánh giá SNR Regime Gate (Hysteresis)
+                if config.enable_snr_gate:
+                    d_val = raw_snr_dispersion.iloc[t]
+                    if pd.notna(d_val):
+                        if not gate_state and d_val >= config.overlay_min_snr_dispersion:
+                            gate_state = True
+                        elif gate_state and d_val <= config.overlay_exit_snr_dispersion:
+                            gate_state = False
+                    gate_val = 1.0 if gate_state else 0.0
+                else:
+                    gate_val = 1.0
 
-                start_idx = max(0, t - config.overlay_vol_lookback)
-                slice_diff = r_diff.iloc[start_idx:t]
+                if len(pos_syms) == 0 or len(neg_syms) == 0:
+                    l_val = 0.0 if config.enable_vol_targeting else config.overlay_gross_leverage
+                elif not config.enable_vol_targeting:
+                    l_val = config.overlay_gross_leverage
+                else:
+                    w_pos = w_row[pos_syms]
+                    w_neg = w_row[neg_syms].abs()
+                    r_long = (ret_matrix[pos_syms] * (w_pos / w_pos.sum())).sum(axis=1)
+                    r_short = (ret_matrix[neg_syms] * (w_neg / w_neg.sum())).sum(axis=1)
+                    r_diff = r_long - r_short
 
-                pair_std = float(slice_diff.std(ddof=1)) if len(slice_diff) > 1 else 0.0
-                sigma_pair = pair_std * math.sqrt(periods_per_year)
-                if np.isnan(sigma_pair) or sigma_pair < 0.05:
-                    sigma_pair = 0.05
+                    start_idx = max(0, t - config.overlay_vol_lookback)
+                    slice_diff = r_diff.iloc[start_idx:t]
 
-                l_raw = config.overlay_target_vol_ann / sigma_pair
-                l_val = float(np.clip(l_raw, config.overlay_leverage_min, config.overlay_leverage_max))
+                    pair_std = float(slice_diff.std(ddof=1)) if len(slice_diff) > 1 else 0.0
+                    sigma_pair = pair_std * math.sqrt(periods_per_year)
+                    if np.isnan(sigma_pair) or sigma_pair < 0.05:
+                        sigma_pair = 0.05
+
+                    l_raw = config.overlay_target_vol_ann / sigma_pair
+                    l_val = float(np.clip(l_raw, config.overlay_leverage_min, config.overlay_leverage_max))
 
             gate_arr[t] = gate_val
             l_raw_arr[t] = l_val
@@ -489,150 +802,147 @@ def run_barbell_portfolio(
             gate_arr[t] = gate_arr[t - 1]
             l_raw_arr[t] = current_l
 
-    # 7. Tính toán tuần tự Drawdown Cushion và đường cong vốn Barbell
-    dd_arr = np.ones(n_bars, dtype=np.float64)
-    leverage_arr = np.zeros(n_bars, dtype=np.float64)
-    equity_arr = np.zeros(n_bars, dtype=np.float64)
-    r_barbell_arr = np.zeros(n_bars, dtype=np.float64)
-
-    r_carry_arr = carry_result["returns"].reindex(common_index).fillna(0.0).to_numpy(dtype=np.float64)
-    r_overlay_unit_arr = overlay_returns.to_numpy(dtype=np.float64)
-
-    if n_bars > 0:
-        equity_arr[0] = config.initial_capital
-        peak = config.initial_capital
-        dd_arr[0] = 1.0
-        lev_0 = l_raw_arr[0] * gate_arr[0] * dd_arr[0]
-        leverage_arr[0] = lev_0
-        r_barbell_arr[0] = r_carry_arr[0] + r_overlay_unit_arr[0] * lev_0
-
-    for t in range(1, n_bars):
-        if config.enable_drawdown_cushion:
-            prev_eq = equity_arr[t - 1]
-            dd_t = 1.0 - (prev_eq / peak) if peak > 0.0 else 0.0
-            if dd_t > config.overlay_dd_off_threshold:
-                dd_mult = 0.0
-            elif dd_t > config.overlay_dd_cut_threshold:
-                dd_mult = 0.5
-            else:
-                dd_mult = 1.0
+    # 7. Mô phỏng động cơ Barbell Equity với lượng hóa lot-size và DD cushion
+    funding_dict: dict[str, pd.Series] = {}
+    for sym in close_matrix.columns:
+        if sym in overlay_data and "funding_rate_event" in overlay_data[sym].columns:
+            funding_dict[sym] = overlay_data[sym]["funding_rate_event"]
         else:
-            dd_mult = 1.0
+            funding_dict[sym] = pd.Series(0.0, index=common_index)
+    funding_matrix = pd.DataFrame(funding_dict, index=common_index, dtype="float64").fillna(0.0)
 
-        dd_arr[t] = dd_mult
-        lev_t = l_raw_arr[t] * gate_arr[t] * dd_mult
-        leverage_arr[t] = lev_t
+    target_leverage = l_raw_arr * gate_arr
+    r_carry_arr = carry_result["returns"].reindex(common_index).fillna(0.0).to_numpy(dtype=np.float64)
+    one_way_cost = ov_perp_fee + ov_slippage
 
-        r_b = r_carry_arr[t] + r_overlay_unit_arr[t] * lev_t
-        r_barbell_arr[t] = r_b
-        curr_eq = equity_arr[t - 1] * (1.0 + r_b)
-        equity_arr[t] = curr_eq
-        if curr_eq > peak:
-            peak = curr_eq
-
-    gate_series = pd.Series(gate_arr, index=common_index, dtype="float64")
-    l_series = pd.Series(l_raw_arr, index=common_index, dtype="float64")
-    dd_series = pd.Series(dd_arr, index=common_index, dtype="float64")
-    leverage_series = pd.Series(leverage_arr, index=common_index, dtype="float64")
-
-    # 8. Scale lợi suất và trọng số Overlay theo leverage_series thực tế
-    r_overlay_scaled = overlay_returns * leverage_series
-    overlay_weights = raw_weights_aligned.mul(leverage_series, axis=0)
-    overlay_weights.index.name = "datetime"
-
-    # Kiểm tra trạng thái đứng ngoài hoàn toàn
     is_overlay_inactive = (
         not config.enable_overlay
         or config.overlay_gross_leverage <= 0.0
-        or (leverage_series.abs().max() < 1e-12)
-        or (np.abs(overlay_weights.to_numpy()) < 1e-12).all()
-        or (r_overlay_scaled.abs().max() < 1e-12)
+        or (np.nanmax(target_leverage) < 1e-12 if len(target_leverage) > 0 else True)
+        or (np.abs(raw_weights_aligned.to_numpy()) < 1e-12).all()
     )
 
     if is_overlay_inactive:
         equity_curve = carry_result["equity_curve"].copy()
         returns = carry_result["returns"].copy()
+        overlay_weights = pd.DataFrame(
+            0.0, index=common_index, columns=close_matrix.columns, dtype="float64"
+        )
+        overlay_weights.index.name = "datetime"
+        leverage_series = pd.Series(0.0, index=common_index, dtype="float64")
+        gate_series = pd.Series(gate_arr, index=common_index, dtype="float64")
+        dd_series = pd.Series(1.0, index=common_index, dtype="float64")
+
+        gross_usd = pd.Series(0.0, index=common_index, dtype="float64")
+        fees_usd = pd.Series(0.0, index=common_index, dtype="float64")
+        net_usd = pd.Series(0.0, index=common_index, dtype="float64")
+        r_overlay_scaled = pd.Series(0.0, index=common_index, dtype="float64")
+
         overlay_pnl_val = 0.0
-        hourly_overlay_pnl = pd.Series(0.0, index=common_index, dtype="float64")
-        hourly_overlay_fees = pd.Series(0.0, index=common_index, dtype="float64")
+        overlay_gross_pnl_val = 0.0
+        overlay_net_pnl_val = 0.0
         overlay_time_in_market_pct = 0.0
+        overlay_active_ratio = 0.0
         overlay_turnover_scaled = 0.0
         overlay_rebalances = 0
+        quantization_events = 0
+        skipped_rebalances = 0
     else:
+        sim_res = _simulate_barbell_equity(
+            raw_weights=raw_weights_aligned[close_matrix.columns],
+            close_matrix=close_matrix,
+            funding_matrix=funding_matrix,
+            target_leverage=target_leverage,
+            carry_returns=r_carry_arr,
+            initial_capital=config.initial_capital,
+            rebalance_hours=config.overlay_rebalance_hours,
+            one_way_cost=one_way_cost,
+            quantize=bool(config.overlay_quantize_legs),
+            min_weight_change=config.min_weight_change_to_trade,
+            dd_cut=config.overlay_dd_cut_threshold,
+            dd_off=config.overlay_dd_off_threshold,
+            enable_dd_cushion=config.enable_drawdown_cushion,
+        )
+
         equity_curve = pd.Series(
-            equity_arr,
-            index=common_index,
-            dtype="float64",
-            name="equity",
+            sim_res["equity"], index=common_index, dtype="float64", name="equity"
         )
         returns = pd.Series(
-            r_barbell_arr,
-            index=common_index,
-            dtype="float64",
-            name="returns",
+            sim_res["returns"], index=common_index, dtype="float64", name="returns"
         )
-
-        overlay_cum_mult = np.cumprod(1.0 + r_overlay_scaled.to_numpy())
-        overlay_pnl_val = float(config.initial_capital * (overlay_cum_mult[-1] - 1.0))
-
-        overlay_dollar_curve = config.initial_capital * overlay_cum_mult
-        hourly_overlay_pnl_vals = np.diff(
-            np.insert(overlay_dollar_curve, 0, config.initial_capital)
+        overlay_weights = pd.DataFrame(
+            sim_res["weights"], index=common_index, columns=close_matrix.columns, dtype="float64"
         )
-        hourly_overlay_pnl = pd.Series(
-            hourly_overlay_pnl_vals, index=common_index, dtype="float64"
+        overlay_weights.index.name = "datetime"
+        leverage_series = pd.Series(
+            sim_res["leverage"], index=common_index, dtype="float64"
         )
+        gate_series = pd.Series(gate_arr, index=common_index, dtype="float64")
 
-        one_way_cost = ov_perp_fee + ov_slippage
-        trades_df = overlay_result.get("trades_df", pd.DataFrame())
-        hourly_overlay_fees = pd.Series(0.0, index=common_index, dtype="float64")
-        if (
-            not trades_df.empty
-            and "turnover" in trades_df.columns
-            and "time" in trades_df.columns
-        ):
-            turnover_by_time = trades_df.groupby("time")["turnover"].sum()
-            valid_times = turnover_by_time.index.intersection(common_index)
-            lev_at_trades = leverage_series.reindex(valid_times).fillna(0.0)
-            scaled_fees_by_time = (
-                turnover_by_time.loc[valid_times]
-                * lev_at_trades
-                * one_way_cost
-                * config.initial_capital
+        peak_arr = np.maximum.accumulate(sim_res["equity"])
+        dd_vals = np.where(peak_arr > 0.0, 1.0 - sim_res["equity"] / peak_arr, 0.0)
+        if config.enable_drawdown_cushion:
+            dd_mult_vals = np.where(
+                dd_vals > config.overlay_dd_off_threshold,
+                0.0,
+                np.where(dd_vals > config.overlay_dd_cut_threshold, 0.5, 1.0),
             )
-            hourly_overlay_fees.loc[valid_times] = scaled_fees_by_time.to_numpy()
-            overlay_turnover_scaled = float((turnover_by_time.loc[valid_times] * lev_at_trades).sum())
         else:
-            overlay_turnover_scaled = 0.0
+            dd_mult_vals = np.ones(n_bars, dtype=np.float64)
+        dd_series = pd.Series(dd_mult_vals, index=common_index, dtype="float64")
 
-        overlay_time_in_market_pct = float(
-            (overlay_weights.abs().sum(axis=1) > 1e-12).mean() * 100.0
+        gross_usd = pd.Series(sim_res["gross_usd"], index=common_index, dtype="float64")
+        fees_usd = pd.Series(sim_res["fees_usd"], index=common_index, dtype="float64")
+        net_usd = pd.Series(sim_res["net_usd"], index=common_index, dtype="float64")
+
+        equity_shift = equity_curve.shift(1).fillna(config.initial_capital)
+        r_overlay_scaled = np.where(equity_shift > 0.0, net_usd / equity_shift, 0.0)
+        r_overlay_scaled = pd.Series(r_overlay_scaled, index=common_index, dtype="float64")
+
+        overlay_gross_pnl_val = float(gross_usd.sum())
+        overlay_pnl_val = float(gross_usd.sum() - fees_usd.sum())
+        overlay_net_pnl_val = overlay_pnl_val
+        overlay_turnover_scaled = float(sim_res["turnover_weight"])
+        overlay_active_ratio = (
+            float((overlay_weights.abs().sum(axis=1) > 1e-12).mean())
+            if len(overlay_weights) > 0
+            else 0.0
         )
-        overlay_rebalances = int(
-            overlay_result.get("metrics", {}).get("Num Rebalances", 0)
-        )
+        overlay_time_in_market_pct = overlay_active_ratio * 100.0
+        overlay_rebalances = int((rebal_mask & (leverage_series > 1e-12)).sum())
+        quantization_events = int(sim_res["quantization_events"])
+        skipped_rebalances = int(sim_res["skipped_rebalances"])
+
+    hourly_overlay_pnl = net_usd
+    hourly_overlay_fees = fees_usd
 
     # 9. Xây dựng attribution_series phân rã 7 cột
     carry_attr = carry_result["attribution_series"]
-    carry_funding = carry_attr["funding_pnl"].reindex(common_index).fillna(0.0)
-    carry_basis = carry_attr["basis_pnl"].reindex(common_index).fillna(0.0)
-    carry_fees = carry_attr["fees"].reindex(common_index).fillna(0.0)
-    total_fees_series = carry_fees + hourly_overlay_fees
-
     if is_overlay_inactive:
-        hourly_net_pnl = carry_attr["net_pnl"].reindex(common_index).fillna(0.0)
+        carry_funding = carry_attr["funding_pnl"].reindex(common_index).fillna(0.0)
+        carry_basis = carry_attr["basis_pnl"].reindex(common_index).fillna(0.0)
+        carry_fees = carry_attr["fees"].reindex(common_index).fillna(0.0)
     else:
-        hourly_net_pnl = (
-            carry_attr["net_pnl"].reindex(common_index).fillna(0.0) + hourly_overlay_pnl
-        )
+        equity_prev = equity_curve.shift(1).fillna(config.initial_capital)
+        carry_eq_prev = carry_result["equity_curve"].shift(1).fillna(config.initial_capital)
+        scale_ratio = np.where(carry_eq_prev > 0.0, equity_prev / carry_eq_prev, 1.0)
+        carry_funding = carry_attr["funding_pnl"].reindex(common_index).fillna(0.0) * scale_ratio
+        carry_basis = carry_attr["basis_pnl"].reindex(common_index).fillna(0.0) * scale_ratio
+        carry_fees = carry_attr["fees"].reindex(common_index).fillna(0.0) * scale_ratio
+
+    total_fees_series = carry_fees + fees_usd
+    hourly_net_pnl = carry_funding + carry_basis + gross_usd - total_fees_series
+    if len(hourly_net_pnl) > 0:
+        hourly_net_pnl.iloc[0] = 0.0
 
     attribution_series = pd.DataFrame(
         {
             "funding_pnl": carry_funding,
             "basis_pnl": carry_basis,
-            "overlay_pnl": hourly_overlay_pnl + hourly_overlay_fees,
+            "overlay_gross_pnl": gross_usd,
+            "overlay_pnl": gross_usd - fees_usd,
             "carry_fees": carry_fees,
-            "overlay_fees": hourly_overlay_fees,
+            "overlay_fees": fees_usd,
             "fees": total_fees_series,
             "net_pnl": hourly_net_pnl,
         },
@@ -681,17 +991,12 @@ def run_barbell_portfolio(
     else:
         max_dd_pct = 0.0
 
-    funding_collected = float(carry_result.get("funding_pnl", 0.0))
-    total_fees_paid = float(carry_result.get("fees", 0.0) + hourly_overlay_fees.sum())
+    funding_collected = float(carry_funding.sum())
+    total_fees_paid = float(total_fees_series.sum())
     carry_turnover = float(carry_result.get("turnover", 0.0))
     total_turnover = carry_turnover + overlay_turnover_scaled
     carry_rebalances = int(carry_result.get("metrics", {}).get("Price Rebalances", 0))
 
-    overlay_active_ratio = (
-        float((overlay_weights.abs().sum(axis=1) > 1e-12).mean())
-        if len(overlay_weights) > 0
-        else 0.0
-    )
     overlay_gate_on_ratio = (
         float(gate_series.mean()) if len(gate_series) > 0 else 0.0
     )
@@ -713,6 +1018,8 @@ def run_barbell_portfolio(
         "Total Funding Collected": funding_collected,
         "Total Fees Paid": total_fees_paid,
         "Overlay PnL": float(overlay_pnl_val),
+        "Overlay Gross PnL": float(overlay_gross_pnl_val),
+        "Overlay Net PnL": float(overlay_net_pnl_val),
         "Overlay Time in Market %": float(overlay_time_in_market_pct),
         "Carry Weight": 1.0,
         "Margin Calls": 0,
@@ -732,6 +1039,16 @@ def run_barbell_portfolio(
         "overlay_mean_leverage": overlay_mean_leverage,
         "snr_dispersion_mean": snr_dispersion_mean,
         "drawdown_cushion_events": drawdown_cushion_events,
+        "quantization_events": quantization_events,
+        "skipped_rebalances": skipped_rebalances,
+        "overlay_gross_pnl": float(overlay_gross_pnl_val),
+        "overlay_net_pnl": float(overlay_net_pnl_val),
+        "overlay_fees": float(fees_usd.sum()),
+        "overlay_quantization_events": int(quantization_events),
+        "overlay_skipped_rebalances": int(skipped_rebalances),
+        "carry_variant": config.carry_variant,
+        "gating_mode": config.gating_mode,
+        "carry_fallback": carry_fallback,
     }
 
     go_no_go_inputs = {
@@ -750,11 +1067,20 @@ def run_barbell_portfolio(
         "overlay_weights": overlay_weights,
         "attribution_series": attribution_series,
         "funding_pnl": funding_collected,
-        "basis_pnl": float(carry_result.get("basis_pnl", 0.0)),
+        "basis_pnl": float(carry_basis.sum()),
         "overlay_pnl": float(overlay_pnl_val),
+        "overlay_gross_pnl": float(overlay_gross_pnl_val),
+        "overlay_net_pnl": float(overlay_net_pnl_val),
+        "overlay_fees": float(fees_usd.sum()),
+        "overlay_turnover_scaled": float(overlay_turnover_scaled),
+        "overlay_quantization_events": int(quantization_events),
+        "overlay_skipped_rebalances": int(skipped_rebalances),
         "fees": total_fees_paid,
         "turnover": float(total_turnover),
         "metrics": metrics,
+        "carry_variant": config.carry_variant,
+        "gating_mode": config.gating_mode,
+        "carry_fallback": carry_fallback,
         "go_no_go_inputs": go_no_go_inputs,
         "overlay_active_ratio": overlay_active_ratio,
         "overlay_leverage_series": leverage_series,
