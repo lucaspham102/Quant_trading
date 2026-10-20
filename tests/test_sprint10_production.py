@@ -616,3 +616,386 @@ def test_drawdown_cushion_scales_down_leverage_after_loss() -> None:
     # Sau cú đảo chiều, cushion phải tắt hẳn overlay (leverage = 0 tuyệt đối).
     assert float(lev.iloc[reversal_start:].min()) == pytest.approx(0.0)
     assert float(lev.iloc[:reversal_start].max()) > 0.0
+
+
+# ===========================================================================
+# Sprint 10 — Chặng 3: Execute Live (quantize + hedge 2 sàn), cancel orphan,
+# Barbell allocations và persist sleeve state
+# ===========================================================================
+from pathlib import Path  # noqa: E402
+from typing import Any, Sequence  # noqa: E402
+
+from src.carry_live_executor import CarryLiveExecutor  # noqa: E402
+from src.dynamic_carry_basis import DynamicCarryConfig  # noqa: E402
+from src.state_store import StateStore  # noqa: E402
+
+BTC = "BTC/USDT:USDT"
+BTC_SPOT = "BTC/USDT"
+
+
+class FakeExchange:
+    """Sàn giả thuần Python cho test thực thi, không gọi mạng.
+
+    Ghi lại lệnh vào ``orders`` và lệnh hủy vào ``cancelled`` để test kiểm tra
+    đúng sàn nhận lệnh. ``order_status`` điều khiển kết quả ``fetch_order``
+    (open/partial/closed/canceled/rejected). Order book mặc định bid 99.9 /
+    ask 100.1; test nào cần giá lớn hơn có thể truyền ``bids``/``asks`` riêng.
+    """
+
+    def __init__(
+        self,
+        order_status: dict[str, Any] | None = None,
+        bids: Sequence[Sequence[float]] | None = None,
+        asks: Sequence[Sequence[float]] | None = None,
+    ) -> None:
+        self.orders: list[dict[str, Any]] = []
+        self.cancelled: list[dict[str, Any]] = []
+        self.order_status: dict[str, Any] = (
+            dict(order_status)
+            if order_status is not None
+            else {"id": "leg1-1", "status": "open", "filled": 0.0}
+        )
+        self.bids = [list(level) for level in (bids or [[99.9, 10]])]
+        self.asks = [list(level) for level in (asks or [[100.1, 10]])]
+
+    def fetch_order_book(self, symbol: str, limit: int = 5) -> dict[str, Any]:
+        """Order book tĩnh: bid 99.9 / ask 100.1 theo mặc định."""
+        return {
+            "bids": [list(level) for level in self.bids],
+            "asks": [list(level) for level in self.asks],
+        }
+
+    def create_order(
+        self,
+        symbol: str,
+        type: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Ghi nhận lệnh; limit trả open ``leg1-1``, market trả closed đã khớp đủ."""
+        self.orders.append(
+            {
+                "symbol": symbol,
+                "type": type,
+                "side": side,
+                "amount": float(amount),
+                "price": None if price is None else float(price),
+                "params": dict(params) if params is not None else {},
+            }
+        )
+        if type == "limit":
+            return {"id": "leg1-1", "status": "open", "filled": 0.0}
+        return {"id": f"m{len(self.orders)}", "status": "closed", "filled": float(amount)}
+
+    def fetch_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Trả trạng thái do test điều khiển qua ``self.order_status``."""
+        return dict(self.order_status)
+
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> dict[str, Any]:
+        """Ghi nhận lệnh hủy để kiểm tra chống lệnh mồ côi."""
+        self.cancelled.append({"id": order_id, "symbol": symbol})
+        return {"id": order_id, "status": "canceled"}
+
+
+def _s10c3_executor(
+    state_path: Path,
+    exchange_map: dict[str, Any],
+    mode: str = "live",
+    overlay_config: BarbellConfig | None = None,
+) -> CarryLiveExecutor:
+    """Tạo executor offline với state file nằm trong ``tmp_path``."""
+    return CarryLiveExecutor(
+        carry_config=DynamicCarryConfig(),
+        mode=mode,  # type: ignore[arg-type]
+        capital=3000.0,
+        exchange_map=exchange_map,
+        state_store=StateStore(state_path),
+        execution_style="maker_taker_hedge",
+        overlay_config=overlay_config,
+    )
+
+
+def _s10c3_universe(periods: int = 1200) -> dict[str, pd.DataFrame]:
+    """Dựng 4 symbol Core-4 trend phân hóa mạnh kèm nhiễu xen kẽ rất nhỏ.
+
+    Drift lần lượt +0.05%, +0.01%, -0.01%, -0.05% mỗi giờ. Nhiễu xen kẽ biên
+    độ 0.02%/h chỉ để ``sigma_1h`` khác 0 (trend tuyến tính tuyệt đối sẽ khiến
+    SNR = NaN vì chia cho 0), không làm đổi hướng trend. Nhờ đó
+    ``raw_snr_dispersion`` rất lớn và SNR gate mở chắc chắn.
+    """
+    index = _overlay_index(periods)
+    steps = np.arange(periods, dtype="float64")
+    noise = 2e-4 * np.where(steps % 2 == 0, 1.0, -1.0)
+    drifts = (0.0005, 0.0001, -0.0001, -0.0005)
+    starts = (65000.0, 3000.0, 150.0, 600.0)
+
+    return {
+        sym: _overlay_frame(index, _price_path(drift + noise, start))
+        for sym, drift, start in zip(OVERLAY_SYMBOLS, drifts, starts)
+    }
+
+
+def _s10c3_last_price(df: pd.DataFrame) -> float:
+    """Giá perp cuối cùng dùng cho lượng hóa khối lượng."""
+    return float(df["perp_close"].iloc[-1])
+
+
+def _s10c3_assert_step_grid(symbol: str, qty: float) -> None:
+    """Khối lượng phải nằm đúng lưới ``step_size`` của sàn (sai số 1e-6)."""
+    step = EXCHANGE_LOT_SPECS[symbol]["step_size"]
+    units = qty / step
+    assert units == pytest.approx(round(units), abs=1e-6)
+    assert qty > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 10. Lượng hóa Chân 1 và hedge đúng khối lượng trên sàn thứ hai
+# ---------------------------------------------------------------------------
+def test_executor_quantizes_leg1_and_hedges_same_qty_on_second_venue(
+    tmp_path: Path,
+) -> None:
+    """0.0187 BTC @ 65000 làm tròn 0.018; hedge market đúng 0.018 trên bybit.
+
+    Chân 1 Post-Only nằm trên ``binance``, Chân 2 phải bắn trên ``bybit``
+    (không phải binance) với khối lượng bằng đúng phần đã khớp, không hedge
+    thừa và không bắn lệnh market trên sàn Chân 1.
+    """
+    fake1 = FakeExchange(bids=[[64999.9, 10]], asks=[[65000.1, 10]])
+    fake2 = FakeExchange()
+    executor = _s10c3_executor(
+        tmp_path / "state_hedge.json",
+        {"binance": fake1, "bybit": fake2},
+    )
+
+    leg1_res = executor.place_maker_leg1(
+        BTC,
+        "sell",
+        0.0187,
+        65000.0,
+        exchange_short="binance",
+        exchange_long="bybit",
+        spot_symbol=BTC_SPOT,
+    )
+
+    limit_orders = [o for o in fake1.orders if o["type"] == "limit"]
+    assert len(limit_orders) == 1
+    assert limit_orders[0]["amount"] == pytest.approx(0.018)
+    assert leg1_res["target_qty"] == pytest.approx(0.018)
+    assert leg1_res["leg1_status"] == "PENDING_MAKER"
+    assert fake2.orders == []
+
+    fake1.order_status = {"id": "leg1-1", "status": "closed", "filled": 0.018}
+    verify_res = executor.verify_maker_fill_and_hedge_leg2(
+        BTC,
+        exchange_short="binance",
+        exchange_long="bybit",
+        spot_symbol=BTC_SPOT,
+    )
+
+    assert verify_res["leg1_filled_qty"] == pytest.approx(0.018)
+    assert verify_res["leg2_hedged_qty"] == pytest.approx(0.018)
+    assert [o for o in fake1.orders if o["type"] == "market"] == []
+
+    bybit_markets = [o for o in fake2.orders if o["type"] == "market"]
+    assert len(bybit_markets) == 1
+    assert bybit_markets[0]["amount"] == pytest.approx(0.018)
+    assert bybit_markets[0]["side"] == "buy"
+
+
+# ---------------------------------------------------------------------------
+# 11. Chặn lệnh dưới min-notional ngay tại tầng thực thi
+# ---------------------------------------------------------------------------
+def test_executor_rejects_order_below_min_notional(tmp_path: Path) -> None:
+    """1e-7 BTC @ 65000 chỉ đáng 0.0065 USDT nên bị REJECTED, không gửi lệnh.
+
+    Executor phải trả ``error='below_min_notional'``, không tạo lệnh limit trên
+    sàn, không bắn market hedge, và giữ vị thế đang theo dõi ở trạng thái IDLE
+    thay vì để lại state rác.
+    """
+    fake1 = FakeExchange()
+    fake2 = FakeExchange()
+    executor = _s10c3_executor(
+        tmp_path / "state_reject.json",
+        {"binance": fake1, "binance_spot": fake2},
+    )
+    # Mô phỏng symbol đã được executor theo dõi từ chu kỳ trước.
+    executor.state.carry_positions[BTC] = {
+        "symbol": BTC,
+        "spot_symbol": BTC_SPOT,
+        "qty": 0.0,
+        "leg1_status": "NONE",
+        "leg1_filled_qty": 0.0,
+        "leg2_hedged_qty": 0.0,
+        "execution_state": "IDLE",
+    }
+
+    res = executor.place_maker_leg1(
+        BTC,
+        "sell",
+        1e-7,
+        65000.0,
+        exchange_short="binance",
+        exchange_long="binance_spot",
+        spot_symbol=BTC_SPOT,
+    )
+
+    assert res["leg1_status"] == "REJECTED"
+    assert res["error"] == "below_min_notional"
+    assert res["target_qty"] == pytest.approx(0.0)
+    assert fake1.orders == []
+    assert [o for o in fake2.orders if o["type"] == "market"] == []
+    assert executor.state.carry_positions[BTC]["execution_state"] == "IDLE"
+    assert executor.state.carry_positions[BTC]["leg1_status"] == "REJECTED"
+
+
+# ---------------------------------------------------------------------------
+# 12. Hủy lệnh mồ côi trên đúng sàn Chân 1 (short venue)
+# ---------------------------------------------------------------------------
+def test_executor_cancels_orphan_order_on_short_venue(tmp_path: Path) -> None:
+    """Limit chưa khớp trên bybit phải bị hủy tại bybit, không đụng binance.
+
+    Rủi ro thực chiến: bỏ quên lệnh treo sẽ tạo vị thế trần trụi khi giá quét
+    qua. Hủy phải gọi đúng sàn đã đặt Chân 1 (``bybit``), không phải sàn mặc
+    định ``binance``, và không bắn market hedge.
+    """
+    fake1 = FakeExchange()
+    fake2 = FakeExchange(
+        order_status={"id": "leg1-1", "status": "open", "filled": 0.0}
+    )
+    executor = _s10c3_executor(
+        tmp_path / "state_cancel.json",
+        {"binance": fake1, "bybit": fake2},
+    )
+
+    leg1_res = executor.place_maker_leg1(
+        BTC,
+        "sell",
+        1.0,
+        100.0,
+        exchange_short="bybit",
+        exchange_long="binance_spot",
+        spot_symbol=BTC_SPOT,
+    )
+    assert leg1_res["leg1_order_id"] == "leg1-1"
+    assert [o for o in fake2.orders if o["type"] == "limit"] != []
+
+    assert executor.cancel_maker_leg1(BTC, exchange_name="bybit") is True
+    assert fake2.cancelled == [{"id": "leg1-1", "symbol": BTC}]
+    assert fake1.cancelled == []
+    assert executor.state.carry_positions[BTC]["leg1_status"] == "CANCELED"
+    assert [o for o in fake1.orders if o["type"] == "market"] == []
+    assert [o for o in fake2.orders if o["type"] == "market"] == []
+
+
+# ---------------------------------------------------------------------------
+# 13. Phân bổ Barbell: lượng hóa carry và mở overlay long/short khi gate ON
+# ---------------------------------------------------------------------------
+def test_build_barbell_allocations_quantizes_and_gates_overlay(
+    tmp_path: Path,
+) -> None:
+    """Trend phân hóa mạnh mở SNR gate; carry 2 mã và overlay 1 long 1 short.
+
+    Mọi ``target_qty`` phải nằm đúng lưới step của cặp (BTC 0.001 / ETH 0.01 /
+    SOL 0.1 / BNB 0.01), notional carry >= 10 USDT, và overlay phải có đúng một
+    chân long và một chân short sau khi lượng hóa.
+    """
+    universe = _s10c3_universe(periods=1200)
+    overlay_config = BarbellConfig(
+        initial_capital=3000.0,
+        overlay_min_snr_dispersion=0.5,
+        overlay_lookback_hours=336,
+    )
+    executor = _s10c3_executor(
+        tmp_path / "state_alloc.json",
+        {"binance": FakeExchange()},
+        mode="paper",
+        overlay_config=overlay_config,
+    )
+    scores_at_t = {sym: 1.0 for sym in OVERLAY_SYMBOLS}
+
+    alloc = executor.build_barbell_allocations(universe, scores_at_t)
+
+    assert alloc["overlay_active"] is True
+    assert alloc["raw_snr_dispersion"] >= 0.5
+
+    carry_allocs = alloc["carry_sleeve"]["allocations"]
+    assert len(carry_allocs) == 2
+    for item in carry_allocs:
+        _s10c3_assert_step_grid(item["symbol"], item["target_qty"])
+        assert item["notional"] >= 10.0
+        price = _s10c3_last_price(universe[item["symbol"]])
+        assert item["notional"] == pytest.approx(item["target_qty"] * price)
+
+    overlay_allocs = alloc["momentum_overlay"]["allocations"]
+    assert len(overlay_allocs) == 2
+    sides = [str(item["side"]) for item in overlay_allocs]
+    assert sum("long" in side for side in sides) == 1
+    assert sum("short" in side for side in sides) == 1
+    for item in overlay_allocs:
+        _s10c3_assert_step_grid(item["symbol"], item["target_qty"])
+        price = _s10c3_last_price(universe[item["symbol"]])
+        assert item["notional"] == pytest.approx(item["target_qty"] * price)
+
+
+# ---------------------------------------------------------------------------
+# 14. Persist carry_sleeve / momentum_overlay sống sót qua vòng save -> load
+# ---------------------------------------------------------------------------
+def test_persist_sleeve_state_roundtrip(tmp_path: Path) -> None:
+    """Persist gắn timestamp, load lại giữ overlay_active và không xóa carry_positions."""
+    state_path = tmp_path / "state.json"
+    executor = _s10c3_executor(state_path, {}, mode="paper")
+    executor.state.carry_positions[BTC] = {
+        "symbol": BTC,
+        "spot_symbol": BTC_SPOT,
+        "qty": 0.5,
+        "leg1_status": "FILLED",
+        "leg1_filled_qty": 0.5,
+        "leg2_hedged_qty": 0.5,
+        "execution_state": "HEDGED",
+    }
+
+    timestamp = "2026-10-19T00:00:00+00:00"
+    allocations = {
+        "carry_sleeve": {
+            "allocations": [
+                {
+                    "symbol": BTC,
+                    "side": "short_perp",
+                    "target_qty": 0.01,
+                    "notional": 650.0,
+                }
+            ],
+            "total_notional": 650.0,
+        },
+        "momentum_overlay": {
+            "allocations": [
+                {
+                    "symbol": "ETH/USDT:USDT",
+                    "side": "long_perp",
+                    "target_qty": 0.1,
+                    "notional": 300.0,
+                }
+            ],
+            "total_notional": 300.0,
+        },
+        "raw_snr_dispersion": 2.0,
+        "overlay_active": True,
+    }
+
+    executor.persist_sleeve_state(allocations, timestamp)
+    executor.state_store.save(executor.state)
+
+    loaded = StateStore(state_path).load(default_equity=3000.0)
+
+    assert loaded.carry_sleeve["timestamp"] == timestamp
+    assert loaded.carry_sleeve["raw_snr_dispersion"] == pytest.approx(2.0)
+    assert len(loaded.carry_sleeve["allocations"]) == 1
+    assert loaded.momentum_overlay["timestamp"] == timestamp
+    assert loaded.momentum_overlay["overlay_active"] is True
+    assert len(loaded.momentum_overlay["allocations"]) == 1
+
+    # carry_positions cũ không bị ghi đè bởi persist sleeve state.
+    assert loaded.carry_positions[BTC]["execution_state"] == "HEDGED"
+    assert loaded.carry_positions[BTC]["qty"] == pytest.approx(0.5)

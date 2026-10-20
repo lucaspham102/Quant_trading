@@ -1,6 +1,6 @@
 """Bộ điều phối thực thi Paper/Live cho chiến lược Dynamic Carry và Hội tụ Basis Spot-Perp.
 
-Sprint 8 - Chặng 4 & Sprint 9 - Chặng 3:
+Sprint 8 - Chặng 4 & Sprint 9 - Chặng 3 & Sprint 10 - Chặng 3:
 Module cung cấp:
 - ReconcileAction: Dataclass biểu diễn kế hoạch điều chỉnh từng tài sản trong danh mục.
 - CarryLiveExecutor: Lớp điều phối kiểm tra nến đóng 1h, đối soát vị thế Delta-Neutral,
@@ -21,7 +21,15 @@ from typing import Any, Literal, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from src.barbell_portfolio import BarbellConfig, compute_snr_dispersion
 from src.config import UNIVERSE_12_SYMBOLS, TradingConfig
+from src.cross_exchange_carry import (
+    DEFAULT_MIN_NOTIONAL,
+    EXCHANGE_LOT_SPECS,
+    LOT_STEP_SIZES,
+    CrossExchangeCarryConfig,
+    quantize_order_qty,
+)
 from src.data_loader import DataLoader, drop_incomplete_last_candle, raw_ohlcv_to_dataframe
 from src.dynamic_carry_basis import (
     DynamicCarryConfig,
@@ -89,6 +97,10 @@ class CarryLiveExecutor:
         capital: Optional[float] = None,
         exchange_map: Optional[dict[str, Any]] = None,
         paper_leg1_fill_ratio: float = 1.0,
+        *,
+        venues: Optional[dict[str, Any]] = None,
+        overlay_config: Optional[BarbellConfig] = None,
+        enable_lot_quantization: bool = True,
     ) -> None:
         if mode not in ("paper", "live"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper' hoac 'live'.")
@@ -108,6 +120,8 @@ class CarryLiveExecutor:
         self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
         self.maker_no_fill_count: int = 0
         self._leg_states: dict[str, dict[str, Any]] = {}
+        self.overlay_config: Optional[BarbellConfig] = overlay_config
+        self.enable_lot_quantization: bool = bool(enable_lot_quantization)
 
         self.perp_exchange = perp_exchange
         self.spot_exchange = spot_exchange
@@ -118,6 +132,12 @@ class CarryLiveExecutor:
                 "binance": perp_exchange,
                 "binance_spot": spot_exchange,
             }
+
+        if venues is not None:
+            for k, v in venues.items():
+                if k not in self.exchange_map or self.exchange_map[k] is None:
+                    self.exchange_map[k] = v
+
         if self.perp_exchange is None and "binance" in self.exchange_map:
             self.perp_exchange = self.exchange_map["binance"]
         if self.spot_exchange is None and "binance_spot" in self.exchange_map:
@@ -174,6 +194,14 @@ class CarryLiveExecutor:
             pos["leg2_hedged_qty"] = float(leg2_hedged_qty)
             pos["execution_state"] = execution_state
 
+    def quantize_leg(self, symbol: str, notional_usd: float, price: float) -> tuple[float, float]:
+        """Lượng hóa khối lượng theo lot-size và min-notional của sàn tương ứng."""
+        if not self.enable_lot_quantization:
+            if price > 0.0 and notional_usd > 0.0:
+                return (float(notional_usd / price), float(notional_usd))
+            return (0.0, 0.0)
+        return quantize_order_qty(symbol, notional_usd, price)
+
     def place_maker_leg1(
         self,
         symbol: str,
@@ -227,6 +255,47 @@ class CarryLiveExecutor:
                 else float(ref_price * (1.0 + 0.00005))
             )
 
+        notional_target = float(target_qty) * float(limit_price)
+        q_qty, actual_notional = self.quantize_leg(symbol, notional_target, limit_price)
+
+        if q_qty <= 0.0:
+            err_msg = "below_min_notional"
+            leg1_order_id = None
+            leg1_status = "REJECTED"
+            execution_state = "IDLE"
+            leg1_filled_qty = 0.0
+            self._update_leg_state(symbol, leg1_status, leg1_filled_qty, 0.0, execution_state)
+            leg_state = {
+                "symbol": symbol,
+                "spot_symbol": resolved_spot_symbol,
+                "leg1_order_id": leg1_order_id,
+                "leg1_status": leg1_status,
+                "leg1_filled_qty": leg1_filled_qty,
+                "leg2_hedged_qty": 0.0,
+                "limit_price": limit_price,
+                "target_qty": 0.0,
+                "quantized_notional": 0.0,
+                "side": side,
+                "exchange_short": exchange_short,
+                "exchange_long": exchange_long,
+                "capital": self.capital,
+                "execution_state": execution_state,
+            }
+            self._leg_states[symbol] = leg_state
+            if symbol in self.state.carry_positions:
+                self.state.carry_positions[symbol].update(leg_state)
+            return {
+                "symbol": symbol,
+                "leg1_order_id": leg1_order_id,
+                "leg1_status": leg1_status,
+                "leg1_filled_qty": leg1_filled_qty,
+                "limit_price": limit_price,
+                "target_qty": 0.0,
+                "execution_state": execution_state,
+                "error": err_msg,
+            }
+
+        target_qty = q_qty
         err_msg: Optional[str] = None
         if self.mode == "live":
             if leg1_ex is None or not hasattr(leg1_ex, "create_order") or not callable(leg1_ex.create_order):
@@ -290,6 +359,7 @@ class CarryLiveExecutor:
             "leg2_hedged_qty": 0.0,
             "limit_price": limit_price,
             "target_qty": float(target_qty),
+            "quantized_notional": float(actual_notional),
             "side": side,
             "exchange_short": exchange_short,
             "exchange_long": exchange_long,
@@ -380,7 +450,20 @@ class CarryLiveExecutor:
                 else:
                     leg1_status = "PARTIAL_FILLED" if filled_val > 1e-12 else "PENDING_MAKER"
 
+        step = LOT_STEP_SIZES.get(symbol)
+        if step is None:
+            if f"{symbol}:USDT" in LOT_STEP_SIZES:
+                step = LOT_STEP_SIZES[f"{symbol}:USDT"]
+            elif symbol.endswith(":USDT") and symbol[:-5] in LOT_STEP_SIZES:
+                step = LOT_STEP_SIZES[symbol[:-5]]
+            else:
+                step = LOT_STEP_SIZES.get(symbol.split(":")[0], 0.001)
+        if step is None or step <= 0:
+            step = 0.001
+
+        leg1_filled_qty = round(math.floor((leg1_filled_qty + 1e-12) / step) * step, 6)
         delta_hedge_qty = max(0.0, leg1_filled_qty - leg2_hedged_qty)
+        delta_hedge_qty = round(math.floor((delta_hedge_qty + 1e-12) / step) * step, 6)
 
         # Chi khi THUC SU chua khop duoc gi moi bo qua Chân 2.
         # Neu status la REJECTED/CANCELED nhung da co partial fill thi VAN PHAI hedge
@@ -483,6 +566,169 @@ class CarryLiveExecutor:
             self.state.carry_positions[symbol]["leg1_status"] = "CANCELED"
             self.state.carry_positions[symbol]["execution_state"] = "IDLE"
         return cancelled
+
+    def build_barbell_allocations(
+        self,
+        aligned_universe: dict[str, pd.DataFrame],
+        scores_at_t: Optional[dict[str, float]] = None,
+    ) -> dict[str, Any]:
+        """Xây dựng phân bổ danh mục Barbell gồm 2 nhánh: carry_sleeve và tactical momentum_overlay."""
+        if scores_at_t is None:
+            scores_dict = build_carry_basis_scores(aligned_universe, self.carry_config)
+            scores_at_t = {}
+            for sym in self.symbols:
+                sdf = scores_dict.get(sym)
+                if sdf is not None and not sdf.empty:
+                    sc = sdf["score"].iloc[-1]
+                    scores_at_t[sym] = float(sc) if pd.notna(sc) and np.isfinite(sc) else 0.0
+                else:
+                    scores_at_t[sym] = 0.0
+
+        # 1. Nhánh carry_sleeve: lấy top-k theo scores_at_t
+        top_k = max(1, int(getattr(self.carry_config, "top_k", 2)))
+        carry_allocations: list[dict[str, Any]] = []
+
+        valid_syms = [s for s in scores_at_t.keys() if s in aligned_universe and aligned_universe[s] is not None and not aligned_universe[s].empty]
+        sorted_syms = sorted(
+            valid_syms,
+            key=lambda s: (scores_at_t[s] if np.isfinite(scores_at_t[s]) else -1e9),
+            reverse=True,
+        )
+        top_syms = sorted_syms[:top_k]
+        target_notional_carry = float(self.capital / float(top_k))
+
+        for sym in top_syms:
+            df = aligned_universe.get(sym)
+            if df is not None and not df.empty:
+                p = float(df["perp_close"].iloc[-1] if "perp_close" in df.columns else df["close"].iloc[-1])
+            else:
+                p = 0.0
+            q_qty, actual_notional = self.quantize_leg(sym, target_notional_carry, p)
+            if q_qty <= 0.0:
+                continue
+            carry_allocations.append({
+                "symbol": sym,
+                "side": "short_perp",
+                "venue": "binance",
+                "target_qty": float(q_qty),
+                "notional": float(actual_notional),
+                "min_notional_ok": True,
+            })
+
+        # 2. Nhánh momentum_overlay
+        overlay_allocations: list[dict[str, Any]] = []
+        overlay_active = False
+        raw_snr_dispersion = 0.0
+
+        if self.overlay_config is not None:
+            lookback = int(getattr(self.overlay_config, "overlay_lookback_hours", 336))
+            close_dict = {}
+            for sym, df in aligned_universe.items():
+                if df is not None and not df.empty:
+                    if "perp_close" in df.columns:
+                        close_dict[sym] = df["perp_close"]
+                    elif "close" in df.columns:
+                        close_dict[sym] = df["close"]
+            close_matrix = pd.DataFrame(close_dict)
+
+            if not close_matrix.empty and len(close_matrix) > 1:
+                snr_df = compute_snr_dispersion(close_matrix, lookback=lookback)
+                if not snr_df.empty and "raw_snr_dispersion" in snr_df.columns:
+                    val = snr_df["raw_snr_dispersion"].iloc[-1]
+                    raw_snr_dispersion = float(val) if pd.notna(val) and np.isfinite(val) else 0.0
+                else:
+                    raw_snr_dispersion = 0.0
+            else:
+                snr_df = pd.DataFrame()
+                raw_snr_dispersion = 0.0
+
+            min_disp = float(getattr(self.overlay_config, "overlay_min_snr_dispersion", 1.35))
+            if raw_snr_dispersion >= min_disp and not snr_df.empty:
+                overlay_active = True
+                snr_series = snr_df.iloc[-1].drop(labels=["raw_snr_dispersion"], errors="ignore").dropna()
+                if len(snr_series) >= 2:
+                    long_sym = str(snr_series.idxmax())
+                    short_sym = str(snr_series.idxmin())
+
+                    vol_ann = float(getattr(self.overlay_config, "overlay_target_vol_ann", 0.065))
+                    scale = min(vol_ann / 0.065, 1.0)
+                    target_notional_overlay = float(self.capital * scale * 0.40)
+
+                    long_df = aligned_universe.get(long_sym)
+                    if long_df is not None and not long_df.empty:
+                        long_price = float(long_df["perp_close"].iloc[-1] if "perp_close" in long_df.columns else long_df["close"].iloc[-1])
+                    else:
+                        long_price = 0.0
+                    q_long, notional_long = self.quantize_leg(long_sym, target_notional_overlay, long_price)
+                    if q_long > 0.0:
+                        overlay_allocations.append({
+                            "symbol": long_sym,
+                            "side": "long_perp",
+                            "venue": "binance",
+                            "target_qty": float(q_long),
+                            "notional": float(notional_long),
+                            "min_notional_ok": True,
+                        })
+
+                    short_df = aligned_universe.get(short_sym)
+                    if short_df is not None and not short_df.empty:
+                        short_price = float(short_df["perp_close"].iloc[-1] if "perp_close" in short_df.columns else short_df["close"].iloc[-1])
+                    else:
+                        short_price = 0.0
+                    q_short, notional_short = self.quantize_leg(short_sym, target_notional_overlay, short_price)
+                    if q_short > 0.0:
+                        overlay_allocations.append({
+                            "symbol": short_sym,
+                            "side": "short_perp",
+                            "venue": "binance",
+                            "target_qty": float(q_short),
+                            "notional": float(notional_short),
+                            "min_notional_ok": True,
+                        })
+
+        total_carry_notional = sum(float(a.get("notional", 0.0)) for a in carry_allocations)
+        total_overlay_notional = sum(float(a.get("notional", 0.0)) for a in overlay_allocations)
+
+        carry_sleeve_data = {
+            "allocations": carry_allocations,
+            "total_notional": float(total_carry_notional),
+            "overlay_active": bool(overlay_active),
+            "raw_snr_dispersion": float(raw_snr_dispersion),
+        }
+        momentum_overlay_data = {
+            "allocations": overlay_allocations,
+            "total_notional": float(total_overlay_notional),
+            "overlay_active": bool(overlay_active),
+            "raw_snr_dispersion": float(raw_snr_dispersion),
+        }
+
+        return {
+            "carry_sleeve": carry_sleeve_data,
+            "momentum_overlay": momentum_overlay_data,
+            "raw_snr_dispersion": float(raw_snr_dispersion),
+            "overlay_active": bool(overlay_active),
+        }
+
+    def persist_sleeve_state(self, allocations: dict[str, Any], timestamp: str) -> None:
+        """Lưu trạng thái phân bổ của 2 nhánh carry_sleeve và momentum_overlay vào bot state."""
+        raw_disp = float(allocations.get("raw_snr_dispersion", 0.0))
+        act = bool(allocations.get("overlay_active", False))
+
+        cs = dict(allocations.get("carry_sleeve", {}))
+        cs["timestamp"] = timestamp
+        cs.setdefault("allocations", [])
+        cs["total_notional"] = float(cs.get("total_notional", sum(float(a.get("notional", 0.0)) for a in cs["allocations"])))
+        cs["overlay_active"] = act
+        cs["raw_snr_dispersion"] = raw_disp
+        self.state.carry_sleeve = cs
+
+        mo = dict(allocations.get("momentum_overlay", {}))
+        mo["timestamp"] = timestamp
+        mo.setdefault("allocations", [])
+        mo["total_notional"] = float(mo.get("total_notional", sum(float(a.get("notional", 0.0)) for a in mo["allocations"])))
+        mo["overlay_active"] = act
+        mo["raw_snr_dispersion"] = raw_disp
+        self.state.momentum_overlay = mo
 
     def _load_symbol_from_cache(self, symbol: str) -> pd.DataFrame:
         """Đọc và ghép dữ liệu Spot, Perp và Funding từ Parquet cache cục bộ."""
@@ -691,6 +937,7 @@ class CarryLiveExecutor:
                 "active_positions": {},
                 "margin_health_summary": "Empty universe",
                 "table_ascii": "",
+                "sleeves": {},
             }
 
         # Xác định mốc thời gian nến chốt mới nhất
@@ -744,6 +991,10 @@ class CarryLiveExecutor:
                     "basis_pct": 0.0,
                     "valid": False,
                 }
+
+        # Lưu trạng thái barbell sleeves
+        barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
+        self.persist_sleeve_state(barbell_allocations, timestamp_str)
 
         # 3. MTM + An toàn ký quỹ cho các vị thế đang nắm giữ
         is_new_funding_bar = (
@@ -842,9 +1093,14 @@ class CarryLiveExecutor:
 
                     if filled <= 1e-12 and self.mode == "live":
                         # Lenh ban spot Post-Only khong khop -> huy de khong treo lenh.
+                        spot_cancel_ex = (
+                            pos.get("exchange_long", "binance_spot")
+                            if "spot" in str(pos.get("exchange_long", "")).lower()
+                            else "binance_spot"
+                        )
                         self.cancel_maker_leg1(
                             sym,
-                            exchange_name="binance_spot",
+                            exchange_name=spot_cancel_ex,
                             order_symbol=spot_sym,
                             is_close=True,
                         )
@@ -1004,9 +1260,14 @@ class CarryLiveExecutor:
                         # Chan 1 khong khop: PHAI huy lenh treo truoc khi xoa state
                         # de tranh lenh mo coi (orphaned post-only order).
                         if self.mode == "live":
+                            cancel_ex = (
+                                self.state.carry_positions.get(sym, {}).get("exchange_short")
+                                or self._leg_states.get(sym, {}).get("exchange_short")
+                                or "binance"
+                            )
                             self.cancel_maker_leg1(
                                 sym,
-                                exchange_name="binance",
+                                exchange_name=cancel_ex,
                                 order_symbol=sym,
                             )
                         self.state.carry_positions.pop(sym, None)
@@ -1126,6 +1387,7 @@ class CarryLiveExecutor:
             "active_positions": dict(self.state.carry_positions),
             "margin_health_summary": summary_str,
             "table_ascii": "",
+            "sleeves": barbell_allocations,
         }
         plan["table_ascii"] = self.format_status_table(plan)
         return plan

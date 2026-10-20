@@ -154,6 +154,8 @@ class BotState:
     trade_history: list[dict[str, Any]] = field(default_factory=list)
     carry_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     carry_last_reconcile_ts: Optional[str] = None
+    carry_sleeve: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh yield sleeve
+    momentum_overlay: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh alpha momentum overlay
 
 
 class StateStore:
@@ -203,6 +205,11 @@ class StateStore:
         raw_carry_ts = raw.get("carry_last_reconcile_ts")
         carry_last_reconcile_ts = str(raw_carry_ts) if raw_carry_ts is not None else None
 
+        raw_carry_sleeve = raw.get("carry_sleeve") or {}
+        carry_sleeve: dict[str, Any] = dict(raw_carry_sleeve) if isinstance(raw_carry_sleeve, dict) else {}
+        raw_momentum_overlay = raw.get("momentum_overlay") or {}
+        momentum_overlay: dict[str, Any] = dict(raw_momentum_overlay) if isinstance(raw_momentum_overlay, dict) else {}
+
         return BotState(
             open_position=dict(open_pos) if isinstance(open_pos, dict) else None,
             daily_realized_pnl=float(raw.get("daily_realized_pnl", 0.0)),
@@ -215,6 +222,8 @@ class StateStore:
             trade_history=[trade_record_to_dict(item) for item in raw_history],
             carry_positions=carry_positions,
             carry_last_reconcile_ts=carry_last_reconcile_ts,
+            carry_sleeve=carry_sleeve,
+            momentum_overlay=momentum_overlay,
         )
 
     def sync_to_risk_manager(self, state: BotState, risk_manager: RiskManager) -> Optional[Position]:
