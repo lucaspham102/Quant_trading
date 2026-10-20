@@ -1,9 +1,10 @@
 """Bộ điều phối thực thi Paper/Live cho chiến lược Dynamic Carry và Hội tụ Basis Spot-Perp.
 
-Sprint 8 - Chặng 4:
+Sprint 8 - Chặng 4 & Sprint 9 - Chặng 3:
 Module cung cấp:
 - ReconcileAction: Dataclass biểu diễn kế hoạch điều chỉnh từng tài sản trong danh mục.
 - CarryLiveExecutor: Lớp điều phối kiểm tra nến đóng 1h, đối soát vị thế Delta-Neutral,
+  máy trạng thái Maker-then-Taker Hedge (POST_ONLY_LEG_1 -> MARKET_HEDGE_LEG_2),
   định giá MTM True Spot-Perp, kiểm tra an toàn ký quỹ và ghi nhận trạng thái nguyên tử.
 """
 from __future__ import annotations
@@ -29,7 +30,7 @@ from src.dynamic_carry_basis import (
     select_portfolio,
 )
 from src.funding_loader import align_spot_perp_funding, fetch_funding_history, fetch_spot_ohlcv
-from src.state_store import BotState, StateStore
+from src.state_store import BotState, StateStore, default_leg_state, normalize_carry_position
 
 logger = logging.getLogger("carry_live_executor")
 
@@ -84,9 +85,17 @@ class CarryLiveExecutor:
         spot_exchange: Any = None,
         raw_data_dir: Path | str = Path("data/raw"),
         lookback_hours: int = 720,
+        execution_style: Literal["maker_taker_hedge", "real_taker"] = "maker_taker_hedge",
+        capital: Optional[float] = None,
+        exchange_map: Optional[dict[str, Any]] = None,
+        paper_leg1_fill_ratio: float = 1.0,
     ) -> None:
         if mode not in ("paper", "live"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper' hoac 'live'.")
+        if execution_style not in ("maker_taker_hedge", "real_taker"):
+            raise ValueError(
+                f"execution_style khong hop le: {execution_style!r}, phai la 'maker_taker_hedge' hoac 'real_taker'."
+            )
 
         self.config = config
         self.carry_config = carry_config
@@ -94,16 +103,346 @@ class CarryLiveExecutor:
         self.symbols: list[str] = list(symbols)
         self.raw_data_dir = Path(raw_data_dir)
         self.lookback_hours = int(lookback_hours)
+        self.execution_style: Literal["maker_taker_hedge", "real_taker"] = execution_style
+        self.capital: float = float(capital if capital is not None else carry_config.initial_capital)
+        self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
+        self.maker_no_fill_count: int = 0
+        self._leg_states: dict[str, dict[str, Any]] = {}
 
         self.perp_exchange = perp_exchange
         self.spot_exchange = spot_exchange
+        if exchange_map is not None:
+            self.exchange_map = dict(exchange_map)
+        else:
+            self.exchange_map = {
+                "binance": perp_exchange,
+                "binance_spot": spot_exchange,
+            }
+        if self.perp_exchange is None and "binance" in self.exchange_map:
+            self.perp_exchange = self.exchange_map["binance"]
+        if self.spot_exchange is None and "binance_spot" in self.exchange_map:
+            self.spot_exchange = self.exchange_map["binance_spot"]
 
         self.state_store: StateStore = (
             state_store if state_store is not None else StateStore(config.state_file_path)
         )
-        self.state: BotState = self.state_store.load(default_equity=carry_config.initial_capital)
+        self.state: BotState = self.state_store.load(default_equity=self.capital)
         if not isinstance(self.state.carry_positions, dict):
             self.state.carry_positions = {}
+        else:
+            self.state.carry_positions = {
+                str(k): normalize_carry_position(v, default_capital=self.capital)
+                for k, v in self.state.carry_positions.items()
+                if isinstance(v, dict)
+            }
+
+    def _get_exchange(self, name: str) -> Any:
+        """Lấy đối tượng sàn giao dịch từ exchange_map hoặc fallback."""
+        if hasattr(self, "exchange_map") and self.exchange_map and name in self.exchange_map:
+            return self.exchange_map[name]
+        if name in ("binance_spot", "spot"):
+            return self.spot_exchange
+        if name in ("binance", "binanceusdm", "perp"):
+            return self.perp_exchange
+        return None
+
+    def get_one_way_fee_rate(self) -> float:
+        """Chi phí 1 chiều tính theo execution_style."""
+        if self.execution_style == "maker_taker_hedge":
+            return 0.001125  # 11.25 bps cho Spot-Perp maker-taker (22.5 bps khứ hồi)
+        return self.carry_config.one_way_cost()
+
+    def _update_leg_state(
+        self,
+        symbol: str,
+        leg1_status: str,
+        leg1_filled_qty: float,
+        leg2_hedged_qty: float,
+        execution_state: str,
+    ) -> None:
+        """Cập nhật trạng thái Chân 1 / Chân 2 vào memory và carry_positions nếu có."""
+        info = self._leg_states.setdefault(symbol, {})
+        info["leg1_status"] = leg1_status
+        info["leg1_filled_qty"] = float(leg1_filled_qty)
+        info["leg2_hedged_qty"] = float(leg2_hedged_qty)
+        info["execution_state"] = execution_state
+
+        if symbol in self.state.carry_positions:
+            pos = self.state.carry_positions[symbol]
+            pos["leg1_status"] = leg1_status
+            pos["leg1_filled_qty"] = float(leg1_filled_qty)
+            pos["leg2_hedged_qty"] = float(leg2_hedged_qty)
+            pos["execution_state"] = execution_state
+
+    def place_maker_leg1(
+        self,
+        symbol: str,
+        side: Literal["buy", "sell"],
+        target_qty: float,
+        ref_price: float,
+        exchange_short: str = "binance",
+        exchange_long: str = "binance_spot",
+        spot_symbol: Optional[str] = None,
+        is_close: bool = False,
+    ) -> dict[str, Any]:
+        """Bước 1 (PLACE_MAKER_LEG_1): Đặt lệnh Limit Post-Only (GTX) tại best bid/ask.
+
+        Khi mở vị thế: Chân 1 đặt trên exchange_short (mặc định binance perp).
+        Khi đóng vị thế: Chân 1 đặt trên sàn spot (bán spot).
+        """
+        resolved_spot_symbol = spot_symbol or symbol.split(":")[0]
+        if is_close:
+            ex_name = exchange_short if exchange_short in ("binance_spot", "spot") else exchange_long
+            leg1_ex = self._get_exchange(ex_name) or self.spot_exchange
+            order_symbol = resolved_spot_symbol
+        else:
+            ex_name = exchange_short
+            leg1_ex = self._get_exchange(ex_name) or self.perp_exchange
+            order_symbol = symbol
+
+        best_bid: Optional[float] = None
+        best_ask: Optional[float] = None
+        if leg1_ex is not None and hasattr(leg1_ex, "fetch_order_book") and callable(leg1_ex.fetch_order_book):
+            try:
+                ob = leg1_ex.fetch_order_book(order_symbol, limit=5)
+                bids = ob.get("bids", [])
+                asks = ob.get("asks", [])
+                if bids and len(bids[0]) > 0:
+                    best_bid = float(bids[0][0])
+                if asks and len(asks[0]) > 0:
+                    best_ask = float(asks[0][0])
+            except Exception as e:
+                logger.warning("fetch_order_book failed for %s on %s: %s", order_symbol, ex_name, e)
+
+        if side == "buy":
+            limit_price = (
+                best_bid
+                if best_bid is not None and best_bid > 0
+                else float(ref_price * (1.0 - 0.00005))
+            )
+        else:
+            limit_price = (
+                best_ask
+                if best_ask is not None and best_ask > 0
+                else float(ref_price * (1.0 + 0.00005))
+            )
+
+        err_msg: Optional[str] = None
+        if self.mode == "live":
+            if leg1_ex is None or not hasattr(leg1_ex, "create_order") or not callable(leg1_ex.create_order):
+                err_msg = f"Exchange {ex_name} does not support create_order"
+                leg1_order_id = None
+                leg1_status = "REJECTED"
+                execution_state = "IDLE"
+                leg1_filled_qty = 0.0
+            else:
+                try:
+                    order = leg1_ex.create_order(
+                        order_symbol,
+                        "limit",
+                        side,
+                        target_qty,
+                        limit_price,
+                        params={"postOnly": True, "timeInForce": "GTX"},
+                    )
+                    leg1_order_id = (
+                        str(order.get("id"))
+                        if isinstance(order, dict) and "id" in order
+                        else f"live_{int(time.time()*1000)}"
+                    )
+                    leg1_status = "PENDING_MAKER"
+                    execution_state = "POST_ONLY_LEG_1"
+                    leg1_filled_qty = (
+                        float(order.get("filled", 0.0) or 0.0)
+                        if isinstance(order, dict)
+                        else 0.0
+                    )
+                    if isinstance(order, dict) and order.get("status") in ("closed", "filled"):
+                        leg1_status = "FILLED"
+                        leg1_filled_qty = float(order.get("filled", target_qty))
+                except Exception as e:
+                    logger.warning("create_order limit post-only rejected for %s: %s", order_symbol, e)
+                    leg1_order_id = None
+                    leg1_status = "REJECTED"
+                    execution_state = "IDLE"
+                    leg1_filled_qty = 0.0
+                    err_msg = str(e)
+        else:
+            leg1_order_id = f"paper_leg1_{symbol}_{int(time.time()*1000)}"
+            ratio = max(0.0, min(1.0, float(self.paper_leg1_fill_ratio)))
+            leg1_filled_qty = float(target_qty * ratio)
+            if ratio >= 1.0 - 1e-12:
+                leg1_status = "FILLED"
+                execution_state = "POST_ONLY_LEG_1"
+            elif ratio > 1e-12:
+                leg1_status = "PARTIAL_FILLED"
+                execution_state = "POST_ONLY_LEG_1"
+            else:
+                leg1_status = "CANCELED"
+                execution_state = "IDLE"
+
+        leg_state = {
+            "symbol": symbol,
+            "spot_symbol": resolved_spot_symbol,
+            "leg1_order_id": leg1_order_id,
+            "leg1_status": leg1_status,
+            "leg1_filled_qty": leg1_filled_qty,
+            "leg2_hedged_qty": 0.0,
+            "limit_price": limit_price,
+            "target_qty": float(target_qty),
+            "side": side,
+            "exchange_short": exchange_short,
+            "exchange_long": exchange_long,
+            "capital": self.capital,
+            "execution_state": execution_state,
+        }
+        self._leg_states[symbol] = leg_state
+
+        if symbol in self.state.carry_positions:
+            self.state.carry_positions[symbol].update(leg_state)
+        else:
+            self.state.carry_positions[symbol] = {
+                "symbol": symbol,
+                "spot_symbol": resolved_spot_symbol,
+                "qty": float(target_qty),
+                "capital": self.capital,
+                "exchange_long": exchange_long,
+                "exchange_short": exchange_short,
+                **leg_state,
+            }
+
+        result: dict[str, Any] = {
+            "symbol": symbol,
+            "leg1_order_id": leg1_order_id,
+            "leg1_status": leg1_status,
+            "leg1_filled_qty": leg1_filled_qty,
+            "limit_price": limit_price,
+            "target_qty": float(target_qty),
+        }
+        if err_msg is not None:
+            result["error"] = err_msg
+        return result
+
+    def verify_maker_fill_and_hedge_leg2(
+        self,
+        symbol: str,
+        exchange_short: str = "binance",
+        exchange_long: str = "binance_spot",
+        spot_symbol: Optional[str] = None,
+        is_close: bool = False,
+    ) -> dict[str, Any]:
+        """Bước 2 (VERIFY_MAKER_FILL_AND_HEDGE_LEG_2):
+        Kiểm tra filled_qty của Chân 1; chỉ bắn Market Taker đối ứng đúng filled_qty.
+        Chân 1 chưa khớp -> không bắn Chân 2. Partial fill -> hedge đúng phần đã khớp.
+        """
+        leg_info = self.state.carry_positions.get(symbol) or self._leg_states.get(symbol, {})
+        leg1_order_id = leg_info.get("leg1_order_id")
+        leg1_status = leg_info.get("leg1_status", "NONE")
+        leg1_filled_qty = float(leg_info.get("leg1_filled_qty", 0.0))
+        leg2_hedged_qty = float(leg_info.get("leg2_hedged_qty", 0.0))
+        leg1_side = leg_info.get("side", "sell")
+        resolved_spot_symbol = spot_symbol or leg_info.get("spot_symbol") or symbol.split(":")[0]
+
+        if self.mode == "live" and leg1_order_id:
+            ex_leg1_name = exchange_short if not is_close else (
+                exchange_short if exchange_short in ("binance_spot", "spot") else exchange_long
+            )
+            ex_leg1 = self._get_exchange(ex_leg1_name)
+            order_data: Optional[dict[str, Any]] = None
+            order_sym = resolved_spot_symbol if is_close else symbol
+
+            if ex_leg1 is not None and hasattr(ex_leg1, "fetch_order") and callable(ex_leg1.fetch_order):
+                try:
+                    order_data = ex_leg1.fetch_order(leg1_order_id, order_sym)
+                except Exception as e:
+                    logger.warning("fetch_order %s failed: %s", leg1_order_id, e)
+
+            if order_data is None and ex_leg1 is not None and hasattr(ex_leg1, "fetch_open_orders") and callable(ex_leg1.fetch_open_orders):
+                try:
+                    open_orders = ex_leg1.fetch_open_orders(order_sym)
+                    for o in open_orders:
+                        if str(o.get("id")) == str(leg1_order_id):
+                            order_data = o
+                            break
+                except Exception as e:
+                    logger.warning("fetch_open_orders failed: %s", e)
+
+            if order_data is not None and isinstance(order_data, dict):
+                raw_st = str(order_data.get("status", "")).lower()
+                filled_val = float(order_data.get("filled", 0.0) or 0.0)
+                leg1_filled_qty = filled_val
+                if raw_st in ("closed", "filled"):
+                    leg1_status = "FILLED"
+                elif raw_st in ("canceled", "cancelled", "expired"):
+                    leg1_status = "CANCELED" if filled_val <= 1e-12 else "PARTIAL_FILLED"
+                elif raw_st in ("rejected",):
+                    leg1_status = "REJECTED"
+                else:
+                    leg1_status = "PARTIAL_FILLED" if filled_val > 1e-12 else "PENDING_MAKER"
+
+        delta_hedge_qty = max(0.0, leg1_filled_qty - leg2_hedged_qty)
+
+        # Chi khi THUC SU chua khop duoc gi moi bo qua Chân 2.
+        # Neu status la REJECTED/CANCELED nhung da co partial fill thi VAN PHAI hedge
+        # dung phan da khop de khong bao gio ho rui ro gia.
+        if leg1_filled_qty <= 1e-12:
+            exec_state = "HEDGED" if (leg2_hedged_qty >= leg1_filled_qty - 1e-12 and leg1_filled_qty > 0) else "IDLE"
+            self._update_leg_state(symbol, leg1_status, leg1_filled_qty, leg2_hedged_qty, exec_state)
+            return {
+                "symbol": symbol,
+                "leg1_status": leg1_status,
+                "leg1_filled_qty": float(leg1_filled_qty),
+                "leg2_hedged_qty": float(leg2_hedged_qty),
+                "delta_hedged": 0.0,
+                "hedged": 0.0,
+                "fired_market": False,
+                "execution_state": exec_state,
+            }
+
+        fired_market = False
+        if delta_hedge_qty > 1e-12:
+            hedge_side: Literal["buy", "sell"] = "buy" if leg1_side == "sell" else "sell"
+            if is_close:
+                ex_leg2_name = exchange_long if exchange_long not in ("binance_spot", "spot") else exchange_short
+            else:
+                ex_leg2_name = exchange_long
+
+            ex_leg2 = self._get_exchange(ex_leg2_name)
+            is_spot_hedge = ex_leg2_name in ("binance_spot", "spot")
+
+            if self.mode == "live":
+                if ex_leg2 is None or not hasattr(ex_leg2, "create_order") or not callable(ex_leg2.create_order):
+                    raise RuntimeError(f"Exchange {ex_leg2_name} does not support create_order for market hedge")
+                if is_spot_hedge:
+                    ex_leg2.create_order(resolved_spot_symbol, "market", hedge_side, delta_hedge_qty)
+                else:
+                    ex_leg2.create_order(
+                        symbol,
+                        "market",
+                        hedge_side,
+                        delta_hedge_qty,
+                        params={"reduceOnly": bool(is_close)},
+                    )
+            fired_market = True
+            leg2_hedged_qty += delta_hedge_qty
+
+        if leg2_hedged_qty >= leg1_filled_qty - 1e-12:
+            exec_state = "HEDGED"
+        else:
+            exec_state = "MARKET_HEDGE_LEG_2"
+
+        self._update_leg_state(symbol, leg1_status, leg1_filled_qty, leg2_hedged_qty, exec_state)
+
+        return {
+            "symbol": symbol,
+            "leg1_status": leg1_status,
+            "leg1_filled_qty": float(leg1_filled_qty),
+            "leg2_hedged_qty": float(leg2_hedged_qty),
+            "delta_hedged": float(delta_hedge_qty),
+            "hedged": float(delta_hedge_qty),
+            "fired_market": fired_market,
+            "execution_state": exec_state,
+        }
 
     def _load_symbol_from_cache(self, symbol: str) -> pd.DataFrame:
         """Đọc và ghép dữ liệu Spot, Perp và Funding từ Parquet cache cục bộ."""
@@ -155,7 +494,6 @@ class CarryLiveExecutor:
                 idx = idx.tz_convert("UTC")
             d.index = idx.as_unit("ns")
 
-        # Áp dụng drop_incomplete_last_candle chống look-ahead
         now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
         perp_df = drop_incomplete_last_candle(perp_df, self.config.timeframe, now_ms)
         spot_df = drop_incomplete_last_candle(spot_df, self.config.timeframe, now_ms)
@@ -439,26 +777,70 @@ class CarryLiveExecutor:
                 sp_curr = float(udf["spot_close"].iloc[-1] if "spot_close" in udf.columns else udf["close"].iloc[-1])
                 pe_curr = float(udf["perp_close"].iloc[-1] if "perp_close" in udf.columns else udf["close"].iloc[-1])
                 qty = float(pos.get("qty", 0.0))
+                spot_sym = pos.get("spot_symbol", sym.split(":")[0])
 
-                if self.mode == "live":
-                    if (
-                        not self.spot_exchange
-                        or not hasattr(self.spot_exchange, "create_order")
-                        or not self.perp_exchange
-                        or not hasattr(self.perp_exchange, "create_order")
-                    ):
-                        raise RuntimeError("Live exchange does not support create_order for carry close")
-                    spot_sym = pos.get("spot_symbol", sym.split(":")[0])
-                    self.spot_exchange.create_order(spot_sym, "market", "sell", qty)
-                    self.perp_exchange.create_order(sym, "market", "buy", qty, params={"reduceOnly": True})
+                if self.execution_style == "maker_taker_hedge":
+                    leg1_res = self.place_maker_leg1(
+                        sym,
+                        "sell",
+                        qty,
+                        sp_curr,
+                        exchange_short="binance_spot",
+                        exchange_long="binance",
+                        spot_symbol=spot_sym,
+                        is_close=True,
+                    )
+                    leg2_res = self.verify_maker_fill_and_hedge_leg2(
+                        sym,
+                        exchange_short="binance_spot",
+                        exchange_long="binance",
+                        spot_symbol=spot_sym,
+                        is_close=True,
+                    )
+                    hedged = float(leg2_res.get("leg2_hedged_qty", 0.0))
+                    filled = float(leg2_res.get("leg1_filled_qty", 0.0))
 
-                entry_spot = float(pos.get("entry_spot_price", sp_curr))
-                entry_perp = float(pos.get("entry_perp_price", pe_curr))
-                mtm_pnl = qty * (sp_curr - entry_spot) - qty * (pe_curr - entry_perp)
-                close_fee = (qty * sp_curr) * self.carry_config.one_way_cost()
-                funding_collected = float(pos.get("funding_collected_usdt", 0.0))
-                self.state.current_equity += mtm_pnl + funding_collected - close_fee
-                del self.state.carry_positions[sym]
+                    if hedged > 1e-12:
+                        entry_spot = float(pos.get("entry_spot_price", sp_curr))
+                        entry_perp = float(pos.get("entry_perp_price", pe_curr))
+                        mtm_pnl = hedged * (sp_curr - entry_spot) - hedged * (pe_curr - entry_perp)
+                        close_fee = (hedged * sp_curr) * self.get_one_way_fee_rate()
+                        close_ratio = hedged / qty if qty > 0 else 1.0
+                        funding_collected = float(pos.get("funding_collected_usdt", 0.0)) * close_ratio
+                        pos["funding_collected_usdt"] = float(pos.get("funding_collected_usdt", 0.0)) - funding_collected
+                        self.state.current_equity += mtm_pnl + funding_collected - close_fee
+
+                    if hedged >= qty - 1e-12:
+                        del self.state.carry_positions[sym]
+                    else:
+                        rem_qty = max(0.0, qty - hedged)
+                        pos["qty"] = float(rem_qty)
+                        pos["notional_usdt"] = float(rem_qty * sp_curr)
+                        pos["leg1_status"] = leg2_res.get("leg1_status", "PARTIAL_FILLED")
+                        pos["leg1_filled_qty"] = float(filled)
+                        pos["leg2_hedged_qty"] = float(hedged)
+                        pos["execution_state"] = leg2_res.get("execution_state", "MARKET_HEDGE_LEG_2")
+                        if filled <= 1e-12:
+                            self.maker_no_fill_count += 1
+                else:
+                    if self.mode == "live":
+                        if (
+                            not self.spot_exchange
+                            or not hasattr(self.spot_exchange, "create_order")
+                            or not self.perp_exchange
+                            or not hasattr(self.perp_exchange, "create_order")
+                        ):
+                            raise RuntimeError("Live exchange does not support create_order for carry close")
+                        self.spot_exchange.create_order(spot_sym, "market", "sell", qty)
+                        self.perp_exchange.create_order(sym, "market", "buy", qty, params={"reduceOnly": True})
+
+                    entry_spot = float(pos.get("entry_spot_price", sp_curr))
+                    entry_perp = float(pos.get("entry_perp_price", pe_curr))
+                    mtm_pnl = qty * (sp_curr - entry_spot) - qty * (pe_curr - entry_perp)
+                    close_fee = (qty * sp_curr) * self.carry_config.one_way_cost()
+                    funding_collected = float(pos.get("funding_collected_usdt", 0.0))
+                    self.state.current_equity += mtm_pnl + funding_collected - close_fee
+                    del self.state.carry_positions[sym]
 
         # b) Cân bằng ký quỹ REBALANCE_MARGIN
         for sym in self.symbols:
@@ -490,7 +872,7 @@ class CarryLiveExecutor:
                     delta_notional = abs(new_qty - qty) * sp_curr
                     reb_fee = (
                         self.carry_config.rebalance_fee_multiplier
-                        * self.carry_config.one_way_cost()
+                        * self.get_one_way_fee_rate()
                         * delta_notional
                     )
                     pos["qty"] = float(new_qty)
@@ -513,35 +895,102 @@ class CarryLiveExecutor:
                 target_notional = allocated_capital * self.carry_config.notional_eta()
                 spot_qty = target_notional / sp_curr if sp_curr > 0 else 0.0
                 perp_qty = spot_qty
-                fee = target_notional * self.carry_config.one_way_cost()
-                margin_alloc = (allocated_capital - target_notional) - fee
+                spot_sym = sym.split(":")[0]
 
-                if self.mode == "live":
-                    if (
-                        not self.spot_exchange
-                        or not hasattr(self.spot_exchange, "create_order")
-                        or not self.perp_exchange
-                        or not hasattr(self.perp_exchange, "create_order")
-                    ):
-                        raise RuntimeError("Live exchange does not support create_order for carry open")
-                    spot_sym = sym.split(":")[0]
-                    self.spot_exchange.create_order(spot_sym, "market", "buy", spot_qty)
-                    self.perp_exchange.create_order(sym, "market", "sell", perp_qty)
+                if self.execution_style == "maker_taker_hedge":
+                    leg1_res = self.place_maker_leg1(
+                        sym,
+                        "sell",
+                        perp_qty,
+                        pe_curr,
+                        exchange_short="binance",
+                        exchange_long="binance_spot",
+                        spot_symbol=spot_sym,
+                        is_close=False,
+                    )
+                    leg2_res = self.verify_maker_fill_and_hedge_leg2(
+                        sym,
+                        exchange_short="binance",
+                        exchange_long="binance_spot",
+                        spot_symbol=spot_sym,
+                        is_close=False,
+                    )
+                    filled_qty = float(leg2_res.get("leg1_filled_qty", 0.0))
+                    hedged_qty = float(leg2_res.get("leg2_hedged_qty", 0.0))
 
-                self.state.carry_positions[sym] = {
-                    "symbol": sym,
-                    "spot_symbol": sym.split(":")[0],
-                    "qty": float(spot_qty),
-                    "entry_spot_price": float(sp_curr),
-                    "entry_perp_price": float(pe_curr),
-                    "notional_usdt": float(target_notional),
-                    "margin_allocated_usdt": float(margin_alloc),
-                    "entry_time": timestamp_str,
-                    "periods_held": 0,
-                    "funding_collected_usdt": 0.0,
-                    "score_at_entry": float(metrics_at_t[sym]["score"]),
-                }
-                self.state.current_equity -= fee
+                    if filled_qty > 1e-12:
+                        real_qty = filled_qty
+                        real_notional = real_qty * pe_curr
+                        fee = real_notional * self.get_one_way_fee_rate()
+                        real_allocated = (
+                            real_notional / self.carry_config.notional_eta()
+                            if self.carry_config.notional_eta() > 0
+                            else real_notional
+                        )
+                        margin_alloc = max(0.0, (real_allocated - real_notional) - fee)
+
+                        self.state.carry_positions[sym] = {
+                            "symbol": sym,
+                            "spot_symbol": spot_sym,
+                            "qty": float(real_qty),
+                            "entry_spot_price": float(sp_curr),
+                            "entry_perp_price": float(pe_curr),
+                            "notional_usdt": float(real_notional),
+                            "margin_allocated_usdt": float(margin_alloc),
+                            "entry_time": timestamp_str,
+                            "periods_held": 0,
+                            "funding_collected_usdt": 0.0,
+                            "score_at_entry": float(metrics_at_t[sym]["score"]),
+                            "leg1_status": leg2_res.get("leg1_status", "FILLED"),
+                            "leg1_order_id": leg1_res.get("leg1_order_id"),
+                            "leg1_filled_qty": float(filled_qty),
+                            "leg2_hedged_qty": float(hedged_qty),
+                            "exchange_long": "binance_spot",
+                            "exchange_short": "binance",
+                            "capital": float(self.capital),
+                            "execution_state": leg2_res.get("execution_state", "HEDGED"),
+                        }
+                        self.state.current_equity -= fee
+                    else:
+                        self.state.carry_positions.pop(sym, None)
+                        self.maker_no_fill_count += 1
+                else:
+                    fee = target_notional * self.carry_config.one_way_cost()
+                    margin_alloc = (allocated_capital - target_notional) - fee
+
+                    if self.mode == "live":
+                        if (
+                            not self.spot_exchange
+                            or not hasattr(self.spot_exchange, "create_order")
+                            or not self.perp_exchange
+                            or not hasattr(self.perp_exchange, "create_order")
+                        ):
+                            raise RuntimeError("Live exchange does not support create_order for carry open")
+                        self.spot_exchange.create_order(spot_sym, "market", "buy", spot_qty)
+                        self.perp_exchange.create_order(sym, "market", "sell", perp_qty)
+
+                    self.state.carry_positions[sym] = {
+                        "symbol": sym,
+                        "spot_symbol": spot_sym,
+                        "qty": float(spot_qty),
+                        "entry_spot_price": float(sp_curr),
+                        "entry_perp_price": float(pe_curr),
+                        "notional_usdt": float(target_notional),
+                        "margin_allocated_usdt": float(margin_alloc),
+                        "entry_time": timestamp_str,
+                        "periods_held": 0,
+                        "funding_collected_usdt": 0.0,
+                        "score_at_entry": float(metrics_at_t[sym]["score"]),
+                        "leg1_status": "FILLED",
+                        "leg1_order_id": None,
+                        "leg1_filled_qty": float(spot_qty),
+                        "leg2_hedged_qty": float(perp_qty),
+                        "exchange_long": "binance_spot",
+                        "exchange_short": "binance",
+                        "capital": float(self.capital),
+                        "execution_state": "HEDGED",
+                    }
+                    self.state.current_equity -= fee
 
         self.state.carry_last_reconcile_ts = timestamp_str
         self.state_store.save(self.state)
@@ -635,7 +1084,7 @@ class CarryLiveExecutor:
         header = (
             f"| {'Symbol':<15} | {'Score(bps)':>10} | {'FundEWMA(bps)':>13} | {'Basis(%)':>9} "
             f"| {'BasisDev(bps)':>13} | {'Action':<20} | {'Notional($)':>11} | {'MarginRatio':>11} "
-            f"| {'Health':<16} | {'Reason':<25} |"
+            f"| {'Health':<16} | {'Reason':<25} | {'ExecState':<20} |"
         )
         sep = (
             "+"
@@ -659,6 +1108,8 @@ class CarryLiveExecutor:
             + "+"
             + "-" * 27
             + "+"
+            + "-" * 22
+            + "+"
         )
 
         lines.append(sep)
@@ -677,10 +1128,16 @@ class CarryLiveExecutor:
             )
             notional_str = f"{a.target_notional_usdt:.2f}"
 
+            pos = self.state.carry_positions.get(a.symbol) or self._leg_states.get(a.symbol, {})
+            l1_st = str(pos.get("leg1_status", "NONE"))
+            l2_hd = float(pos.get("leg2_hedged_qty", 0.0))
+            ex_st = str(pos.get("execution_state", "IDLE"))
+            exec_str = f"{l1_st}:{l2_hd:.1f}|{ex_st}"
+
             row = (
                 f"| {a.symbol:<15} | {score_bps_str:>10} | {fund_bps_str:>13} | {basis_pct_str:>9} "
                 f"| {dev_bps_str:>13} | {a.action:<20} | {notional_str:>11} | {ratio_str:>11} "
-                f"| {a.margin_health:<16} | {a.reason:<25} |"
+                f"| {a.margin_health:<16} | {a.reason:<25} | {exec_str:<20} |"
             )
             lines.append(row)
 
@@ -689,7 +1146,13 @@ class CarryLiveExecutor:
 
     def run_loop(self, once: bool = False, max_iterations: Optional[int] = None) -> int:
         """Vận hành vòng lặp điều phối CarryLiveExecutor (24/7 hoặc chạy một lần --once)."""
-        logger.info("Starting CarryLiveExecutor run_loop (mode=%s, once=%s)", self.mode, once)
+        logger.info(
+            "Starting CarryLiveExecutor run_loop (mode=%s, style=%s, capital=%.2f, once=%s)",
+            self.mode,
+            self.execution_style,
+            self.capital,
+            once,
+        )
         iterations = 0
         try:
             while True:

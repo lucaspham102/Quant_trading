@@ -106,6 +106,41 @@ def trade_record_from_dict(data: dict[str, Any]) -> TradeRecord:
     )
 
 
+def default_leg_state(
+    capital: float = 3000.0,
+    exchange_long: str = "binance_spot",
+    exchange_short: str = "binance",
+) -> dict[str, Any]:
+    """Trả về dict chứa các trường Chân 1/Chân 2 ở trạng thái IDLE mặc định."""
+    return {
+        "leg1_status": "NONE",
+        "leg1_order_id": None,
+        "leg1_filled_qty": 0.0,
+        "leg2_hedged_qty": 0.0,
+        "exchange_long": str(exchange_long),
+        "exchange_short": str(exchange_short),
+        "capital": float(capital),
+        "execution_state": "IDLE",
+    }
+
+
+def normalize_carry_position(
+    pos: dict[str, Any],
+    default_capital: float = 3000.0,
+) -> dict[str, Any]:
+    """Bổ sung các trường Chân 1/Chân 2 còn thiếu (giữ nguyên giá trị cũ nếu có), không xóa trường lạ."""
+    out = dict(pos)
+    defaults = default_leg_state(
+        capital=float(out.get("capital", default_capital)),
+        exchange_long=str(out.get("exchange_long", "binance_spot")),
+        exchange_short=str(out.get("exchange_short", "binance")),
+    )
+    for k, v in defaults.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
 @dataclass
 class BotState:
     open_position: Optional[dict[str, Any]] = None
@@ -141,7 +176,7 @@ class StateStore:
         os.replace(tmp_path, self.file_path)
         return self.file_path
 
-    def load(self, default_equity: float = 400.0) -> BotState:
+    def load(self, default_equity: float = 400.0, normalize_carry: bool = False) -> BotState:
         """Đọc trạng thái từ đĩa; nếu file chưa tồn tại thì trả về BotState mặc định."""
         if not self.file_path.exists():
             eq = float(default_equity)
@@ -161,7 +196,10 @@ class StateStore:
         if isinstance(raw_carry, dict):
             for k, v in raw_carry.items():
                 if isinstance(v, dict):
-                    carry_positions[str(k)] = dict(v)
+                    pos_dict = dict(v)
+                    if normalize_carry:
+                        pos_dict = normalize_carry_position(pos_dict, default_capital=eq)
+                    carry_positions[str(k)] = pos_dict
         raw_carry_ts = raw.get("carry_last_reconcile_ts")
         carry_last_reconcile_ts = str(raw_carry_ts) if raw_carry_ts is not None else None
 
