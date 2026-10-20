@@ -166,4 +166,4 @@ Lỗi #1 là loại lỗi khiến "kill-switch" trở thành hình thức: cờ 
 | `docs/go_no_go_sprint12.md` | Tiêu chí PR-1..PR-8 (khóa trước khi sửa) |
 | `docs/sprint11_evidence_tables.md` | Bằng chứng Sprint 11 (bất biến) |
 
-**Commit:** `e6b82c7` → `b6877be` → `7ca4ced` → `dfd6243` → `1c2f0aa` (audit fixes).
+**Commit:** `e6b82c7` → `b6877be` → `7ca4ced` → `dfd6243` → `c385e3c` (audit fixes) → `ad2b46e` (báo cáo này).
