@@ -1,12 +1,12 @@
 """Module mô phỏng chiến lược Cross-Exchange Carry đa sàn (Binance, Bybit, OKX).
 
-Sprint 9 - Chặng 2a:
+Sprint 10 - Chặng 1:
 Cung cấp:
-- CrossExchangeCarryConfig: Cấu hình tham số, phí maker_taker_hedge và quản trị ký quỹ liên sàn.
-- compute_expected_8h_yield: Tính toán kỳ vọng lợi suất mỗi 8h cho Chế độ A (Perp-Perp) và Chế độ B (Spot-Perp/Coin-M).
-- run_cross_exchange_carry: Engine mô phỏng bar-by-bar delta-neutral carry đa sàn với mô hình khớp lệnh
-  Limit Post-Only (Chân 1) -> Market Taker (Chân 2), quản trị ký quỹ liên sàn (rebalance ±25%, 5 bps),
-  và cơ chế Hysteresis siêu bền giảm thiểu turnover.
+- EXCHANGE_LOT_SPECS, LOT_STEP_SIZES, DEFAULT_MIN_NOTIONAL, quantize_order_qty: Quy chuẩn lot-size và min-notional từng sàn.
+- CrossExchangeCarryConfig: Cấu hình tham số chiến lược carry dài hạn, ngưỡng entry/exit và ma trận chi phí.
+- compute_expected_8h_yield: Tính toán kỳ vọng lợi suất mỗi 8h cho Chế độ A và B với ngưỡng entry hiệu dụng.
+- run_cross_exchange_carry: Engine mô phỏng bar-by-bar delta-neutral carry đa sàn với Bar-by-Bar Basis MTM,
+  lượng hóa lot-size, mô hình maker fill tất định, quản trị ký quỹ liên sàn và cơ chế Hysteresis.
 """
 from __future__ import annotations
 
@@ -19,6 +19,63 @@ import pandas as pd
 
 from src.multi_exchange_loader import SUPPORTED_EXCHANGES
 
+# -----------------------------------------------------------------------------
+# Yêu cầu 1: Quy chuẩn kích thước lệnh (Lot-size & Min Notional) từng cặp sàn
+# -----------------------------------------------------------------------------
+EXCHANGE_LOT_SPECS: dict[str, dict[str, float]] = {
+    "BTC/USDT:USDT": {"step_size": 0.001, "min_notional": 10.0},
+    "ETH/USDT:USDT": {"step_size": 0.01,  "min_notional": 10.0},
+    "SOL/USDT:USDT": {"step_size": 0.1,   "min_notional": 10.0},
+    "BNB/USDT:USDT": {"step_size": 0.01,  "min_notional": 10.0},
+}
+LOT_STEP_SIZES: dict[str, float] = {k: v["step_size"] for k, v in EXCHANGE_LOT_SPECS.items()}
+DEFAULT_MIN_NOTIONAL: float = 10.0
+
+
+def quantize_order_qty(
+    symbol: str,
+    target_notional_usd: float,
+    price: float,
+    min_notional: float = DEFAULT_MIN_NOTIONAL,
+) -> tuple[float, float]:
+    """Lượng hóa khối lượng đặt lệnh theo step_size và min_notional của sàn.
+
+    Tham số:
+        symbol: Mã cặp giao dịch (vd: 'BTC/USDT:USDT' hoặc 'BTC/USDT').
+        target_notional_usd: Giá trị danh nghĩa mục tiêu (USD).
+        price: Giá vào lệnh (entry price).
+        min_notional: Giá trị danh nghĩa tối thiểu của lệnh (mặc định 10.0 USD).
+
+    Trả về:
+        Tuple (q, actual): Khối lượng và giá trị danh nghĩa thực tế sau khi làm tròn.
+    """
+    if price <= 0.0 or target_notional_usd <= 0.0:
+        return (0.0, 0.0)
+
+    step = LOT_STEP_SIZES.get(symbol)
+    if step is None:
+        if f"{symbol}:USDT" in LOT_STEP_SIZES:
+            step = LOT_STEP_SIZES[f"{symbol}:USDT"]
+        elif symbol.endswith(":USDT") and symbol[:-5] in LOT_STEP_SIZES:
+            step = LOT_STEP_SIZES[symbol[:-5]]
+        else:
+            base = symbol.split("/")[0] if "/" in symbol else symbol
+            for k, v in LOT_STEP_SIZES.items():
+                if k.startswith(f"{base}/"):
+                    step = v
+                    break
+            if step is None:
+                step = 0.001
+
+    q_raw = target_notional_usd / price
+    q = math.floor((q_raw + 1e-12) / step) * step
+    precision = 8 if step < 0.001 else 6
+    q = round(q, precision)
+    actual = q * price
+    if actual < min_notional:
+        return (0.0, 0.0)
+    return (float(q), float(actual))
+
 
 @dataclass(frozen=True)
 class CrossExchangeCarryConfig:
@@ -29,7 +86,7 @@ class CrossExchangeCarryConfig:
     execution: Literal["maker_taker_hedge", "real_taker"] = "maker_taker_hedge"
     initial_capital: float = 3000.0
     top_k: int = 2
-    ema_span: int = 6
+    ema_span: int = 21
 
     # Đòn bẩy & hiệu suất sử dụng vốn (eta)
     perp_leg_leverage: float = 2.0
@@ -51,11 +108,14 @@ class CrossExchangeCarryConfig:
     maker_order_ttl_bars: int = 2           # Hết 2 nến không khớp -> hủy
 
     # Hysteresis siêu bền
-    max_payback_periods: int = 12           # <= 12 kỳ funding (4 ngày) phải thu hồi đủ round-trip cost
+    max_payback_periods: int = 42           # <= 42 kỳ funding phải thu hồi đủ round-trip cost
     horizon_periods_7d: int = 21            # 7 ngày = 21 kỳ funding 8h
     switch_cost_multiplier: float = 3.0     # Chênh lệch kỳ vọng 21 kỳ > 3 * round_trip_cost mới đóng/chuyển sàn
-    min_hold_periods: int = 12              # Giữ tối thiểu 12 kỳ (4 ngày) trừ khi âm sâu
+    min_hold_periods: int = 42              # Giữ tối thiểu 42 kỳ trừ khi âm sâu
     exit_yield_threshold: float = -0.00002  # Ngưỡng thoát khi expected yield âm sâu
+    entry_funding_threshold: float = 0.00005  # Ngưỡng entry tối thiểu mỗi 8h (0.50 bps/8h)
+    exit_funding_threshold: float = -0.00001  # Ngưỡng thoát khi funding rate âm (-0.10 bps/8h)
+    lot_size_quantization: bool = True       # Bật lượng hóa khối lượng đặt lệnh theo lot-size sàn
 
     # Quản trị ký quỹ liên sàn
     price_rebalance_trigger_pct: float = 0.25  # Biến động giá >= ±25% từ lúc mở/rebalance gần nhất
@@ -131,8 +191,8 @@ def compute_expected_8h_yield(
         - expected_yield_b: Lợi suất kỳ vọng mỗi 8h cho Chế độ B (max_single_funding * eta_b hoặc single binance).
         - selected_mode: Chế độ tối ưu được chọn ('perp_perp_spread', 'best_venue_carry', hoặc None).
         - expected_yield: Lợi suất kỳ vọng của chế độ được chọn.
-        - min_entry_rate: Ngưỡng lợi suất tối thiểu cần đạt để thu hồi phí trong max_payback_periods.
-        - can_enter: Cờ boolean chỉ ra có đủ điều kiện mở vị thế mới hay không.
+        - min_entry_rate: Ngưỡng lợi suất hiệu dụng tối thiểu (max giữa min_entry_rate_per_8h và entry_funding_threshold).
+        - can_enter: Cờ boolean chỉ ra có đủ điều kiện mở vị thế mới theo ngưỡng hiệu dụng hay không.
         - short_ex: Sàn giao dịch mở vị thế Short.
         - long_ex: Sàn giao dịch mở vị thế Long (hoặc 'spot').
     """
@@ -143,7 +203,6 @@ def compute_expected_8h_yield(
     idx = frame.index
 
     # 1. Tính lợi suất kỳ vọng Chế độ A (Perp-vs-Perp)
-    # Mode A yêu cầu tồn tại cross_ex_spread và 2 sàn short/long khác nhau
     if "cross_ex_spread" in frame.columns:
         spread_raw = frame["cross_ex_spread"].to_numpy(dtype=np.float64)
     else:
@@ -155,7 +214,6 @@ def compute_expected_8h_yield(
     short_arr = best_short_s.to_numpy()
     long_arr = best_long_s.to_numpy()
 
-    # Điều kiện Mode A hợp lệ: short != long, cả 2 không None, spread > 0
     valid_mode_a = (
         np.isfinite(spread_raw)
         & (spread_raw > 0.0)
@@ -207,7 +265,6 @@ def compute_expected_8h_yield(
         selected_long_arr[mask] = "spot"
 
     elif config.mode == "hybrid":
-        # Chọn Mode A nếu yield_a > yield_b, ngược lại chọn Mode B nếu yield_b hợp lệ
         choose_a = valid_mode_a & (yield_a > yield_b)
         choose_b = (~choose_a) & valid_mode_b
 
@@ -221,16 +278,19 @@ def compute_expected_8h_yield(
         selected_short_arr[choose_b] = short_b_arr[choose_b]
         selected_long_arr[choose_b] = "spot"
 
-    # 4. Tính ngưỡng entry và kiểm tra điều kiện can_enter
+    # 4. Tính ngưỡng entry hiệu dụng và kiểm tra điều kiện can_enter
     min_entry_arr = np.full(n_rows, np.nan, dtype=np.float64)
     can_enter_arr = np.zeros(n_rows, dtype=bool)
+
+    entry_thr = getattr(config, "entry_funding_threshold", 0.0)
 
     for i in range(n_rows):
         m = selected_mode_arr[i]
         if m is not None:
             min_rate = config.min_entry_rate_per_8h(str(m))
-            min_entry_arr[i] = min_rate
-            if np.isfinite(selected_yield_arr[i]) and selected_yield_arr[i] >= min_rate:
+            effective_min = max(min_rate, float(entry_thr)) if (entry_thr is not None and entry_thr > 0.0) else min_rate
+            min_entry_arr[i] = effective_min
+            if np.isfinite(selected_yield_arr[i]) and selected_yield_arr[i] >= effective_min:
                 can_enter_arr[i] = True
 
     res = pd.DataFrame(
@@ -269,7 +329,8 @@ def run_cross_exchange_carry(
         - holdings_log: pd.DataFrame ảnh chụp trạng thái danh mục tại mỗi kỳ 8h.
         - attribution_series: pd.DataFrame phân rã PnL từng giờ.
         - funding_pnl: float tổng funding thu được (USDT).
-        - basis_pnl: float (0.0 theo giả định bảo thủ).
+        - basis_pnl: float tổng Basis MTM PnL (USDT).
+        - basis_mtm_std: float độ lệch chuẩn Basis MTM từng giờ (tiêu chí GO-4).
         - fees: float tổng trading_fees + rebalance_fees (USDT).
         - rebalance_fees: float tổng phí rebalance ký quỹ liên sàn (USDT).
         - turnover: float hệ số quay vòng vốn (total_notional_traded / initial_capital).
@@ -322,6 +383,7 @@ def run_cross_exchange_carry(
             "attribution_series": empty_attr,
             "funding_pnl": 0.0,
             "basis_pnl": 0.0,
+            "basis_mtm_std": 0.0,
             "fees": 0.0,
             "rebalance_fees": 0.0,
             "turnover": 0.0,
@@ -360,6 +422,7 @@ def run_cross_exchange_carry(
             "attribution_series": empty_attr,
             "funding_pnl": 0.0,
             "basis_pnl": 0.0,
+            "basis_mtm_std": 0.0,
             "fees": 0.0,
             "rebalance_fees": 0.0,
             "turnover": 0.0,
@@ -385,6 +448,7 @@ def run_cross_exchange_carry(
     low_prices: dict[str, np.ndarray] = {}
     funding_events: dict[str, dict[str, np.ndarray]] = {sym: {} for sym in symbols}
     ewma_funding: dict[str, dict[str, np.ndarray]] = {sym: {} for sym in symbols}
+    basis_arr: dict[str, np.ndarray] = {}
 
     cand_yield: dict[str, np.ndarray] = {}
     cand_mode: dict[str, list[str | None]] = {}
@@ -424,6 +488,12 @@ def run_cross_exchange_carry(
             else:
                 ewma_funding[sym][ex] = np.full(n_steps, np.nan, dtype=np.float64)
 
+        # Trích mảng basis_pct cho True Basis MTM
+        if "basis_pct" in df_raw.columns:
+            basis_arr[sym] = df_raw["basis_pct"].fillna(0.0).to_numpy(dtype=np.float64)
+        else:
+            basis_arr[sym] = np.zeros(n_steps, dtype=np.float64)
+
         cand_yield[sym] = y_df["expected_yield"].to_numpy(dtype=np.float64)
         cand_mode[sym] = y_df["selected_mode"].tolist()
         cand_short_ex[sym] = y_df["short_ex"].tolist()
@@ -461,6 +531,8 @@ def run_cross_exchange_carry(
     in_market_any = np.zeros(n_steps, dtype=bool)
 
     hourly_funding_pnl = np.zeros(n_steps, dtype=np.float64)
+    hourly_basis_pnl = np.zeros(n_steps, dtype=np.float64)
+    prev_basis: dict[str, float] = {sym: 0.0 for sym in symbols}
     hourly_rebalance_fees = np.zeros(n_steps, dtype=np.float64)
     hourly_trading_fees = np.zeros(n_steps, dtype=np.float64)
     hourly_notional_traded = np.zeros(n_steps, dtype=np.float64)
@@ -470,6 +542,9 @@ def run_cross_exchange_carry(
 
     # 5. Vòng lặp mô phỏng bar-by-bar
     for t_idx, t in enumerate(common_index):
+        # Lưu notional tại đầu nến t trước mọi thay đổi trong nến t
+        notional_start = {s: notional[s] for s in symbols}
+
         # -----------------------------------------------------------------
         # Bước 1 — Mô hình khớp lệnh Maker Fill tất định cho pending orders
         # -----------------------------------------------------------------
@@ -492,6 +567,11 @@ def run_cross_exchange_carry(
 
                 if is_filled and not in_position[sym] and equity > 0:
                     leg_notional = float(order["notional"])
+                    if getattr(config, "lot_size_quantization", False) and leg_notional <= 0.0:
+                        maker_no_fill_count += 1
+                        del pending_maker_orders[sym]
+                        continue
+
                     fee = leg_notional * float(order["one_way_cost"])
 
                     equity -= fee
@@ -591,6 +671,16 @@ def run_cross_exchange_carry(
                     periods_held[sym] += 1
 
         # -----------------------------------------------------------------
+        # Bước 3b — Mark-to-Market (MTM) Basis PnL từng nến 1h
+        # -----------------------------------------------------------------
+        for sym in symbols:
+            if in_position[sym] and notional_start[sym] > 0.0:
+                delta_basis = -notional_start[sym] * (basis_arr[sym][t_idx] - prev_basis[sym])
+                hourly_basis_pnl[t_idx] += delta_basis
+                equity += delta_basis
+            prev_basis[sym] = float(basis_arr[sym][t_idx])
+
+        # -----------------------------------------------------------------
         # Bước 4 — Hysteresis & Xoay Vòng Danh Mục (tại mốc 8h)
         # -----------------------------------------------------------------
         if is_8h_event:
@@ -619,7 +709,12 @@ def run_cross_exchange_carry(
                     close_reason = ""
 
                     # Điều kiện A: Thoát vị thế âm sâu khi đã giữ đủ min_hold_periods
-                    if periods_held[sym] >= config.min_hold_periods and curr_hold_yield < config.exit_yield_threshold:
+                    thr = (
+                        config.exit_funding_threshold
+                        if config.exit_funding_threshold is not None
+                        else config.exit_yield_threshold
+                    )
+                    if periods_held[sym] >= config.min_hold_periods and curr_hold_yield < thr:
                         close_reason = "EXIT_NEGATIVE_YIELD"
                         forced_exits += 1
 
@@ -643,7 +738,7 @@ def run_cross_exchange_carry(
                                 num_switches += 1
 
                     if close_reason:
-                        # Thực thi ĐÓNG vị thế
+                        # Thực thi ĐÓNG vị thế (không cộng thêm basis vì đã MTM bar-by-bar)
                         pos_notional = notional[sym]
                         close_fee = pos_notional * one_way_cost_curr
                         equity -= close_fee
@@ -681,6 +776,7 @@ def run_cross_exchange_carry(
 
             if n_slots_available > 0 and equity > 0:
                 candidates: list[tuple[float, str, str, str, str]] = []
+                entry_thr = getattr(config, "entry_funding_threshold", 0.0)
                 for sym in symbols:
                     if not in_position[sym] and sym not in pending_maker_orders:
                         y = cand_yield[sym][t_idx]
@@ -690,8 +786,8 @@ def run_cross_exchange_carry(
 
                         if m is not None and np.isfinite(y) and sh_ex is not None:
                             min_rate = config.min_entry_rate_per_8h(m)
-                            # Kiểm tra quy tắc thu hồi vốn: expected_8h_rate * 12 >= round_trip_cost
-                            if y >= min_rate:
+                            effective_min = max(min_rate, float(entry_thr)) if (entry_thr is not None and entry_thr > 0.0) else min_rate
+                            if y >= effective_min:
                                 candidates.append((float(y), sym, m, str(sh_ex), str(lo_ex)))
 
                 # Sắp xếp giảm dần theo expected yield
@@ -715,6 +811,22 @@ def run_cross_exchange_carry(
 
                     # Chân 1 Limit Post-Only: Bán treo cao hơn giá đóng cửa t-1
                     limit_p = pe_prev * (1.0 + buffer_mult)
+
+                    entry_price = float(
+                        limit_p
+                        if (config.enable_maker_fill_model and config.execution == "maker_taker_hedge")
+                        else perp_prices[sym][t_idx]
+                    )
+                    if np.isnan(entry_price) or entry_price <= 0:
+                        entry_price = float(perp_prices[sym][t_idx]) if not np.isnan(perp_prices[sym][t_idx]) and perp_prices[sym][t_idx] > 0 else 1.0
+
+                    # Lượng hóa lot-size theo sàn
+                    if getattr(config, "lot_size_quantization", False):
+                        q_qty, actual_notional = quantize_order_qty(sym, leg_notional, entry_price)
+                        if q_qty <= 0.0 or actual_notional <= 0.0:
+                            maker_no_fill_count += 1
+                            continue
+                        leg_notional = actual_notional
 
                     if config.enable_maker_fill_model and config.execution == "maker_taker_hedge":
                         pending_maker_orders[sym] = {
@@ -792,7 +904,7 @@ def run_cross_exchange_carry(
     holdings_log = pd.DataFrame(holdings_log_list) if holdings_log_list else pd.DataFrame(columns=holdings_cols)
 
     hourly_fees = hourly_trading_fees + hourly_rebalance_fees
-    hourly_basis = np.zeros(n_steps, dtype=np.float64)  # basis_pnl = 0.0 theo giả định bảo thủ
+    hourly_basis = hourly_basis_pnl
     hourly_net_pnl = hourly_funding_pnl + hourly_basis - hourly_fees
 
     attribution_series = pd.DataFrame(
@@ -850,6 +962,8 @@ def run_cross_exchange_carry(
     )
 
     total_fees_paid = total_trading_fees + total_rebalance_fees
+    total_basis_pnl = float(hourly_basis_pnl.sum())
+    basis_mtm_std = float(np.std(hourly_basis_pnl)) if len(hourly_basis_pnl) > 0 else 0.0
 
     metrics = {
         "Total Return %": total_return_pct,
@@ -868,8 +982,8 @@ def run_cross_exchange_carry(
         "Num Switches": int(num_switches),
         "Num Rebalances": int(price_rebalances),
         "Margin Rebalances": 0,
-        "Total Basis PnL": 0.0,
-        "Total MTM PnL": 0.0,
+        "Total Basis PnL": total_basis_pnl,
+        "Total MTM PnL": total_basis_pnl,
         "Net PnL": float(equity - config.initial_capital),
         "Forced Exits": int(forced_exits),
     }
@@ -881,7 +995,8 @@ def run_cross_exchange_carry(
         "holdings_log": holdings_log,
         "attribution_series": attribution_series,
         "funding_pnl": float(total_funding_collected),
-        "basis_pnl": 0.0,
+        "basis_pnl": total_basis_pnl,
+        "basis_mtm_std": basis_mtm_std,
         "fees": float(total_fees_paid),
         "rebalance_fees": float(total_rebalance_fees),
         "turnover": turnover,
