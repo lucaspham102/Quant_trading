@@ -58,8 +58,14 @@ class DynamicCarryConfig:
     rebalance_price_trigger_pct: float = 0.35
     rebalance_fee_multiplier: float = 2.0
 
+    # Sprint 15: che do cua Tier 1B (giu mac dinh "advantage" cho test Sprint 7-10)
+    switch_rule: Literal["advantage", "tier1b_buffer_rank"] = "advantage"
+    eta_override: float | None = None
+
     def notional_eta(self) -> float:
         """Tỷ lệ vốn hiệu dụng nhận funding (0.75 cho spot_perp_3x, 1.0 cho coinm_1leg)."""
+        if self.eta_override is not None:
+            return float(self.eta_override)
         if self.structure == "spot_perp_3x":
             return 0.75
         elif self.structure == "coinm_1leg":
@@ -265,6 +271,7 @@ def select_portfolio(
     current_holdings: set[str],
     periods_held: dict[str, int],
     config: DynamicCarryConfig,
+    switch_rule: Literal["advantage", "tier1b_buffer_rank"] | None = None,
 ) -> SelectionDecision:
     """Hàm thuần lựa chọn danh mục tập trung có cơ chế Buffer, Hysteresis và Min Switch Advantage.
 
@@ -303,6 +310,8 @@ def select_portfolio(
     kept_holdings: set[str] = set()
     used_candidates: set[str] = set()
     min_switch = config.min_switch_advantage()
+    rule = switch_rule or config.switch_rule
+    drop_rank_threshold = int(config.top_k + config.buffer_rank)
 
     # 3. Xét từng coin đang nắm giữ từ kỳ trước (duyệt theo điểm từ cao xuống thấp)
     sorted_holdings = sorted(
@@ -321,6 +330,35 @@ def select_portfolio(
 
         h_score = score_map.get(h, -float("inf"))
         h_rank = rank_map.get(h, 999999)
+
+        if rule == "tier1b_buffer_rank":
+            # Tier 1B (Frozen Alpha): chi thoat khi het han giu toi thieu VA diem <= exit_threshold.
+            if (not np.isfinite(h_score)) or h_score <= config.exit_threshold:
+                actions[h] = "CLOSE"
+                reasons[h] = "EXIT_BELOW_THRESHOLD"
+                continue
+
+            # Thoat/switch khi roi ngoai vung dem (top_k + buffer_rank).
+            if h_rank > drop_rank_threshold:
+                cand_found = None
+                for cand in new_candidates:
+                    if cand not in used_candidates:
+                        cand_found = cand
+                        break
+                if cand_found is not None:
+                    actions[h] = "CLOSE"
+                    reasons[h] = "SWITCH_RANK_DROP"
+                    used_candidates.add(cand_found)
+                else:
+                    actions[h] = "HOLD"
+                    reasons[h] = "HOLD_BUFFER_RANK"
+                    kept_holdings.add(h)
+                continue
+
+            actions[h] = "HOLD"
+            reasons[h] = "HOLD_BUFFER_RANK"
+            kept_holdings.add(h)
+            continue
 
         # Điều kiện thoát khi điểm rơi dưới ngưỡng thoát
         if h_score < config.exit_threshold:

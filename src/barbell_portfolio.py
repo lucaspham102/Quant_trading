@@ -196,6 +196,179 @@ def build_overlay_data(
 from src.cross_exchange_carry import quantize_order_qty
 
 
+def build_rebalance_mask(
+    n_bars: int,
+    rebalance_hours: int,
+    phase_offset: int = 0,
+    weights_changed: Optional[pd.Series] = None,
+    index: Optional[pd.Index] = None,
+) -> pd.Series:
+    """Sprint 15: mask tai can bang overlay, neo theo moc tuyet doi + phase offset.
+
+    ``phase_offset`` cho phep neo lai dong ho 48h khi chuoi du lieu bi cat ngan
+    (Method D bat dau tu ``split_date - warmup``), nho do moc tai can bang trung
+    voi backtest chay tren chuoi day du.
+    """
+    hours = max(1, int(rebalance_hours))
+    local = np.arange(int(n_bars))
+    base = ((local + int(phase_offset)) % hours == 0)
+    mask = pd.Series(base, index=index if index is not None else pd.RangeIndex(int(n_bars)))
+    if weights_changed is not None:
+        mask = mask | weights_changed.reindex(mask.index).fillna(False).astype(bool)
+    if n_bars > 0:
+        mask.iloc[0] = True
+    return mask.astype(bool)
+
+
+def compute_live_overlay_targets(
+    aligned_universe: dict[str, pd.DataFrame],
+    overlay_config: BarbellConfig,
+    lookback_hours: int = 720,
+    vol_lookback_hours: int = 168,
+    min_weight_change: float = 0.08,
+) -> dict[str, Any]:
+    """Sprint 15: tinh overlay target weights live theo dung cong thuc Frozen Alpha Sprint 11.
+
+    Tai cung mot moc t (bar cuoi cung), ham nay:
+    1. Cat ``lookback_hours`` nen cuoi (chi du lieu <= t, khong look-ahead).
+    2. Chay nguyen ``run_cross_sectional_portfolio`` (momentum 336h, rebalance 48h,
+       min_spread 0.75, top_k=1, buffer_rank=1, carry_tilt=0.20) -> weight momentum tho.
+    3. Ap gate ``smooth_conviction``: ``c_t = clip(snr_dispersion/1.0, 0.50, 1.00)`` khi
+       dispersion >= 0.25 va co du ca chan long + short, nguoc lai c_t = 0.
+    4. Vol targeting: ``sigma = std(returns 168h) * sqrt(8760)`` (san 0.08),
+       ``L_t = c_t * clip(0.075/sigma, 0.15, 0.50)``.
+    5. ``w_i = raw_w_i * L_t``; bo qua thay doi nho hon ``min_weight_change`` (0.08).
+
+    Tra ve dict: ``weights`` (target weight co dau), ``raw_weights``, ``conviction``,
+    ``leverage``, ``active``, ``raw_snr_dispersion``, ``skip_reason``.
+    """
+    symbols = [s for s, df in aligned_universe.items() if df is not None and not df.empty]
+    empty = {
+        "weights": {},
+        "raw_weights": {},
+        "conviction": 0.0,
+        "leverage": 0.0,
+        "active": False,
+        "raw_snr_dispersion": 0.0,
+        "skip_reason": "NO_DATA",
+        "min_weight_change": float(min_weight_change),
+    }
+    if not symbols:
+        return empty
+
+    # 1. Cat cua so lookback (giu index chung ngan nhat de tranh lech truc thoi gian)
+    trimmed: dict[str, pd.DataFrame] = {}
+    ref_index = None
+    for sym in symbols:
+        df = aligned_universe[sym]
+        if lookback_hours and len(df) > lookback_hours:
+            df = df.iloc[-int(lookback_hours):]
+        trimmed[sym] = df
+        if ref_index is None:
+            ref_index = df.index
+        else:
+            common = ref_index.intersection(df.index)
+            ref_index = common
+    if ref_index is None or len(ref_index) < 2:
+        return {**empty, "skip_reason": "INSUFFICIENT_HISTORY"}
+
+    trimmed = {s: df.reindex(ref_index) for s, df in trimmed.items()}
+
+    overlay_data = build_overlay_data(trimmed)
+    close_dict: dict[str, pd.Series] = {}
+    for sym, df in overlay_data.items():
+        if "close" in df.columns:
+            close_dict[sym] = df["close"]
+    close_matrix = pd.DataFrame(close_dict, index=ref_index, dtype="float64").ffill()
+    if close_matrix.empty:
+        return {**empty, "skip_reason": "NO_CLOSE_PRICES"}
+
+    snr_df = compute_snr_dispersion(close_matrix, overlay_config.overlay_lookback_hours)
+    try:
+        raw_disp = float(snr_df["raw_snr_dispersion"].iloc[-1])
+    except Exception:
+        raw_disp = 0.0
+    if not np.isfinite(raw_disp):
+        raw_disp = 0.0
+
+    ov_perp_fee = 0.0003
+    ov_slippage = 0.0002
+    if overlay_config.overlay_execution == "real_taker":
+        ov_perp_fee = 0.0005
+    xs_config = CrossSectionalConfig(
+        mode="momentum",
+        lookback_hours=overlay_config.overlay_lookback_hours,
+        rebalance_hours=overlay_config.overlay_rebalance_hours,
+        min_spread=overlay_config.overlay_min_spread,
+        gross_leverage=1.0,
+        perp_fee=ov_perp_fee,
+        slippage=ov_slippage,
+        initial_capital=overlay_config.initial_capital,
+        top_k=overlay_config.overlay_top_k,
+        buffer_rank=max(1, overlay_config.overlay_buffer_rank),
+        carry_tilt_weight=overlay_config.carry_tilt_weight,
+        vol_target_ann=None,
+    )
+    overlay_result = run_cross_sectional_portfolio(
+        overlay_data, config=xs_config, periods_per_year=8760
+    )
+    weights_df = overlay_result.get("weights_df", pd.DataFrame())
+    if weights_df is None or weights_df.empty:
+        return {**empty, "raw_snr_dispersion": raw_disp, "skip_reason": "NO_WEIGHTS"}
+
+    raw_row = weights_df.reindex(ref_index).fillna(0.0).iloc[-1]
+    raw_weights = {
+        str(sym): float(val)
+        for sym, val in raw_row.items()
+        if np.isfinite(val) and abs(float(val)) > 1e-12
+    }
+    pos_syms = [s for s, w in raw_weights.items() if w > 0]
+    neg_syms = [s for s, w in raw_weights.items() if w < 0]
+
+    if not pos_syms or not neg_syms:
+        return {
+            **empty,
+            "raw_weights": raw_weights,
+            "raw_snr_dispersion": raw_disp,
+            "skip_reason": "MISSING_LEG",
+        }
+    if raw_disp < 0.25:
+        return {
+            **empty,
+            "raw_weights": raw_weights,
+            "raw_snr_dispersion": raw_disp,
+            "skip_reason": "SNR_BELOW_FLOOR",
+        }
+
+    c_t = float(np.clip(raw_disp / 1.00, 0.50, 1.00))
+
+    ret_series = overlay_result.get("returns")
+    sigma = 0.08
+    if isinstance(ret_series, pd.Series) and len(ret_series) > 1:
+        tail = ret_series.tail(int(vol_lookback_hours)).astype("float64")
+        std = float(tail.std()) if hasattr(tail, "std") else 0.0
+        if np.isfinite(std) and std > 0:
+            sigma = max(std * float(np.sqrt(8760.0)), 0.08)
+    l_t = float(c_t * np.clip(0.075 / sigma, 0.15, 0.50))
+
+    weights: dict[str, float] = {}
+    for sym, w in raw_weights.items():
+        scaled = float(w) * l_t
+        if abs(scaled) >= min_weight_change:
+            weights[sym] = scaled
+
+    return {
+        "weights": weights,
+        "raw_weights": raw_weights,
+        "conviction": c_t,
+        "leverage": l_t,
+        "active": bool(weights),
+        "raw_snr_dispersion": float(raw_disp),
+        "skip_reason": "" if weights else "BELOW_MIN_WEIGHT_CHANGE",
+        "min_weight_change": float(min_weight_change),
+    }
+
+
 def _simulate_barbell_equity(
     raw_weights: pd.DataFrame,      # trọng số unit-gross theo nến (đã reindex common_index, fillna 0)
     close_matrix: pd.DataFrame,     # giá đóng cửa theo nến, cùng cột
@@ -212,6 +385,7 @@ def _simulate_barbell_equity(
     enable_dd_cushion: bool,
     reinvest_profits: bool = True,
     carry_dollar_pnl: Optional[np.ndarray] = None,
+    rebalance_phase_offset: int = 0,
 ) -> dict[str, Any]:
     """Mô phỏng động cơ vốn Barbell với lượng hóa lot-size và quản trị drawdown.
 
@@ -337,7 +511,7 @@ def _simulate_barbell_equity(
         g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
-        is_rebal = (t % rebalance_hours == 0) or w_changed[t]
+        is_rebal = ((t + int(rebalance_phase_offset)) % rebalance_hours == 0) or w_changed[t]
         fee = 0.0
 
         if is_rebal:
@@ -434,6 +608,7 @@ def run_barbell_portfolio(
     config: BarbellConfig,
     periods_per_year: int = 8760,
     trade_start_idx: int | None = None,
+    rebalance_phase_offset: int = 0,
 ) -> dict[str, Any]:
     """Mô phỏng danh mục Barbell (Core Yield Sleeve + Tactical Alpha Overlay).
 
@@ -742,10 +917,13 @@ def run_barbell_portfolio(
     # 6. Xác định mốc tái cân bằng, SNR Gate và Vol Targeting
     diff_s = raw_weights_aligned.diff().abs().sum(axis=1)
     weights_changed_mask = ~diff_s.le(1e-12)
-    hour_rebal_mask = (np.arange(n_bars) % config.overlay_rebalance_hours == 0)
-    rebal_mask = hour_rebal_mask | weights_changed_mask
-    if n_bars > 0:
-        rebal_mask.iloc[0] = True
+    rebal_mask = build_rebalance_mask(
+        n_bars,
+        config.overlay_rebalance_hours,
+        phase_offset=rebalance_phase_offset,
+        weights_changed=weights_changed_mask,
+        index=raw_weights_aligned.index,
+    )
 
     gate_arr = np.zeros(n_bars, dtype=np.float64)
     l_raw_arr = np.zeros(n_bars, dtype=np.float64)
@@ -911,6 +1089,7 @@ def run_barbell_portfolio(
             enable_dd_cushion=config.enable_drawdown_cushion,
             reinvest_profits=bool(config.reinvest_profits),
             carry_dollar_pnl=carry_dollar_pnl_arr,
+            rebalance_phase_offset=int(rebalance_phase_offset),
         )
 
         equity_curve = pd.Series(

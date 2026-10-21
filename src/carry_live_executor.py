@@ -107,6 +107,7 @@ class CarryLiveExecutor:
         max_allowed_spread_bps: float = 10.0,
         max_live_drawdown_pct: float = 0.06,
         min_notional_usd: float = 10.0,
+        tier1b_gate: bool = False,
     ) -> None:
         if mode not in ("paper", "live", "testnet"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper', 'live' hoac 'testnet'.")
@@ -127,6 +128,9 @@ class CarryLiveExecutor:
         else:
             self.capital = float(capital if capital is not None else carry_config.initial_capital)
         self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
+        # Sprint 15: co Tier 1B - gate carry theo pure EMA funding (khop backtest Frozen Alpha).
+        self.tier1b_gate: bool = bool(tier1b_gate)
+        self.last_overlay_targets: dict[str, Any] = {}
         self.maker_no_fill_count: int = 0
         self.last_decision_diagnostics: dict[str, Any] = {}
         self._leg_states: dict[str, dict[str, Any]] = {}
@@ -896,6 +900,26 @@ class CarryLiveExecutor:
             "cancelled": bool(cancelled),
         }
 
+    def _carry_selection_scores(
+        self,
+        metrics_at_t: dict[str, dict[str, Any]],
+        scores_at_t: dict[str, float],
+    ) -> dict[str, float]:
+        """Sprint 15: chon score dua vao gate carry.
+
+        Tier 1B (``tier1b_gate=True``) dung pure EMA funding ``f_ewma`` (chua blend basis)
+        de khop backtest Frozen Alpha; nguoc lai giu ``score`` Sprint 7 nhu cu.
+        """
+        if not self.tier1b_gate:
+            return scores_at_t
+        out: dict[str, float] = {}
+        for sym, metrics in (metrics_at_t or {}).items():
+            try:
+                out[sym] = float(metrics.get("f_ewma", scores_at_t.get(sym, 0.0)))
+            except (TypeError, ValueError):
+                out[sym] = float(scores_at_t.get(sym, 0.0))
+        return out
+
     def build_barbell_allocations(
         self,
         aligned_universe: dict[str, pd.DataFrame],
@@ -949,7 +973,42 @@ class CarryLiveExecutor:
         overlay_active = False
         raw_snr_dispersion = 0.0
 
-        if self.overlay_config is not None:
+        if self.overlay_config is not None and self.tier1b_gate:
+            # Sprint 15: overlay parity - dung dung cong thuc smooth_conviction Sprint 11.
+            from src.barbell_portfolio import compute_live_overlay_targets
+
+            live_targets = compute_live_overlay_targets(
+                aligned_universe,
+                self.overlay_config,
+                lookback_hours=int(getattr(self, "lookback_hours", 720) or 720),
+            )
+            raw_snr_dispersion = float(live_targets.get("raw_snr_dispersion", 0.0) or 0.0)
+            target_weights = dict(live_targets.get("weights", {}) or {})
+            overlay_active = bool(live_targets.get("active", False))
+            self.last_overlay_targets = live_targets
+
+            equity_now = float(getattr(self.state, "current_equity", self.capital) or self.capital)
+            for sym, w in target_weights.items():
+                df = aligned_universe.get(sym)
+                if df is None or df.empty:
+                    continue
+                price = float(
+                    df["perp_close"].iloc[-1] if "perp_close" in df.columns else df["close"].iloc[-1]
+                )
+                target_notional = abs(float(w)) * equity_now
+                q_qty, actual_notional = self.quantize_leg(sym, target_notional, price)
+                if q_qty <= 0.0:
+                    continue
+                overlay_allocations.append({
+                    "symbol": sym,
+                    "side": "long_perp" if float(w) > 0 else "short_perp",
+                    "venue": "binance",
+                    "target_qty": float(q_qty),
+                    "notional": float(actual_notional),
+                    "min_notional_ok": True,
+                    "target_weight": float(w),
+                })
+        elif self.overlay_config is not None:
             lookback = int(getattr(self.overlay_config, "overlay_lookback_hours", 336))
             close_dict = {}
             for sym, df in aligned_universe.items():
@@ -1970,11 +2029,24 @@ class CarryLiveExecutor:
             aligned_universe, metrics_at_t, barbell_allocations
         )
         self.persist_sleeve_state(barbell_allocations, timestamp_str)
+        carry_snapshot_before = {
+            sym: float(pos.get("notional_usdt", 0.0))
+            for sym, pos in self.state.carry_positions.items()
+            if isinstance(pos, dict)
+        }
+        overlay_trades_count = 0
         try:
-            self.execute_overlay_rebalance(
+            ov_res = self.execute_overlay_rebalance(
                 barbell_allocations.get("momentum_overlay", {}),
                 aligned_universe,
                 timestamp=timestamp_str,
+            )
+            overlay_trades_count = int(
+                sum(
+                    1
+                    for _o in (ov_res.get("orders") or [])
+                    if isinstance(_o, dict) and _o.get("status") in ("filled", "paper_filled")
+                )
             )
         except Exception as _ov_err:  # khong de overlay lam chet reconcile
             logger.warning("Overlay rebalance skipped: %s", _ov_err)
@@ -2007,10 +2079,18 @@ class CarryLiveExecutor:
             else:
                 margin_health_map[sym] = (0.0, "N/A")
 
+        # Sprint 15: Tier 1B dung pure EMA funding (bps) lam score, khop backtest.
+        selection_scores = self._carry_selection_scores(metrics_at_t, scores_at_t)
         # 4. Lựa chọn danh mục qua select_portfolio
         current_holdings = set(self.state.carry_positions.keys())
         periods_held_map = {sym: int(pos.get("periods_held", 0)) for sym, pos in self.state.carry_positions.items()}
-        decision = select_portfolio(scores_at_t, current_holdings, periods_held_map, self.carry_config)
+        decision = select_portfolio(
+            selection_scores,
+            current_holdings,
+            periods_held_map,
+            self.carry_config,
+            switch_rule="tier1b_buffer_rank" if self.tier1b_gate else None,
+        )
 
         resolved_actions: dict[str, Literal["HOLD", "OPEN_DELTA_NEUTRAL", "CLOSE_DELTA_NEUTRAL", "REBALANCE_MARGIN", "SKIP"]] = {}
         resolved_reasons: dict[str, str] = {}
@@ -2342,6 +2422,21 @@ class CarryLiveExecutor:
         self.state.carry_last_reconcile_ts = timestamp_str
         self.state_store.save(self.state)
 
+        # 5b. Sprint 15: dem so trade carry thuc thi (open/close/rebalance) trong chu ky nay.
+        carry_snapshot_after = {
+            sym: float(pos.get("notional_usdt", 0.0))
+            for sym, pos in self.state.carry_positions.items()
+            if isinstance(pos, dict)
+        }
+        carry_trades_count = len(set(carry_snapshot_before) ^ set(carry_snapshot_after)) + int(
+            sum(
+                1
+                for sym in set(carry_snapshot_before) & set(carry_snapshot_after)
+                if abs(carry_snapshot_before[sym] - carry_snapshot_after[sym]) > 1e-9
+            )
+        )
+        self._apply_trade_counts_diagnostics(carry_trades_count, overlay_trades_count)
+
         # 6. Dựng danh sách ReconcileAction
         actions_list: list[ReconcileAction] = []
         for sym in self.symbols:
@@ -2442,9 +2537,14 @@ class CarryLiveExecutor:
 
         # 2. Carry EMA gating
         carry_ema_span: int = int(getattr(self.carry_config, "ema_span", 42))
-        carry_ema_threshold_bps: float = float(
-            getattr(self.carry_config, "entry_funding_threshold", 0.000045)
-        ) * 10000.0
+        carry_ema_threshold_raw: float = float(
+            getattr(
+                self.carry_config,
+                "entry_threshold" if getattr(self, "tier1b_gate", False) else "entry_funding_threshold",
+                getattr(self.carry_config, "entry_funding_threshold", 0.000045),
+            )
+        )
+        carry_ema_threshold_bps: float = carry_ema_threshold_raw * 10000.0
 
         carry_bps_list: list[float] = []
         if metrics_at_t:
@@ -2547,10 +2647,20 @@ class CarryLiveExecutor:
 
         overlay_gate_pass: bool = bool(max_overlay_delta >= overlay_delta_threshold)
 
+        carry_selected_count = int(symbols_above_carry_threshold)
+        overlay_selected_count = int(len(target_signed_notionals))
+
+        carry_gate_verdict = "PASS" if carry_gate_pass else "BLOCK"
+        overlay_gate_verdict = "PASS" if overlay_gate_pass else "BLOCK"
         summary: str = (
             f"Warmup={warmup_hours_loaded}h (thr {warmup_min_required}h) -> {'OK' if warmup_ok else 'COLD'} | "
-            f"MaxCarryEMA={max_carry_ema_bps:.2f} bps (thr {carry_ema_threshold_bps:.2f}) -> {'PASS' if carry_gate_pass else 'BLOCK'} | "
-            f"MaxOverlayDelta={max_overlay_delta:.3f} (thr {0.08:.2f}) -> {'PASS' if overlay_gate_pass else 'BLOCK'}"
+            f"MaxCarryEMA={max_carry_ema_bps:.2f} bps (thr {carry_ema_threshold_bps:.2f}) -> {carry_gate_verdict} | "
+            f"MaxOverlayDelta={max_overlay_delta:.3f} (thr {overlay_delta_threshold:.2f}) -> {overlay_gate_verdict} | "
+            f"CarryGate: {carry_gate_verdict} (selected={carry_selected_count}, "
+            f"maxEMA={max_carry_ema_bps:.2f} bps vs thr {carry_ema_threshold_bps:.2f}) | "
+            f"OverlayGate: {overlay_gate_verdict} (selected={overlay_selected_count}, "
+            f"maxDelta={max_overlay_delta:.3f} vs thr {overlay_delta_threshold:.2f}) | "
+            f"TradesExecuted: carryTrades=0, overlayTrades=0"
         )
 
         res: dict[str, Any] = {
@@ -2561,14 +2671,46 @@ class CarryLiveExecutor:
             "max_carry_ema_bps": max_carry_ema_bps,
             "carry_ema_threshold_bps": carry_ema_threshold_bps,
             "carry_gate_pass": carry_gate_pass,
+            "carry_selected_count": carry_selected_count,
             "symbols_above_carry_threshold": symbols_above_carry_threshold,
             "max_overlay_delta": max_overlay_delta,
             "overlay_delta_threshold": overlay_delta_threshold,
             "overlay_gate_pass": overlay_gate_pass,
+            "overlay_selected_count": overlay_selected_count,
+            "carry_trades_executed": 0,
+            "overlay_trades_executed": 0,
             "summary": summary,
         }
         self.last_decision_diagnostics = res
         return res
+
+    def _apply_trade_counts_diagnostics(self, carry_trades: int, overlay_trades: int) -> None:
+        """Sprint 15: cap nhat so lenh carry/overlay da khop vao diagnostics cua chu ky hien tai."""
+        diag = self.last_decision_diagnostics
+        if not isinstance(diag, dict):
+            return
+        c_cnt = int(carry_trades)
+        o_cnt = int(overlay_trades)
+        diag["carry_trades_executed"] = c_cnt
+        diag["overlay_trades_executed"] = o_cnt
+        carry_verdict = "PASS" if diag.get("carry_gate_pass") else "BLOCK"
+        overlay_verdict = "PASS" if diag.get("overlay_gate_pass") else "BLOCK"
+        diag["summary"] = (
+            f"Warmup={int(diag.get('warmup_hours_loaded', 0))}h "
+            f"(thr {int(diag.get('warmup_min_required', 400))}h) -> "
+            f"{'OK' if diag.get('warmup_ok') else 'COLD'} | "
+            f"MaxCarryEMA={float(diag.get('max_carry_ema_bps', 0.0)):.2f} bps "
+            f"(thr {float(diag.get('carry_ema_threshold_bps', 0.0)):.2f}) -> {carry_verdict} | "
+            f"MaxOverlayDelta={float(diag.get('max_overlay_delta', 0.0)):.3f} "
+            f"(thr {float(diag.get('overlay_delta_threshold', 0.08)):.2f}) -> {overlay_verdict} | "
+            f"CarryGate: {carry_verdict} (selected={int(diag.get('carry_selected_count', 0))}, "
+            f"maxEMA={float(diag.get('max_carry_ema_bps', 0.0)):.2f} bps vs thr "
+            f"{float(diag.get('carry_ema_threshold_bps', 0.0)):.2f}) | "
+            f"OverlayGate: {overlay_verdict} (selected={int(diag.get('overlay_selected_count', 0))}, "
+            f"maxDelta={float(diag.get('max_overlay_delta', 0.0)):.3f} vs thr "
+            f"{float(diag.get('overlay_delta_threshold', 0.08)):.2f}) | "
+            f"TradesExecuted: carryTrades={c_cnt}, overlayTrades={o_cnt}"
+        )
 
     def format_status_table(self, plan: dict[str, Any]) -> str:
         """Định dạng bảng trạng thái đối soát thuần ASCII (mọi ord(ch) < 128, không emoji)."""
@@ -2679,8 +2821,19 @@ class CarryLiveExecutor:
                         float(p.get("leg2_hedged_qty", p.get("qty", 0.0))) * float(p.get("entry_perp_price", 0.0))
                         for p in self.state.carry_positions.values()
                     )
+                    ov_long = 0.0
+                    ov_short = 0.0
+                    for _sym, _pos in (getattr(self.state, "overlay_positions", {}) or {}).items():
+                        if not isinstance(_pos, dict):
+                            continue
+                        _q = abs(float(_pos.get("qty", 0.0)))
+                        _px = abs(float(_pos.get("entry_price", 0.0)))
+                        if str(_pos.get("side", "")).lower() == "short":
+                            ov_short += _q * _px
+                        else:
+                            ov_long += _q * _px
                     logger.info(
-                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=0.00 vs Short=0.00) | Kill-Switch=%s",
+                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f) | Kill-Switch=%s",
                         iterations,
                         self.capital,
                         cur_eq,
@@ -2688,6 +2841,8 @@ class CarryLiveExecutor:
                         dd_pct,
                         carry_spots,
                         carry_perps,
+                        ov_long,
+                        ov_short,
                         ks_status,
                     )
                     logger.info(

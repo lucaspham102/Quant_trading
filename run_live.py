@@ -347,6 +347,22 @@ def main(argv: list[str] | None = None) -> int:
                 carry_variant="tier1b",
                 gating_mode="smooth_conviction",
             )
+            # Sprint 15: carry gate phai dung dung Frozen Alpha Tier 1B (Sprint 11),
+            # khong dung defaults Sprint 7 (entry 1.0 bps, score co basis blend).
+            carry_config = DynamicCarryConfig(
+                initial_capital=float(args.capital),
+                ema_span=42,
+                top_k=4,
+                entry_threshold=0.000045,
+                exit_threshold=0.0,
+                min_hold_periods=63,
+                buffer_rank=3,
+                w_basis=0.0,
+                basis_ema_hours=168,
+                expected_hold_periods=63,
+                switch_rule="tier1b_buffer_rank",
+                eta_override=0.80,
+            )
             barbell_symbols = list(LIQUID_8_SYMBOLS)
             logger.info(
                 "Universe: LIQUID-8 | Venues: %s | Lot quantization: ON", sorted(venues.keys())
@@ -368,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_capital=float(args.capital),
                 reset_state=bool(args.reset_state),
                 strategy=strat,
+                tier1b_gate=True,
             )
             logger.info(
                 "Warmup requirement: >= 400h history (lookback_hours=%d).",
