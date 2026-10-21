@@ -108,6 +108,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Sprint 16: cho phep gui lenh that len testnet (mac dinh TAT, chi ky/dong goi)",
     )
     parser.add_argument(
+        "--reconcile-snapshot",
+        default=None,
+        help="Sprint 17: duong dan JSON snapshot san (spot_balances/perp_positions/exchange_equity_usd). "
+        "Neu doi soat khong khop -> fail-closed, khong mo vi the moi.",
+    )
+    parser.add_argument(
         "--symbol",
         default="BTC/USDT:USDT",
         help="Cặp giao dịch (mặc định: BTC/USDT:USDT)",
@@ -276,6 +282,62 @@ def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str])
             sig[:8] if sig else "<unsigned>",
         )
     return True
+
+
+def _run_reconcile_preflight(
+    args: argparse.Namespace,
+    executor: object,
+    prices: dict[str, float] | None = None,
+) -> dict | None:
+    """Sprint 17: doi soat state local voi snapshot san truoc khi mo vi the moi.
+
+    Fail-closed: file snapshot loi/khong doc duoc -> tra ve report BLOCKED, khong
+    bao gio cho phep mo lenh moi. Tra ve None khi khong bat ``--reconcile-snapshot``.
+    """
+    path = getattr(args, "reconcile_snapshot", None)
+    if not path:
+        return None
+    from src.cross_exchange_carry import EXCHANGE_LOT_SPECS
+    from src.exchange_reconciler import load_snapshot, reconcile_portfolio_state
+
+    try:
+        snapshot = load_snapshot(path)
+    except Exception as e:  # fail-closed: khong doc duoc snapshot = khong giao dich
+        logger.error("Reconcile: BLOCKED (SNAPSHOT_UNREADABLE) - %s", e)
+        report = {
+            "status": "SNAPSHOT_UNREADABLE",
+            "trading_allowed": False,
+            "repair_actions": [],
+            "items": [],
+            "orphans": [],
+            "phantoms": [],
+            "drifting": [],
+            "equity_gap_usd": 0.0,
+            "equity_gap_pct": 0.0,
+            "summary": f"SNAPSHOT_UNREADABLE | {e}",
+        }
+        apply = getattr(executor, "apply_reconcile_report", None)
+        if callable(apply):
+            apply(report)
+        return report
+
+    px = dict(snapshot.get("prices") or {}) if isinstance(snapshot, dict) else {}
+    if prices:
+        px.update({k: v for k, v in prices.items() if v not in px})
+    report = reconcile_portfolio_state(
+        getattr(executor, "state", {}),
+        snapshot,
+        px,
+        EXCHANGE_LOT_SPECS,
+    )
+    apply = getattr(executor, "apply_reconcile_report", None)
+    if callable(apply):
+        apply(report)
+    else:  # executor toi gian (test double) - van ghi thuoc tinh
+        setattr(executor, "reconcile_report", report)
+        setattr(executor, "reconcile_status", report.get("status"))
+        setattr(executor, "trading_allowed", bool(report.get("trading_allowed", False)))
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -465,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.mode == "testnet":
                 if not _run_testnet_signing_preflight(args, barbell_symbols):
                     return 1
+            # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
+            _run_reconcile_preflight(args, executor)
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -497,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "testnet":
             if not _run_testnet_signing_preflight(args, [args.symbol]):
                 return 1
+        # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
+        _run_reconcile_preflight(args, executor)
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,
