@@ -66,9 +66,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("paper", "live", "testnet"),
+        choices=("paper", "live", "testnet", "shadow-live"),
         default="paper",
-        help="Chế độ thực thi: paper, live hoặc testnet (mặc định: paper)",
+        help="Chế độ thực thi: paper, live, testnet hoặc shadow-live (read-only public feed, không đặt lệnh thật)",
     )
     parser.add_argument(
         "--once",
@@ -157,7 +157,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Dùng nguồn nến giả lập offline (không gọi mạng)",
     )
+    parser.add_argument(
+        "--shadow-timeout-sec",
+        type=float,
+        default=5.0,
+        help="Timeout (giây) cho mỗi request public feed ở chế độ shadow-live (mặc định 5.0)",
+    )
+    parser.add_argument(
+        "--offline-fixture",
+        default=None,
+        help="Đường dẫn JSON fixture cho shadow-live (không gọi mạng, dùng để test/CI)",
+    )
     return parser.parse_args(argv)
+
+
+def _load_shadow_fixture(fixture_path: Any) -> Any:
+    """Nạp JSON fixture cho shadow-live; trả None nếu không có đường dẫn."""
+    if not fixture_path:
+        return None
+    import json as _json
+
+    path = Path(fixture_path)
+    with open(path, "r", encoding="utf-8") as f:
+        return _json.load(f)
+
+
+def _run_shadow_live_preflight(args: argparse.Namespace, symbols: list[str]) -> bool:
+    """Chốt an toàn trước khi chạy shadow-live: chỉ đọc public feed, fail-closed.
+
+    Trả False (=> dừng, exit != 0) khi feed không healthy hoặc fixture lỗi.
+    """
+    from src.binance_public_feed import fetch_binance_shadow_snapshot
+
+    try:
+        fixture_data = _load_shadow_fixture(getattr(args, "offline_fixture", None))
+    except Exception as e:
+        logger.error("Shadow-live: cannot load offline fixture: %s", e)
+        return False
+
+    snapshot = fetch_binance_shadow_snapshot(
+        symbols,
+        timeout_sec=float(getattr(args, "shadow_timeout_sec", 5.0)),
+        fixture_data=fixture_data,
+    )
+    logger.info(
+        "Shadow-live snapshot: source=%s | healthy=%s | symbols=%d | errors=%d",
+        snapshot.get("source"),
+        snapshot.get("healthy"),
+        len(snapshot.get("symbols", {})),
+        len(snapshot.get("errors", [])),
+    )
+    for err in list(snapshot.get("errors", []))[:5]:
+        logger.warning("Shadow-live feed issue: %s", err)
+    if not snapshot.get("healthy", False):
+        logger.error("Shadow-live: public feed unhealthy -> fail-closed, no cycles executed.")
+        return False
+    logger.info("Shadow-live: read-only feed OK (no orders can be placed in this mode).")
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -181,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
         if not has_api_keys:
             logger.warning("Testnet: thieu API key, chay Public Live Feed Paper Mode")
             exec_mode = "paper"
+    elif args.mode == "shadow-live":
+        # Shadow-live: chỉ đọc public feed + mô phỏng paper, KHÔNG dùng API key, KHÔNG đặt lệnh thật.
+        logger.info("Shadow-live: read-only public feed + paper executor (no real orders).")
+        exec_mode = "paper"
 
     if args.state_file is not None:
         state_path = Path(args.state_file)
@@ -313,6 +373,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Warmup requirement: >= 400h history (lookback_hours=%d).",
                 int(getattr(executor, "lookback_hours", 720)),
             )
+            if args.mode == "shadow-live":
+                if not _run_shadow_live_preflight(args, barbell_symbols):
+                    return 1
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -336,6 +399,9 @@ def main(argv: list[str] | None = None) -> int:
             "Warmup requirement: >= 400h history (lookback_hours=%d).",
             int(getattr(executor, "lookback_hours", 720)),
         )
+        if args.mode == "shadow-live":
+            if not _run_shadow_live_preflight(args, [args.symbol]):
+                return 1
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,
