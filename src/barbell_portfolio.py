@@ -196,6 +196,171 @@ def build_overlay_data(
 from src.cross_exchange_carry import quantize_order_qty
 
 
+def _floor_to_step(qty_abs: float, step: float) -> float:
+    """Lam tron XUONG theo step_size, an toan voi sai so float."""
+    if step <= 0.0 or qty_abs <= 0.0:
+        return 0.0
+    n_steps = math.floor(qty_abs / step + 1e-9)
+    if n_steps <= 0:
+        return 0.0
+    digits = 8 if step < 0.001 else 6
+    return round(n_steps * step, digits)
+
+
+def enforce_overlay_dollar_neutrality(
+    target_notional_by_symbol: dict[str, float],
+    prices: dict[str, float],
+    lot_specs: dict[str, dict[str, float]],
+    max_imbalance_usd: float = 10.0,
+    min_viable_leg_usd: float = 50.0,
+) -> dict[str, float]:
+    """Sprint 16: bao dam overlay trung tinh USD SAU khi lam tron lot-size.
+
+    Van de Sprint 15: 1 lot BTC = 0.001 BTC ~ 96.5 USD, lon hon nhieu so voi ETH/SOL/BNB
+    (1-6 USD), nen floor tung ma doc lap lam chan chua BTC hut ~76 USD -> ro ri delta rong.
+
+    Thuat toan:
+        1. ``raw_qty = notional / price``, floor theo ``step_size``; neu notional thuc te
+           < ``min_notional`` cua ma -> qty = 0.
+        2. Tinh ``long_usd`` / ``short_usd`` sau lam tron.
+        3. Neu mot chan < ``min_viable_leg_usd`` -> tra 0.0 cho TAT CA symbol
+           (khong bao gio de lo naked long/short mot chan).
+        4. Neu ``|long_usd - short_usd| > max_imbalance_usd``: co chan lon hon theo
+           ``scale = min/max`` roi floor lai; sau do tinh chinh tung step tren ma co
+           ``step_size * price`` nho nhat cua chan lon cho toi khi gap dat cuc tieu.
+
+    Tra ve:
+        Dict map {symbol: signed_qty} (qty am = chan short).
+    """
+    result: dict[str, float] = {sym: 0.0 for sym in target_notional_by_symbol}
+    if not target_notional_by_symbol:
+        return result
+
+    # Buoc 1: luong hoa tho tung ma
+    qty: dict[str, float] = {}
+    for sym, notional in target_notional_by_symbol.items():
+        price = float(prices.get(sym, 0.0) or 0.0)
+        spec = lot_specs.get(sym) or {}
+        step = float(spec.get("step_size", 0.0) or 0.0)
+        min_notional = float(spec.get("min_notional", 10.0) or 10.0)
+        if price <= 0.0 or step <= 0.0 or notional == 0.0:
+            qty[sym] = 0.0
+            continue
+        qty_abs = _floor_to_step(abs(float(notional)) / price, step)
+        if qty_abs * price < min_notional:
+            qty[sym] = 0.0
+            continue
+        qty[sym] = math.copysign(qty_abs, float(notional))
+
+    def _leg_totals(qmap: dict[str, float]) -> tuple[float, float]:
+        long_usd = 0.0
+        short_usd = 0.0
+        for s, q in qmap.items():
+            px = float(prices.get(s, 0.0) or 0.0)
+            if q > 0.0:
+                long_usd += q * px
+            elif q < 0.0:
+                short_usd += abs(q) * px
+        return long_usd, short_usd
+
+    long_usd, short_usd = _leg_totals(qty)
+
+    # Buoc 3: chan khong du toi thieu -> huy toan bo overlay
+    if long_usd < min_viable_leg_usd or short_usd < min_viable_leg_usd:
+        return result
+
+    # Buoc 4: can bang hai chan
+    gap = abs(long_usd - short_usd)
+    if gap <= max_imbalance_usd:
+        return {s: q for s, q in qty.items()}
+
+    big_is_long = long_usd > short_usd
+    target_leg_usd = min(long_usd, short_usd)
+    larger_usd = max(long_usd, short_usd)
+    scale = target_leg_usd / larger_usd if larger_usd > 0.0 else 0.0
+
+    # 4a: co chan lon theo ty le target/larger roi floor lai
+    for sym, q in list(qty.items()):
+        is_long = q > 0.0
+        if is_long != big_is_long:
+            continue
+        px = float(prices.get(sym, 0.0) or 0.0)
+        spec = lot_specs.get(sym) or {}
+        step = float(spec.get("step_size", 0.0) or 0.0)
+        min_notional = float(spec.get("min_notional", 10.0) or 10.0)
+        if px <= 0.0 or step <= 0.0:
+            qty[sym] = 0.0
+            continue
+        scaled_abs = _floor_to_step(abs(q) * scale, step)
+        if scaled_abs * px < min_notional:
+            qty[sym] = 0.0
+            continue
+        qty[sym] = math.copysign(scaled_abs, q)
+
+    long_usd, short_usd = _leg_totals(qty)
+    if long_usd < min_viable_leg_usd or short_usd < min_viable_leg_usd:
+        return result
+
+    # 4b: tinh chinh tung step (giam chan lon HOAC tang chan nho) cho toi khi gap cuc tieu
+    for _ in range(10000):
+        long_usd, short_usd = _leg_totals(qty)
+        gap = abs(long_usd - short_usd)
+        if gap <= max_imbalance_usd:
+            break
+
+        def _best_trial(want_long: bool) -> tuple[float, dict[str, float]] | None:
+            best: tuple[float, dict[str, float]] | None = None
+            for sym, q in qty.items():
+                if q != 0.0 and (q > 0.0) != want_long:
+                    continue
+                px = float(prices.get(sym, 0.0) or 0.0)
+                spec = lot_specs.get(sym) or {}
+                step = float(spec.get("step_size", 0.0) or 0.0)
+                min_notional = float(spec.get("min_notional", 10.0) or 10.0)
+                if px <= 0.0 or step <= 0.0:
+                    continue
+                sign = 1.0 if want_long else -1.0
+                # giam 1 step
+                down_abs = _floor_to_step(abs(q) - step, step) if q != 0.0 else 0.0
+                if down_abs * px < min_notional:
+                    down_abs = 0.0
+                trial_down = dict(qty)
+                trial_down[sym] = math.copysign(down_abs, sign) if down_abs > 0.0 else 0.0
+                d_long, d_short = _leg_totals(trial_down)
+                if d_long >= min_viable_leg_usd and d_short >= min_viable_leg_usd:
+                    d_gap = abs(d_long - d_short)
+                    if best is None or d_gap < best[0]:
+                        best = (d_gap, trial_down)
+                # tang 1 step
+                up_abs = _floor_to_step(abs(q) + step, step)
+                if up_abs * px >= min_notional:
+                    trial_up = dict(qty)
+                    trial_up[sym] = math.copysign(up_abs, sign)
+                    u_long, u_short = _leg_totals(trial_up)
+                    if u_long >= min_viable_leg_usd and u_short >= min_viable_leg_usd:
+                        u_gap = abs(u_long - u_short)
+                        if best is None or u_gap < best[0]:
+                            best = (u_gap, trial_up)
+            return best
+
+        options = []
+        for want_long in (True, False):
+            cand = _best_trial(want_long)
+            if cand is not None:
+                options.append(cand)
+        if not options:
+            break
+        best_gap, best_qty = min(options, key=lambda item: item[0])
+        if best_gap >= gap:
+            break
+        qty = best_qty
+
+    long_usd, short_usd = _leg_totals(qty)
+    if long_usd < min_viable_leg_usd or short_usd < min_viable_leg_usd:
+        return result
+    return {s: q for s, q in qty.items()}
+
+
 def build_rebalance_mask(
     n_bars: int,
     rebalance_hours: int,

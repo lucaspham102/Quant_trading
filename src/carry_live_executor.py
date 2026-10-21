@@ -10,18 +10,24 @@ Module cung cấp:
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-from src.barbell_portfolio import BarbellConfig, compute_snr_dispersion
+from src.barbell_portfolio import (
+    BarbellConfig,
+    compute_snr_dispersion,
+    enforce_overlay_dollar_neutrality,
+)
 from src.config import UNIVERSE_12_SYMBOLS, TradingConfig
 from src.cross_exchange_carry import (
     DEFAULT_MIN_NOTIONAL,
@@ -79,6 +85,74 @@ def _spot_symbol_clean_name(spot_symbol: str) -> str:
     return clean
 
 
+AUDIT_SCHEMA_VERSION: str = "sprint16.cycle.v1"
+
+
+def append_audit_record(
+    path: Optional[str | Path], record: dict[str, Any]
+) -> bool:
+    """Sprint 16: ghi 1 dong JSONL audit cho chu ky hien tai (False neu khong ghi)."""
+    if not path:
+        return False
+    try:
+        target = Path(path)
+        if target.parent and str(target.parent) not in ("", "."):
+            target.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=True, sort_keys=True, default=str)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        return True
+    except Exception as exc:  # pragma: no cover - phong thu I/O
+        logger.warning("Khong ghi duoc audit log %s: %s", path, exc)
+        return False
+
+
+def build_cycle_audit_record(
+    *,
+    cycle: int,
+    mode: str,
+    execution_style: str,
+    capital: float,
+    equity: float,
+    peak_equity: float,
+    drawdown_pct: float,
+    carry_spot_usd: float,
+    carry_perp_usd: float,
+    overlay_long_usd: float,
+    overlay_short_usd: float,
+    overlay_neutrality: Optional[dict[str, Any]] = None,
+    kill_switch: bool = False,
+    diagnostics_summary: str = "",
+    actions: Optional[dict[str, Any]] = None,
+    timestamp: Optional[str] = None,
+) -> dict[str, Any]:
+    """Sprint 16: dung payload audit JSONL chuan cho 1 chu ky reconcile."""
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
+    net_delta = float(overlay_long_usd) - float(overlay_short_usd)
+    return {
+        "schema": AUDIT_SCHEMA_VERSION,
+        "ts": ts,
+        "cycle": int(cycle),
+        "mode": mode,
+        "execution_style": execution_style,
+        "capital": float(capital),
+        "equity": float(equity),
+        "peak_equity": float(peak_equity),
+        "drawdown_pct": float(drawdown_pct),
+        "carry_spot_usd": float(carry_spot_usd),
+        "carry_perp_usd": float(carry_perp_usd),
+        "overlay_long_usd": float(overlay_long_usd),
+        "overlay_short_usd": float(overlay_short_usd),
+        "overlay_net_delta_usd": net_delta,
+        "overlay_neutrality": dict(overlay_neutrality or {}),
+        "kill_switch": bool(kill_switch),
+        "diagnostics": diagnostics_summary,
+        "actions": dict(actions) if isinstance(actions, Mapping) else (
+            list(actions) if isinstance(actions, (list, tuple)) else {}
+        ),
+    }
+
+
 class CarryLiveExecutor:
     """Bộ điều phối vận hành thực tế / paper cho chiến lược Dynamic Carry xoay vòng 12 coin."""
 
@@ -131,6 +205,14 @@ class CarryLiveExecutor:
         # Sprint 15: co Tier 1B - gate carry theo pure EMA funding (khop backtest Frozen Alpha).
         self.tier1b_gate: bool = bool(tier1b_gate)
         self.last_overlay_targets: dict[str, Any] = {}
+        # Sprint 16: guard trung tinh USD sau lam tron lot-size cho overlay.
+        self.overlay_max_imbalance_usd: float = 10.0
+        self.overlay_min_viable_leg_usd: float = 50.0
+        self.last_overlay_neutrality: dict[str, Any] = {}
+        self.last_overlay_delta: dict[str, float] = {}
+        # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
+        self.audit_log_path: Optional[str] = None
+        self.audit_written: int = 0
         self.maker_no_fill_count: int = 0
         self.last_decision_diagnostics: dict[str, Any] = {}
         self._leg_states: dict[str, dict[str, Any]] = {}
@@ -975,7 +1057,7 @@ class CarryLiveExecutor:
 
         if self.overlay_config is not None and self.tier1b_gate:
             # Sprint 15: overlay parity - dung dung cong thuc smooth_conviction Sprint 11.
-            from src.barbell_portfolio import compute_live_overlay_targets
+            from src.barbell_portfolio import compute_live_overlay_targets  # noqa: F401
 
             live_targets = compute_live_overlay_targets(
                 aligned_universe,
@@ -988,6 +1070,8 @@ class CarryLiveExecutor:
             self.last_overlay_targets = live_targets
 
             equity_now = float(getattr(self.state, "current_equity", self.capital) or self.capital)
+            prices: dict[str, float] = {}
+            target_notional_signed: dict[str, float] = {}
             for sym, w in target_weights.items():
                 df = aligned_universe.get(sym)
                 if df is None or df.empty:
@@ -995,19 +1079,54 @@ class CarryLiveExecutor:
                 price = float(
                     df["perp_close"].iloc[-1] if "perp_close" in df.columns else df["close"].iloc[-1]
                 )
-                target_notional = abs(float(w)) * equity_now
-                q_qty, actual_notional = self.quantize_leg(sym, target_notional, price)
-                if q_qty <= 0.0:
+                if not np.isfinite(price) or price <= 0.0:
                     continue
+                prices[sym] = price
+                target_notional_signed[sym] = float(w) * equity_now
+
+            # Sprint 16: sau khi floor lot-size tung ma, can lai 2 chan theo USD
+            # de khong bao gio ro ri delta rong (1 lot BTC ~ 96.5 USD).
+            neutral_qty = enforce_overlay_dollar_neutrality(
+                target_notional_signed,
+                prices,
+                EXCHANGE_LOT_SPECS,
+                max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
+                min_viable_leg_usd=float(getattr(self, "overlay_min_viable_leg_usd", 50.0)),
+            )
+            self.last_overlay_neutrality = {
+                "target_notional_by_symbol": dict(target_notional_signed),
+                "neutral_qty": dict(neutral_qty),
+            }
+
+            overlay_long_usd = 0.0
+            overlay_short_usd = 0.0
+            for sym, q in neutral_qty.items():
+                if q == 0.0:
+                    continue
+                price = float(prices.get(sym, 0.0) or 0.0)
+                notional = abs(float(q)) * price
+                if q > 0.0:
+                    overlay_long_usd += notional
+                else:
+                    overlay_short_usd += notional
                 overlay_allocations.append({
                     "symbol": sym,
-                    "side": "long_perp" if float(w) > 0 else "short_perp",
+                    "side": "long_perp" if q > 0.0 else "short_perp",
                     "venue": "binance",
-                    "target_qty": float(q_qty),
-                    "notional": float(actual_notional),
+                    "target_qty": abs(float(q)),
+                    "notional": float(notional),
                     "min_notional_ok": True,
-                    "target_weight": float(w),
+                    "target_weight": float(target_notional_signed.get(sym, 0.0)) / equity_now
+                    if equity_now > 0.0
+                    else 0.0,
                 })
+            self.last_overlay_delta = {
+                "long_usd": float(overlay_long_usd),
+                "short_usd": float(overlay_short_usd),
+                "net_delta_usd": float(overlay_long_usd - overlay_short_usd),
+            }
+            if overlay_allocations:
+                overlay_active = True
         elif self.overlay_config is not None:
             lookback = int(getattr(self.overlay_config, "overlay_lookback_hours", 336))
             close_dict = {}
@@ -2833,7 +2952,7 @@ class CarryLiveExecutor:
                         else:
                             ov_long += _q * _px
                     logger.info(
-                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f) | Kill-Switch=%s",
+                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s",
                         iterations,
                         self.capital,
                         cur_eq,
@@ -2843,12 +2962,38 @@ class CarryLiveExecutor:
                         carry_perps,
                         ov_long,
                         ov_short,
+                        ov_long - ov_short,
                         ks_status,
                     )
                     logger.info(
                         "Diagnostics: %s",
                         (self.last_decision_diagnostics or {}).get("summary", "N/A")
                     )
+                    if self.audit_log_path:
+                      try:
+                        _record = build_cycle_audit_record(
+                            cycle=iterations,
+                            mode=str(self.mode),
+                            execution_style=str(self.execution_style),
+                            capital=self.capital,
+                            equity=cur_eq,
+                            peak_equity=peak_eq,
+                            drawdown_pct=dd_pct,
+                            carry_spot_usd=carry_spots,
+                            carry_perp_usd=carry_perps,
+                            overlay_long_usd=ov_long,
+                            overlay_short_usd=ov_short,
+                            overlay_neutrality=getattr(self, "last_overlay_neutrality", {}),
+                            kill_switch=ks_status,
+                            diagnostics_summary=str(
+                                (self.last_decision_diagnostics or {}).get("summary", "")
+                            ),
+                            actions=plan.get("actions") if isinstance(plan, dict) else None,
+                        )
+                        if append_audit_record(self.audit_log_path, _record):
+                            self.audit_written += 1
+                      except Exception as _audit_err:
+                        logger.warning('Audit log skipped: %s', _audit_err)
                 except Exception as e:
                     logger.error("Error in reconcile_once: %s", e, exc_info=True)
                     if once:
