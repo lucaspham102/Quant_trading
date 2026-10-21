@@ -196,6 +196,30 @@ def build_overlay_data(
 from src.cross_exchange_carry import quantize_order_qty
 
 
+def build_rebalance_mask(
+    n_bars: int,
+    rebalance_hours: int,
+    phase_offset: int = 0,
+    weights_changed: Optional[pd.Series] = None,
+    index: Optional[pd.Index] = None,
+) -> pd.Series:
+    """Sprint 15: mask tai can bang overlay, neo theo moc tuyet doi + phase offset.
+
+    ``phase_offset`` cho phep neo lai dong ho 48h khi chuoi du lieu bi cat ngan
+    (Method D bat dau tu ``split_date - warmup``), nho do moc tai can bang trung
+    voi backtest chay tren chuoi day du.
+    """
+    hours = max(1, int(rebalance_hours))
+    local = np.arange(int(n_bars))
+    base = ((local + int(phase_offset)) % hours == 0)
+    mask = pd.Series(base, index=index if index is not None else pd.RangeIndex(int(n_bars)))
+    if weights_changed is not None:
+        mask = mask | weights_changed.reindex(mask.index).fillna(False).astype(bool)
+    if n_bars > 0:
+        mask.iloc[0] = True
+    return mask.astype(bool)
+
+
 def compute_live_overlay_targets(
     aligned_universe: dict[str, pd.DataFrame],
     overlay_config: BarbellConfig,
@@ -361,6 +385,7 @@ def _simulate_barbell_equity(
     enable_dd_cushion: bool,
     reinvest_profits: bool = True,
     carry_dollar_pnl: Optional[np.ndarray] = None,
+    rebalance_phase_offset: int = 0,
 ) -> dict[str, Any]:
     """Mô phỏng động cơ vốn Barbell với lượng hóa lot-size và quản trị drawdown.
 
@@ -486,7 +511,7 @@ def _simulate_barbell_equity(
         g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
-        is_rebal = (t % rebalance_hours == 0) or w_changed[t]
+        is_rebal = ((t + int(rebalance_phase_offset)) % rebalance_hours == 0) or w_changed[t]
         fee = 0.0
 
         if is_rebal:
@@ -583,6 +608,7 @@ def run_barbell_portfolio(
     config: BarbellConfig,
     periods_per_year: int = 8760,
     trade_start_idx: int | None = None,
+    rebalance_phase_offset: int = 0,
 ) -> dict[str, Any]:
     """Mô phỏng danh mục Barbell (Core Yield Sleeve + Tactical Alpha Overlay).
 
@@ -891,10 +917,13 @@ def run_barbell_portfolio(
     # 6. Xác định mốc tái cân bằng, SNR Gate và Vol Targeting
     diff_s = raw_weights_aligned.diff().abs().sum(axis=1)
     weights_changed_mask = ~diff_s.le(1e-12)
-    hour_rebal_mask = (np.arange(n_bars) % config.overlay_rebalance_hours == 0)
-    rebal_mask = hour_rebal_mask | weights_changed_mask
-    if n_bars > 0:
-        rebal_mask.iloc[0] = True
+    rebal_mask = build_rebalance_mask(
+        n_bars,
+        config.overlay_rebalance_hours,
+        phase_offset=rebalance_phase_offset,
+        weights_changed=weights_changed_mask,
+        index=raw_weights_aligned.index,
+    )
 
     gate_arr = np.zeros(n_bars, dtype=np.float64)
     l_raw_arr = np.zeros(n_bars, dtype=np.float64)
@@ -1060,6 +1089,7 @@ def run_barbell_portfolio(
             enable_dd_cushion=config.enable_drawdown_cushion,
             reinvest_profits=bool(config.reinvest_profits),
             carry_dollar_pnl=carry_dollar_pnl_arr,
+            rebalance_phase_offset=int(rebalance_phase_offset),
         )
 
         equity_curve = pd.Series(

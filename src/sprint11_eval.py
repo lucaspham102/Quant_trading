@@ -176,6 +176,7 @@ def run_indicator_warm_cash_start(
     carry_variant: str = "tier1b",
     gating_mode: str = "smooth_conviction",
     warmup_hours: int = SPRINT14_WARMUP_HOURS,
+    phase_aligned: bool = False,
 ) -> dict[str, Any]:
     """Method D: chỉ báo đã ấm (nhìn được lịch sử trước holdout) nhưng tồn kho bằng tiền mặt.
 
@@ -209,8 +210,25 @@ def run_indicator_warm_cash_start(
         overlay_quantize_legs=True,
         reinvest_profits=bool(reinvest_profits),
     )
-    res = run_barbell_portfolio(ext_data, cfg, trade_start_idx=trade_start_idx)
-
+    # Sprint 15: đồng hồ tái cân bằng overlay là mốc tuyệt đối 48h neo từ nến đầu chuỗi.
+    # Method D cắt chuỗi tại split + warmup nên lệch pha so với backtest đầy đủ (B/C);
+    # phase_aligned=True neo lại offset theo vị trí tuyệt đối của split_date.
+    phase_offset = 0
+    if phase_aligned:
+        idx_full = None
+        for df in data.values():
+            if isinstance(df, pd.DataFrame) and not df.empty and isinstance(df.index, pd.DatetimeIndex):
+                idx_full = df.index
+                break
+        if idx_full is not None and len(idx_full) > 0:
+            global_start_idx = int(idx_full.searchsorted(ext_start, side="left"))
+            phase_offset = int(global_start_idx % int(cfg.overlay_rebalance_hours))
+    res = run_barbell_portfolio(
+        ext_data,
+        cfg,
+        trade_start_idx=trade_start_idx,
+        rebalance_phase_offset=phase_offset,
+    )
     go_inputs = res.get("go_no_go_inputs", {}) if isinstance(res, dict) else {}
     final_eq = float(go_inputs.get("final_equity", res.get("final_equity", capital)))
     net_pnl = float(final_eq - capital)
@@ -234,6 +252,8 @@ def run_indicator_warm_cash_start(
         "reinvest_profits": bool(reinvest_profits),
         "capital": float(capital),
         "warmup_hours": int(warmup_hours),
+        "phase_aligned": bool(phase_aligned),
+        "rebalance_phase_offset": int(phase_offset),
         "trade_start_idx": int(trade_start_idx),
         "trade_start_bars_available": int(len(idx_ref)) if idx_ref is not None else 0,
         "start_equity_usd": float(capital),
@@ -827,6 +847,7 @@ def compute_holdout_accounting_bridge(
     payload_compound: dict[str, Any],
     payload_fixed_base: dict[str, Any] | None = None,
     warm_cash: dict[str, Any] | None = None,
+    warm_cash_aligned: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Doi soat 3 phuong phap do lai Holdout (warm-state vs cold-start).
 
@@ -912,15 +933,53 @@ def compute_holdout_accounting_bridge(
     }
 
     indicator_blindness = (net_d - net_c) if method_d["available"] else 0.0
+
+    # Sprint 15 - do lech pha dong ho tai can bang overlay 48h (Method D vs chuoi day du).
+    d_aligned_payload = warm_cash_aligned if isinstance(warm_cash_aligned, dict) else {}
+    net_d_aligned = (
+        float(d_aligned_payload.get("net_pnl_usd", 0.0) or 0.0) if d_aligned_payload else net_d
+    )
+    method_d_aligned = {
+        "available": bool(d_aligned_payload),
+        "start_equity_usd": float(
+            d_aligned_payload.get("start_equity_usd", active_capital) or active_capital
+        ),
+        "end_equity_usd": float(
+            d_aligned_payload.get("end_equity_usd", active_capital) or active_capital
+        ),
+        "net_pnl_usd": net_d_aligned,
+        "return_on_active_capital_pct": float(
+            d_aligned_payload.get("return_on_active_capital_pct", 0.0) or 0.0
+        ),
+        "entry_fee_usd": float(d_aligned_payload.get("entry_fee_usd", 0.0) or 0.0),
+        "warmup_hours": int(d_aligned_payload.get("warmup_hours", 0) or 0),
+        "trade_start_idx": int(d_aligned_payload.get("trade_start_idx", 0) or 0),
+        "rebalance_phase_offset": int(
+            d_aligned_payload.get("rebalance_phase_offset", 0) or 0
+        ),
+    }
+    clock_phase_drift = (
+        (net_d_aligned - net_d) if (method_d["available"] and method_d_aligned["available"]) else 0.0
+    )
+
     inventory_carryover = (
         (float(fixed["net_pnl_usd"]) - net_d - entry_fee) if method_d["available"] else warmup_drag
     )
+    # Dong nhat thuc: Fee + Blindness + ClockPhaseDrift + PureCarryover = B - C
+    pure_inventory_carryover = (
+        (float(fixed["net_pnl_usd"]) - net_d_aligned - entry_fee)
+        if method_d_aligned["available"]
+        else inventory_carryover
+    )
+    explained_total = entry_fee + indicator_blindness + clock_phase_drift + pure_inventory_carryover
     warm_cash_decomposition = {
         "cold_start_initial_entry_fee_usd": float(entry_fee),
         "indicator_blindness_drag_usd": float(indicator_blindness),
+        "clock_phase_drift_usd": float(clock_phase_drift),
+        "pure_inventory_carryover_usd": float(pure_inventory_carryover),
         "inventory_carryover_diff_usd": float(inventory_carryover),
-        "explained_total_usd": float(entry_fee + indicator_blindness + inventory_carryover),
-        "unexplained_total_usd": float(cold_start_total_drag - (entry_fee + indicator_blindness + inventory_carryover)),
+        "explained_total_usd": float(explained_total),
+        "unexplained_total_usd": float(cold_start_total_drag - explained_total),
     }
 
     return {
@@ -930,7 +989,17 @@ def compute_holdout_accounting_bridge(
         "continuous_fixed_base": fixed,
         "standalone_cold_start": cold,
         "indicator_warm_cash_start": method_d,
+        "indicator_warm_cash_start_clock_aligned": method_d_aligned,
         "warm_cash_decomposition": warm_cash_decomposition,
+        "clock_phase_bridge": {
+            "D_unaligned_clock_usd": float(net_d),
+            "D_clock_aligned_usd": float(net_d_aligned),
+            "clock_phase_drift_usd": float(clock_phase_drift),
+            "pure_inventory_carryover_usd": float(pure_inventory_carryover),
+            "identity_rhs_usd": float(fixed["net_pnl_usd"] - net_c),
+            "identity_lhs_usd": float(explained_total),
+            "identity_gap_usd": float((fixed["net_pnl_usd"] - net_c) - explained_total),
+        },
         "bridge_decomposition": {
             "compounding_scale_effect_usd": float(compounding_scale_effect),
             "cold_start_total_drag_usd": float(cold_start_total_drag),
