@@ -167,6 +167,8 @@ class BotState:
     peak_equity: float = 400.0
     strategy: Optional[str] = None
     kill_switch_triggered: bool = False
+    kill_switch_pending_close: bool = False
+    drift_unrepairable_symbols: dict[str, float] = field(default_factory=dict)
 
 
 class StateStore:
@@ -178,7 +180,14 @@ class StateStore:
     def save(self, state: BotState | dict[str, Any]) -> Path:
         """Ghi nguyên tử trạng thái ra file JSON qua file tạm cùng thư mục."""
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = dataclasses.asdict(state) if isinstance(state, BotState) else dict(state)
+        if isinstance(state, BotState):
+            payload = dataclasses.asdict(state)
+        else:
+            payload = dict(state)
+            if "kill_switch_pending_close" not in payload:
+                payload["kill_switch_pending_close"] = False
+            if "drift_unrepairable_symbols" not in payload:
+                payload["drift_unrepairable_symbols"] = {}
         tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
 
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -207,6 +216,9 @@ class StateStore:
                 initial_capital=cap,
                 peak_equity=cap,
                 strategy=strategy,
+                kill_switch_triggered=False,
+                kill_switch_pending_close=False,
+                drift_unrepairable_symbols={},
             )
 
         with open(self.file_path, "r", encoding="utf-8") as f:
@@ -214,10 +226,20 @@ class StateStore:
 
         had_explicit_initial = "initial_capital" in raw
 
+        raw_unrepairable = raw.get("drift_unrepairable_symbols", {})
+        drift_unrepairable: dict[str, float] = {}
+        if isinstance(raw_unrepairable, dict):
+            for k, v in raw_unrepairable.items():
+                try:
+                    drift_unrepairable[str(k)] = float(v)
+                except (ValueError, TypeError):
+                    continue
+
         if strategy is not None and raw.get("strategy") is not None and raw.get("strategy") != strategy:
             sticky_kill = bool(raw.get("kill_switch_triggered", False))
-            if sticky_kill:
-                logger.error("State cua chien luoc khac dang co kill-switch=True -> giu nguyen co")
+            sticky_pending_close = bool(raw.get("kill_switch_pending_close", False))
+            if sticky_kill or sticky_pending_close:
+                logger.error("State cua chien luoc khac dang co kill-switch/pending-close=True -> giu nguyen co")
             logger.warning(
                 "Strategy mismatch in state file: expected %s, found %s. Resetting state.",
                 strategy,
@@ -230,6 +252,8 @@ class StateStore:
                 peak_equity=cap,
                 strategy=strategy,
                 kill_switch_triggered=sticky_kill,
+                kill_switch_pending_close=sticky_pending_close,
+                drift_unrepairable_symbols=drift_unrepairable,
             )
 
         open_pos = raw.get("open_position")
@@ -275,12 +299,14 @@ class StateStore:
         raw_peak_eq = raw.get("peak_equity")
         raw_strat = raw.get("strategy")
         raw_kill = raw.get("kill_switch_triggered", False)
+        raw_pending_close = raw.get("kill_switch_pending_close", False)
 
         cur_eq = float(raw.get("current_equity", cap))
         init_cap = float(raw_init_cap) if raw_init_cap is not None else cap
         peak_eq = float(raw_peak_eq) if raw_peak_eq is not None else max(cur_eq, init_cap)
         strat = str(raw_strat) if raw_strat is not None else None
         kill_switch = bool(raw_kill)
+        kill_switch_pending = bool(raw_pending_close)
 
         state = BotState(
             open_position=dict(open_pos) if isinstance(open_pos, dict) else None,
@@ -304,6 +330,8 @@ class StateStore:
             peak_equity=peak_eq,
             strategy=strat,
             kill_switch_triggered=kill_switch,
+            kill_switch_pending_close=kill_switch_pending,
+            drift_unrepairable_symbols=drift_unrepairable,
         )
 
         if initial_capital is not None:
