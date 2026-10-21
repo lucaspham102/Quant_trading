@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.barbell_portfolio import (
     BarbellConfig,
+    compute_adaptive_min_viable_leg_usd,
     compute_snr_dispersion,
     enforce_overlay_dollar_neutrality,
 )
@@ -207,7 +208,8 @@ class CarryLiveExecutor:
         self.last_overlay_targets: dict[str, Any] = {}
         # Sprint 16: guard trung tinh USD sau lam tron lot-size cho overlay.
         self.overlay_max_imbalance_usd: float = 10.0
-        self.overlay_min_viable_leg_usd: float = 50.0
+        # Sprint 17: None = tu co gian theo von hoat dong (adaptive), so cu the = ghim cung.
+        self.overlay_min_viable_leg_usd: Optional[float] = None
         self.last_overlay_neutrality: dict[str, Any] = {}
         self.last_overlay_delta: dict[str, float] = {}
         # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
@@ -1086,16 +1088,25 @@ class CarryLiveExecutor:
 
             # Sprint 16: sau khi floor lot-size tung ma, can lai 2 chan theo USD
             # de khong bao gio ro ri delta rong (1 lot BTC ~ 96.5 USD).
+            # Sprint 17: nguong toi thieu moi chan tu co gian theo von hoat dong
+            # (von nho 400-600 USDT van chay duoc, khong bi tat toan bo sleeve).
+            _min_leg_override = getattr(self, "overlay_min_viable_leg_usd", None)
+            if _min_leg_override is None:
+                _min_leg_usd = compute_adaptive_min_viable_leg_usd(equity_now)
+            else:
+                _min_leg_usd = float(_min_leg_override)
             neutral_qty = enforce_overlay_dollar_neutrality(
                 target_notional_signed,
                 prices,
                 EXCHANGE_LOT_SPECS,
                 max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
-                min_viable_leg_usd=float(getattr(self, "overlay_min_viable_leg_usd", 50.0)),
+                min_viable_leg_usd=_min_leg_usd,
             )
             self.last_overlay_neutrality = {
                 "target_notional_by_symbol": dict(target_notional_signed),
                 "neutral_qty": dict(neutral_qty),
+                "min_viable_leg_usd": float(_min_leg_usd),
+                "adaptive": _min_leg_override is None,
             }
 
             overlay_long_usd = 0.0

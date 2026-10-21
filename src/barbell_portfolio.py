@@ -207,12 +207,32 @@ def _floor_to_step(qty_abs: float, step: float) -> float:
     return round(n_steps * step, digits)
 
 
+def compute_adaptive_min_viable_leg_usd(
+    active_capital: float,
+    min_floor_usd: float = 10.0,
+    max_cap_usd: float = 50.0,
+    capital_ratio: float = 0.015,
+) -> float:
+    """Sprint 17: nguong toi thieu moi chan overlay ty le theo von hoat dong.
+
+    ``max(10, min(50, capital * 1.5%))`` - o von 3,000 USDT giu nguyen 45-50 USDT
+    (tuong thich Sprint 16), nhung khi chay testnet von 400-600 USDT nguong tu ha
+    xuong 10 USDT (van > ``min_notional`` 5-10 USDT cua san va van khoa tuyet doi
+    khi mot chan bi lam tron ve 0).
+    """
+    capital = float(active_capital)
+    if capital != capital or capital < 0.0:  # NaN hoac am
+        capital = 0.0
+    return float(max(float(min_floor_usd), min(float(max_cap_usd), capital * float(capital_ratio))))
+
+
 def enforce_overlay_dollar_neutrality(
     target_notional_by_symbol: dict[str, float],
     prices: dict[str, float],
     lot_specs: dict[str, dict[str, float]],
     max_imbalance_usd: float = 10.0,
-    min_viable_leg_usd: float = 50.0,
+    min_viable_leg_usd: float | None = None,
+    active_capital: float | None = None,
 ) -> dict[str, float]:
     """Sprint 16: bao dam overlay trung tinh USD SAU khi lam tron lot-size.
 
@@ -231,7 +251,18 @@ def enforce_overlay_dollar_neutrality(
 
     Tra ve:
         Dict map {symbol: signed_qty} (qty am = chan short).
+
+    Sprint 17: ``min_viable_leg_usd=None`` (mac dinh) -> tu tinh theo von hoat dong
+    (``active_capital`` neu co, nguoc lai 50.0 de giu tuong thich Sprint 16). Truyen
+    so cu the thi dung dung so do (toan bo test Sprint 16 van chay nguyen).
     """
+    if min_viable_leg_usd is None:
+        min_viable_leg_usd = (
+            compute_adaptive_min_viable_leg_usd(float(active_capital))
+            if active_capital is not None and float(active_capital) > 0.0
+            else 50.0
+        )
+    min_viable_leg_usd = float(min_viable_leg_usd)
     result: dict[str, float] = {sym: 0.0 for sym in target_notional_by_symbol}
     if not target_notional_by_symbol:
         return result
