@@ -171,6 +171,16 @@ def build_cycle_audit_record(
     }
 
 
+def compute_warmup_hours_loaded(aligned_universe: Mapping[str, Any] | None) -> int:
+    """Sprint 18: so gio lich su thuc te da nap (lay min tren tat ca symbol)."""
+    lengths = [
+        len(df)
+        for df in (aligned_universe or {}).values()
+        if df is not None and len(df) > 0
+    ]
+    return int(min(lengths)) if lengths else 0
+
+
 class CarryLiveExecutor:
     """Bộ điều phối vận hành thực tế / paper cho chiến lược Dynamic Carry xoay vòng 12 coin."""
 
@@ -1069,12 +1079,7 @@ class CarryLiveExecutor:
         Tra ve ``warmup_ready == False`` khi lich su nap vao < 720h: luc do executor
         phai chan mo vi the moi voi ly do ``WARMUP_INSUFFICIENT_BELOW_720H``.
         """
-        lengths = [
-            len(df)
-            for df in (aligned_universe or {}).values()
-            if df is not None and len(df) > 0
-        ]
-        loaded = int(min(lengths)) if lengths else 0
+        loaded = compute_warmup_hours_loaded(aligned_universe)
         required = int(getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS) or WARMUP_MIN_HOURS)
         ready = bool(loaded >= required)
         self.warmup_hours_loaded = loaded
