@@ -1375,8 +1375,13 @@ def compute_holdout_accounting_bridge(
         "overlay_net_pnl_usd": float(e_payload.get("overlay_net_pnl_usd", 0.0) or 0.0),
         "entry_fee_usd": float(e_payload.get("entry_fee_usd", 0.0) or 0.0),
         "gap_b_minus_e_usd": (float(fixed["net_pnl_usd"]) - net_e) if e_payload else 0.0,
+        # Sprint 17: add-back dung phi vao lenh CUA CHINH E (E tra trong cua so holdout,
+        # con B da tra truoc split) - dung `entry_fee` cua A/B se tinh trung hai lan
+        # va lam sai lech con so (2.22 vs 3.97).
         "revised_pure_carryover_usd": (
-            (float(fixed["net_pnl_usd"]) - net_e - entry_fee) if e_payload else 0.0
+            (float(fixed["net_pnl_usd"]) - net_e - float(e_payload.get("entry_fee_usd", 0.0) or 0.0))
+            if e_payload
+            else 0.0
         ),
         "sleeve_attribution": _extract_sleeve_attribution(e_payload),
     }

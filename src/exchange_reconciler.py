@@ -41,9 +41,12 @@ def normalize_symbol(symbol: str) -> str:
 
 
 def load_snapshot(path: str | Path) -> dict[str, Any]:
-    """Doc file JSON exchange snapshot. Yeu cau root phai la dict."""
+    """Doc file JSON exchange snapshot. Yeu cau root phai la dict.
+
+    Dung ``utf-8-sig`` de chap nhan ca file co BOM (Windows/PowerShell hay sinh ra).
+    """
     p = Path(path)
-    with p.open("r", encoding="utf-8") as f:
+    with p.open("r", encoding="utf-8-sig") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError("JSON root must be a dict")

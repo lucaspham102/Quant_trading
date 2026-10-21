@@ -228,3 +228,27 @@ def test_bridge_without_e_measure_is_safe() -> None:
     assert bridge["e_true_fixed_warm_cash"]["available"] is False
     assert bridge["e_true_fixed_warm_cash"]["gap_b_minus_e_usd"] == 0.0
     assert bridge["overlay_divergence_forensics"] == {"available": False}
+
+def test_revised_carryover_uses_e_own_entry_fee() -> None:
+    """Sprint 17: add-back phai dung phi vao lenh cua E, khong dung phi cua A/B."""
+    compound = _payload(159.15)
+    fixed = _payload(118.50)
+    warm_cash = {"net_pnl_usd": 81.73, "entry_fee_usd": 2.02, "label": "D"}
+    warm_cash_aligned = {"net_pnl_usd": 76.09, "entry_fee_usd": 2.02, "label": "Dp"}
+    warm_cash_converged = {
+        "net_pnl_usd": 114.27,
+        "entry_fee_usd": 0.27,
+        "warmup_hours": 720,
+        "rebalance_phase_offset": 46,
+        "overlay_net_pnl_usd": 73.26,
+    }
+    bridge = compute_holdout_accounting_bridge(
+        compound,
+        fixed,
+        warm_cash=warm_cash,
+        warm_cash_aligned=warm_cash_aligned,
+        warm_cash_converged=warm_cash_converged,
+    )
+    e_block = bridge["e_true_fixed_warm_cash"]
+    assert e_block["entry_fee_usd"] == pytest.approx(0.27)
+    assert e_block["revised_pure_carryover_usd"] == pytest.approx(118.50 - 114.27 - 0.27)

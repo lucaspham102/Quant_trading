@@ -254,3 +254,68 @@ def test_executor_apply_reconcile_report_gates_new_entries() -> None:
 
     assert alloc.get("reconcile_blocked") is True
     assert alloc["carry_sleeve"]["allocations"] == []
+
+def test_load_snapshot_accepts_utf8_bom(tmp_path) -> None:
+    """Windows/PowerShell hay ghi BOM - snapshot van phai doc duoc."""
+    p = tmp_path / "snap_bom.json"
+    p.write_text('\ufeff{"spot_balances": {}, "perp_positions": {}, "exchange_equity_usd": 3000.0}', encoding="utf-8")
+    snap = load_snapshot(p)
+    assert snap["exchange_equity_usd"] == 3000.0
+
+
+def test_executor_reconcile_dashboard_label() -> None:
+    ex = CarryLiveExecutor.__new__(CarryLiveExecutor)
+    ex.reconcile_status = None
+    ex.trading_allowed = True
+    assert CarryLiveExecutor._reconcile_dashboard_label(ex) == "OFF"
+
+    ex.reconcile_status = "SYNCED"
+    assert CarryLiveExecutor._reconcile_dashboard_label(ex) == "SYNCED"
+
+    ex.reconcile_status = "PHANTOM_IN_STATE"
+    ex.trading_allowed = False
+    assert CarryLiveExecutor._reconcile_dashboard_label(ex) == "BLOCKED (PHANTOM_IN_STATE)"
+
+
+def test_executor_apply_none_report_restores_trading() -> None:
+    ex = CarryLiveExecutor.__new__(CarryLiveExecutor)
+    ex.reconcile_report = {"status": "QTY_DRIFT"}
+    ex.reconcile_status = "QTY_DRIFT"
+    ex.trading_allowed = False
+    assert CarryLiveExecutor.apply_reconcile_report(ex, None) is True
+    assert ex.trading_allowed is True
+    assert ex.reconcile_status is None
+
+
+def test_audit_record_carries_reconcile_status() -> None:
+    from src.carry_live_executor import build_cycle_audit_record
+
+    rec = build_cycle_audit_record(
+        cycle=1,
+        mode="paper",
+        execution_style="maker_taker_hedge",
+        capital=3000.0,
+        equity=3000.0,
+        peak_equity=3000.0,
+        drawdown_pct=0.0,
+        carry_spot_usd=0.0,
+        carry_perp_usd=0.0,
+        overlay_long_usd=0.0,
+        overlay_short_usd=0.0,
+        reconcile_status="ORPHAN_ON_EXCHANGE",
+    )
+    assert rec["reconcile_status"] == "ORPHAN_ON_EXCHANGE"
+    rec_off = build_cycle_audit_record(
+        cycle=1,
+        mode="paper",
+        execution_style="maker_taker_hedge",
+        capital=3000.0,
+        equity=3000.0,
+        peak_equity=3000.0,
+        drawdown_pct=0.0,
+        carry_spot_usd=0.0,
+        carry_perp_usd=0.0,
+        overlay_long_usd=0.0,
+        overlay_short_usd=0.0,
+    )
+    assert rec_off["reconcile_status"] is None

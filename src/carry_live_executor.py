@@ -2300,6 +2300,22 @@ class CarryLiveExecutor:
                 resolved_actions[sym] = "SKIP"
                 resolved_reasons[sym] = raw_rs
 
+        # Sprint 17: doi soat san chua khop -> fail-closed, chan MOI vi the moi
+        # (carry lan overlay); dong/giam vi the van duoc phep de giam rui ro.
+        if not getattr(self, "trading_allowed", True):
+            blocked_open = 0
+            for _sym, _act in list(resolved_actions.items()):
+                if _act == "OPEN_DELTA_NEUTRAL":
+                    resolved_actions[_sym] = "SKIP"
+                    resolved_reasons[_sym] = f"RECONCILE_BLOCKED_{getattr(self, 'reconcile_status', 'BLOCKED')}"
+                    blocked_open += 1
+            if blocked_open:
+                logger.warning(
+                    "Reconcile: BLOCKED (%s) -> chan %d lanh the carry moi trong chu ky nay.",
+                    getattr(self, "reconcile_status", "BLOCKED"),
+                    blocked_open,
+                )
+
         # PR-4: Kiem tra va sua delta drift truoc khi thuc thi lenh chu ky
         try:
             drift_items = self.audit_delta_drift(aligned_universe)
