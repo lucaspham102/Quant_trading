@@ -1031,6 +1031,7 @@ def run_binance_tier1_plus_carry(
     exit_funding_threshold: float = -0.00001,
     eta: float = 0.80,
     periods_per_year: int = 8760,
+    trade_start_idx: int | None = None,
 ) -> dict[str, Any]:
     """Mô phỏng Bar-by-bar chiến lược Binance Single-Venue Tier 1+ Carry.
 
@@ -1293,6 +1294,11 @@ def run_binance_tier1_plus_carry(
 
     # 5. Vòng lặp mô phỏng bar-by-bar (1 tầng trên trục thời gian)
     for t_idx, t in enumerate(common_index):
+        # Sprint 14: giu 100% tien mat truoc moc trade_start_idx (chi warm indicator).
+        if trade_start_idx is not None and t_idx < int(trade_start_idx):
+            equity_vals[t_idx] = equity
+            continue
+
         notional_start = {s: notional[s] for s in sym_universe}
 
         # -------------------------------------------------------------
