@@ -331,7 +331,9 @@ def _simulate_barbell_equity(
         if is_funding_bar[t]:
             gross_ret -= float(np.sum(w_cur * funding_arr[t]))
 
-        g_base = prev_eq if reinvest_profits else float(initial_capital)
+        # R2-3: active_capital cho overlay g_base
+        active_capital_overlay = max(0.0, min(float(initial_capital), float(prev_eq)))
+        g_base = prev_eq if reinvest_profits else active_capital_overlay
         g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
@@ -347,7 +349,15 @@ def _simulate_barbell_equity(
             if reinvest_profits:
                 eq_mid = prev_eq + carry_returns[t] * prev_eq + g_usd
             else:
-                eq_mid = float(initial_capital)
+                # R2-3: active_capital tu equity ngay truoc buoc rebalance
+                carry_usd_step = (
+                    float(carry_dollar_pnl[t])
+                    if carry_dollar_pnl is not None and t < len(carry_dollar_pnl)
+                    else float(carry_returns[t]) * float(initial_capital)
+                )
+                cur_eq = prev_eq + carry_usd_step + g_usd
+                active_capital = max(0.0, min(float(initial_capital), float(cur_eq)))
+                eq_mid = active_capital
             if eq_mid <= 0.0:
                 eq_mid = 0.0
 

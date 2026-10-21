@@ -170,6 +170,7 @@ def run_sprint11_tiers(
     split_date: str = SPRINT11_SPLIT_DATE,
     holdout_end: str = SPRINT11_HOLDOUT_END,
     benchmark_returns: pd.Series | None = None,
+    reinvest_profits: bool = True,
 ) -> dict[str, Any]:
     """Mo phong 4 combo tham so Sprint 11 tren toan bo ky va holdout.
 
@@ -195,6 +196,7 @@ def run_sprint11_tiers(
                 gating_mode=gating,
                 enable_snr_gate=True,
                 overlay_quantize_legs=True,
+                reinvest_profits=bool(reinvest_profits),
             )
 
             # 1. Chay tren toan bo ky
@@ -257,6 +259,12 @@ def run_sprint11_tiers(
             h_ov_net = float(res_h.get("overlay_net_pnl", h_metrics.get("overlay_net_pnl", 0.0)))
             h_rets = res_h.get("returns")
             h_days = float(len(h_rets) / 24.0) if isinstance(h_rets, pd.Series) and len(h_rets) > 0 else 0.0
+
+            # 2a-bis. Phi mo vi the ngay dau cua Standalone Cold-Start (24 bar dau)
+            h_resim_entry_fee = 0.0
+            h_resim_attr = res_h.get("attribution_series")
+            if isinstance(h_resim_attr, pd.DataFrame) and not h_resim_attr.empty and "fees" in h_resim_attr.columns:
+                h_resim_entry_fee = float(h_resim_attr["fees"].iloc[:24].sum())
 
             # 2b. Holdout theo phuong phap cua so lien tuc (slice tu ket qua toan ky)
             h_start_ts = pd.Timestamp(split_date, tz="UTC")
@@ -323,6 +331,7 @@ def run_sprint11_tiers(
                 "holdout_return_on_compounded_equity_pct": h_ret_compound_pct,
                 "holdout_return_resim_pct": h_ret_pct,
                 "holdout_net_pnl_resim": float(h_final_eq - float(capital)),
+                "holdout_resim_entry_fee_usd": float(h_resim_entry_fee),
                 "reinvest_profits": bool(getattr(cfg, "reinvest_profits", True)),
                 "holdout_carry_pnl": (h_carry_slice if not (h_carry_slice == 0.0 and h_carry_pnl > 0.0) else h_carry_pnl),
                 "holdout_overlay_net_pnl": (h_overlay_slice if not (h_overlay_slice == 0.0 and h_ov_net != 0.0) else h_ov_net),
@@ -708,6 +717,110 @@ def evaluate_sprint11_go_no_go(
         "go": go,
         "criteria": criteria,
         "reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6b. compute_holdout_accounting_bridge
+# ---------------------------------------------------------------------------
+def _find_primary_row(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Tim dong primary (tier1b/smooth_conviction) trong payload Sprint 11."""
+    tiers = payload.get("tiers", payload) if isinstance(payload, dict) else {}
+    rows = tiers.get("rows", []) if isinstance(tiers, dict) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("combo")) == "tier1b/smooth_conviction":
+            return row
+    for row in rows:
+        if isinstance(row, dict) and row.get("error") is None:
+            return row
+    return None
+
+
+def compute_holdout_accounting_bridge(
+    payload_compound: dict[str, Any],
+    payload_fixed_base: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Doi soat 3 phuong phap do lai Holdout (warm-state vs cold-start).
+
+    - ``continuous_compound``: chay lien tuc tu 2023-04 voi ``reinvest_profits=True``,
+      do lai phan PnL trong cua so holdout (phuong phap slice lien tuc).
+    - ``continuous_fixed_base``: cung chay lien tuc nhung ``reinvest_profits=False``,
+      von hoat dong neo o ``initial_capital`` (co clamp khi equity giam duoi von goc).
+    - ``standalone_cold_start``: chay lai rieng cua so holdout tu 100% tien mat.
+
+    Dang thuc bao toan (sai so < 1e-6):
+    ``A.net_pnl = C.net_pnl + compounding_scale_effect + cold_start_total_drag``.
+    """
+    row_a = _find_primary_row(payload_compound if isinstance(payload_compound, dict) else {})
+    if row_a is None:
+        raise ValueError("Khong tim thay dong ket qua trong payload compound")
+
+    active_capital = 0.0
+    tiers_c = payload_compound.get("tiers", payload_compound) if isinstance(payload_compound, dict) else {}
+    meta = payload_compound.get("meta", {}) if isinstance(payload_compound, dict) else {}
+    if isinstance(meta, dict) and meta.get("capital") is not None:
+        active_capital = float(meta["capital"])
+    if active_capital <= 0.0:
+        active_capital = float(tiers_c.get("capital", 3000.0)) if isinstance(tiers_c, dict) else 3000.0
+
+    start_a = float(row_a.get("holdout_equity_start", active_capital) or active_capital)
+    net_a = float(row_a.get("holdout_net_pnl", 0.0))
+    compound = {
+        "start_equity_usd": start_a,
+        "end_equity_usd": start_a + net_a,
+        "net_pnl_usd": net_a,
+        "return_on_start_equity_pct": (net_a / start_a * 100.0) if start_a > 0 else 0.0,
+    }
+
+    fixed_row = _find_primary_row(payload_fixed_base) if payload_fixed_base else None
+    if fixed_row is None:
+        fixed = {
+            "active_capital_usd": active_capital,
+            "start_equity_usd": start_a,
+            "end_equity_usd": start_a,
+            "net_pnl_usd": 0.0,
+            "return_on_active_capital_pct": 0.0,
+            "available": False,
+        }
+    else:
+        start_b = float(fixed_row.get("holdout_equity_start", active_capital) or active_capital)
+        net_b = float(fixed_row.get("holdout_net_pnl", 0.0))
+        fixed = {
+            "active_capital_usd": active_capital,
+            "start_equity_usd": start_b,
+            "end_equity_usd": start_b + net_b,
+            "net_pnl_usd": net_b,
+            "return_on_active_capital_pct": (net_b / active_capital * 100.0) if active_capital > 0 else 0.0,
+            "available": True,
+        }
+
+    net_c = float(row_a.get("holdout_net_pnl_resim", 0.0))
+    cold = {
+        "start_equity_usd": active_capital,
+        "end_equity_usd": active_capital + net_c,
+        "net_pnl_usd": net_c,
+        "return_on_active_capital_pct": (net_c / active_capital * 100.0) if active_capital > 0 else 0.0,
+    }
+
+    compounding_scale_effect = net_a - float(fixed["net_pnl_usd"])
+    cold_start_total_drag = float(fixed["net_pnl_usd"]) - net_c
+    entry_fee = float(row_a.get("holdout_resim_entry_fee_usd", 0.0) or 0.0)
+    warmup_drag = cold_start_total_drag - entry_fee
+
+    return {
+        "holdout_days": float(row_a.get("holdout_days", 0.0) or 0.0),
+        "active_capital_usd": active_capital,
+        "continuous_compound": compound,
+        "continuous_fixed_base": fixed,
+        "standalone_cold_start": cold,
+        "bridge_decomposition": {
+            "compounding_scale_effect_usd": float(compounding_scale_effect),
+            "cold_start_total_drag_usd": float(cold_start_total_drag),
+            "cold_start_initial_entry_fee_usd": float(entry_fee),
+            "warmup_and_min_hold_path_diff_usd": float(warmup_drag),
+        },
     }
 
 

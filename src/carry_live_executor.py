@@ -259,6 +259,35 @@ class CarryLiveExecutor:
                 logger.warning("fetch_order_book failed in check_orderbook_spread for %s on %s: %s", target_sym, exchange_name, e)
         return (0.0, 0.0)
 
+    def _reject_leg1_spread(self, symbol: str, resolved_spot_symbol: str, reason: str) -> dict[str, Any]:
+        """Ghi nhan va tra ve payload khi chan dat lenh vi spread/orderbook khong hop le."""
+        leg1_status = "SKIPPED"
+        execution_state = "IDLE"
+        self._update_leg_state(symbol, leg1_status, 0.0, 0.0, execution_state)
+        skip_state = {
+            "symbol": symbol,
+            "spot_symbol": resolved_spot_symbol,
+            "leg1_order_id": None,
+            "leg1_status": leg1_status,
+            "leg1_filled_qty": 0.0,
+            "leg2_hedged_qty": 0.0,
+            "execution_state": execution_state,
+            "skip_reason": reason,
+            "spread_bps": 0.0,
+        }
+        self._leg_states.setdefault(symbol, {}).update(skip_state)
+        if symbol in self.state.carry_positions:
+            self.state.carry_positions[symbol].update(skip_state)
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "spread_bps": 0.0,
+            "symbol": symbol,
+            "order_id": None,
+            "filled": 0.0,
+            "qty": 0.0,
+        }
+
     def place_maker_leg1(
         self,
         symbol: str,
@@ -299,41 +328,30 @@ class CarryLiveExecutor:
             except Exception as e:
                 logger.warning("fetch_order_book failed for %s on %s: %s", order_symbol, ex_name, e)
 
-        book_ok = (
-            best_bid is not None
-            and best_ask is not None
-            and best_bid > 0
-            and best_ask > best_bid
-        )
+        book_present = best_bid is not None and best_ask is not None
+        invalid_reason: Optional[str] = None
+        if book_present:
+            if best_bid <= 0 or best_ask <= 0:
+                invalid_reason = "SPREAD_INVALID_BOOK"
+            elif best_ask < best_bid:
+                invalid_reason = "SPREAD_CROSSED_BOOK"
+
+        book_ok = book_present and invalid_reason is None
+
+        # R2-4: so loi/crossed book bi chan o MOI che do (paper, testnet, live)
+        if invalid_reason is not None:
+            logger.error(
+                "%s %s: orderbook khong hop le (bid=%s ask=%s) -> huy dat lenh",
+                invalid_reason,
+                symbol,
+                best_bid,
+                best_ask,
+            )
+            return self._reject_leg1_spread(symbol, resolved_spot_symbol, invalid_reason)
 
         if not book_ok and self.mode in ("live", "testnet"):
             logger.error("SPREAD_UNKNOWN %s: khong lay duoc orderbook -> huy dat lenh", symbol)
-            leg1_status = "SKIPPED"
-            execution_state = "IDLE"
-            self._update_leg_state(symbol, leg1_status, 0.0, 0.0, execution_state)
-            skip_state = {
-                "symbol": symbol,
-                "spot_symbol": resolved_spot_symbol,
-                "leg1_order_id": None,
-                "leg1_status": leg1_status,
-                "leg1_filled_qty": 0.0,
-                "leg2_hedged_qty": 0.0,
-                "execution_state": execution_state,
-                "skip_reason": "SPREAD_UNKNOWN",
-                "spread_bps": 0.0,
-            }
-            self._leg_states.setdefault(symbol, {}).update(skip_state)
-            if symbol in self.state.carry_positions:
-                self.state.carry_positions[symbol].update(skip_state)
-            return {
-                "status": "skipped",
-                "reason": "SPREAD_UNKNOWN",
-                "spread_bps": 0.0,
-                "symbol": symbol,
-                "order_id": None,
-                "filled": 0.0,
-                "qty": 0.0,
-            }
+            return self._reject_leg1_spread(symbol, resolved_spot_symbol, "SPREAD_UNKNOWN")
 
         spread_bps = 0.0
         if book_ok:
@@ -1080,6 +1098,16 @@ class CarryLiveExecutor:
         if not hasattr(self.state, "overlay_orders") or not isinstance(self.state.overlay_orders, list):
             self.state.overlay_orders = []
 
+        if getattr(self.state, "kill_switch_triggered", False) or getattr(self.state, "kill_switch_pending_close", False):
+            logger.warning("KILL-SWITCH active: blocking overlay rebalance")
+            return {
+                "orders": [],
+                "n_orders": 0,
+                "skipped": 0,
+                "turnover_notional": 0.0,
+                "functional": bool(self.executor_functional),
+            }
+
         current: dict[str, float] = {}
         for sym, pos in self.state.overlay_positions.items():
             if isinstance(pos, dict):
@@ -1133,6 +1161,28 @@ class CarryLiveExecutor:
                 continue
 
             side = "buy" if delta > 0 else "sell"
+            if abs(target) <= 1e-12:
+                close_ok = self._close_overlay_position_emergency(symbol)
+                if close_ok:
+                    self.state.overlay_positions.pop(symbol, None)
+                    status = "filled" if self.mode in ("live", "testnet") else "paper_filled"
+                    turnover_notional += float(notional_q)
+                else:
+                    status = "error"
+                    self.state.kill_switch_pending_close = True
+                    logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
+                order_record = {
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": float(qty_q),
+                    "notional": float(notional_q),
+                    "status": status,
+                    "ts": str(timestamp) if timestamp else pd.Timestamp.now(tz="UTC").isoformat(),
+                    "reason": "close",
+                }
+                self.state.overlay_orders.append(order_record)
+                orders.append(order_record)
+                continue
 
             if (
                 self.mode in ("live", "testnet")
@@ -1158,7 +1208,12 @@ class CarryLiveExecutor:
                         "ts": str(timestamp or ""),
                     }
                 else:
-                    self.state.overlay_positions.pop(symbol, None)
+                    close_ok = self._close_overlay_position_emergency(symbol)
+                    if close_ok:
+                        self.state.overlay_positions.pop(symbol, None)
+                    else:
+                        self.state.kill_switch_pending_close = True
+                        logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
                 turnover_notional += float(notional_q)
 
             reason = "close" if abs(target) < 1e-12 else "delta_rebalance"
@@ -1376,14 +1431,61 @@ class CarryLiveExecutor:
                 min_repairable_usd = step * price * 1.02
             else:
                 min_repairable_usd = 0.0
-            threshold = max(self.min_notional_usd, min_repairable_usd)
+            mark_price = float(price)
+            lot_step = step
+            if lot_step is not None and lot_step > 0:
+                specs_dict = globals().get("EXCHANGE_LOT_SPECS")
+                min_qty_val = None
+                if isinstance(specs_dict, dict):
+                    sym_spec = specs_dict.get(sym) or specs_dict.get(sym.split(":")[0])
+                    if isinstance(sym_spec, dict):
+                        min_qty_val = sym_spec.get("min_qty")
+                        if min_qty_val is None:
+                            min_qty_val = sym_spec.get("minQty")
+                min_qty = float(min_qty_val) if min_qty_val is not None else float(lot_step)
+                import math
+                repair_qty = round(math.floor(abs(drift_qty) / lot_step) * lot_step, 12)
+            else:
+                repair_qty = abs(drift_qty)
+                min_qty = 0.0
 
-            if pos.get("drift_unrepairable", False):
-                if drift_usd >= threshold * 5:
-                    pos.pop("drift_unrepairable", None)
-                    pos.pop("drift_unrepairable_usd", None)
-                else:
-                    continue
+            effective_threshold_usd = max(float(self.min_notional_usd), float(min_qty or 0.0) * mark_price * 1.05)
+            threshold = effective_threshold_usd
+
+            # Kiem tra 3 nhanh xu ly delta drift R2-2
+            unrep_syms = getattr(self.state, "drift_unrepairable_symbols", None)
+
+            # Nhanh 1: Drift bang 0 hoac khong dang ke
+            if abs(drift_qty) <= 1e-12:
+                pos.pop("drift_unrepairable", None)
+                pos.pop("drift_unrepairable_usd", None)
+                if isinstance(unrep_syms, dict):
+                    unrep_syms.pop(sym, None)
+                continue
+
+            # Nhanh 2: Dust duoi 1 lo (sub-lot drift)
+            if repair_qty < (min_qty or 0.0) or repair_qty <= 0:
+                pos["drift_unrepairable"] = True
+                pos["drift_unrepairable_usd"] = float(drift_usd)
+                if isinstance(unrep_syms, dict):
+                    unrep_syms[sym] = float(drift_qty)
+                logger.warning(
+                    "SUB_LOT_DUST %s: repair_qty=%.8f < min_qty=%.8f (drift_usd=%.2f < threshold=%.2f)",
+                    sym,
+                    repair_qty,
+                    float(min_qty or 0.0),
+                    drift_usd,
+                    effective_threshold_usd,
+                )
+                continue
+
+            # Nhanh 3: Du lo va dat nguong gia tri de sua
+            if repair_qty >= (min_qty or 0.0) and drift_usd >= effective_threshold_usd:
+                pos.pop("drift_unrepairable", None)
+                pos.pop("drift_unrepairable_usd", None)
+                if isinstance(unrep_syms, dict):
+                    unrep_syms.pop(sym, None)
+
 
             if drift_usd >= threshold:
                 drift_items.append({
@@ -1393,6 +1495,8 @@ class CarryLiveExecutor:
                     "drift_usd": float(drift_usd),
                     "price": float(price),
                     "side": "sell_spot" if drift_qty > 0 else "sell_perp",
+                    "repair_qty": float(repair_qty),
+                    "min_qty": float(min_qty or 0.0),
                 })
 
         return drift_items
@@ -1404,12 +1508,17 @@ class CarryLiveExecutor:
         drift_usd = float(item.get("drift_usd", 0.0))
         price = float(item.get("price", 0.0))
 
-        qty_q, notional_q = self.quantize_leg(symbol, abs(drift_qty) * price, price)
+        repair_qty = float(item.get("repair_qty", 0.0))
+        target_notional = (repair_qty * price) if repair_qty > 0.0 else (abs(drift_qty) * price)
+        qty_q, notional_q = self.quantize_leg(symbol, target_notional, price)
         if qty_q <= 0.0:
             pos = self.state.carry_positions.get(symbol)
             if pos is not None and isinstance(pos, dict):
                 pos["drift_unrepairable"] = True
                 pos["drift_unrepairable_usd"] = item.get("drift_usd")
+            unrep_syms = getattr(self.state, "drift_unrepairable_symbols", None)
+            if isinstance(unrep_syms, dict):
+                unrep_syms[symbol] = float(drift_qty)
             logger.warning("repair_delta_drift %s: qty_q <= 0, marking drift_unrepairable", symbol)
             return {
                 "status": "skipped",
@@ -1444,6 +1553,9 @@ class CarryLiveExecutor:
                 pos["qty"] = float(new_perp)
                 pos["leg2_hedged_qty"] = float(new_perp)
                 pos["notional_usdt"] = float(new_perp * price)
+                unrep_syms = getattr(self.state, "drift_unrepairable_symbols", None)
+                if isinstance(unrep_syms, dict):
+                    unrep_syms.pop(symbol, None)
                 pos.pop("drift_unrepairable", None)
                 pos.pop("drift_unrepairable_usd", None)
             logger.info("REPAIR_DELTA_DRIFT %s: drift=%.4f (%.2f USD)", symbol, drift_qty, drift_usd)
@@ -1458,6 +1570,170 @@ class CarryLiveExecutor:
         if err_msg is not None:
             res["error"] = err_msg
         return res
+
+    def _close_carry_position_emergency(self, symbol: str) -> bool:
+        """Dong khan cap ca chan spot (sell) va chan perp (buy reduceOnly) cho vi the carry."""
+        if self.mode == "paper":
+            return True
+
+        if not hasattr(self.state, "carry_positions") or not isinstance(self.state.carry_positions, dict):
+            return True
+
+        pos = self.state.carry_positions.get(symbol)
+        if not pos or not isinstance(pos, dict):
+            return True
+
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        spot_qty = float(pos.get("spot_qty", qty) or qty)
+        perp_qty = float(pos.get("qty", 0.0) or 0.0)
+
+        if spot_qty <= 0.0 and perp_qty <= 0.0:
+            return True
+
+        spot_sym = pos.get("spot_symbol", symbol.split(":")[0])
+        spot_ok = True
+        perp_ok = True
+
+        spot_ex = self.spot_exchange or self._get_exchange("binance_spot")
+        perp_ex = self.perp_exchange or self._get_exchange("binance")
+
+        if spot_qty > 0.0:
+            spot_ok = False
+            if spot_ex is not None and hasattr(spot_ex, "create_order") and callable(spot_ex.create_order):
+                try:
+                    res = spot_ex.create_order(spot_sym, "market", "sell", spot_qty)
+                    if isinstance(res, dict) and "status" in res:
+                        st = res.get("status")
+                        if st in {"closed", "filled", "FILLED", "CLOSED"}:
+                            spot_ok = True
+                        else:
+                            logger.warning("Kill switch close spot %s status: %s", spot_sym, st)
+                    else:
+                        spot_ok = True
+                except Exception as e_spot:
+                    logger.warning("Kill switch close spot failed for %s: %s", spot_sym, e_spot)
+            else:
+                logger.warning("Spot exchange missing create_order for %s", spot_sym)
+
+        if perp_qty > 0.0:
+            perp_ok = False
+            if perp_ex is not None and hasattr(perp_ex, "create_order") and callable(perp_ex.create_order):
+                try:
+                    res = perp_ex.create_order(symbol, "market", "buy", perp_qty, params={"reduceOnly": True})
+                    if isinstance(res, dict) and "status" in res:
+                        st = res.get("status")
+                        if st in {"closed", "filled", "FILLED", "CLOSED"}:
+                            perp_ok = True
+                        else:
+                            logger.warning("Kill switch close perp %s status: %s", symbol, st)
+                    else:
+                        perp_ok = True
+                except Exception as e_perp:
+                    logger.warning("Kill switch close perp failed for %s: %s", symbol, e_perp)
+            else:
+                logger.warning("Perp exchange missing create_order for %s", symbol)
+
+        return spot_ok and perp_ok
+
+    def _close_overlay_position_emergency(self, symbol: str) -> bool:
+        """Dong khan cap vi the overlay theo side (short -> market buy reduceOnly; long -> market sell)."""
+        if self.mode == "paper":
+            return True
+
+        if not hasattr(self.state, "overlay_positions") or not isinstance(self.state.overlay_positions, dict):
+            return True
+
+        pos = self.state.overlay_positions.get(symbol)
+        if pos is None:
+            return True
+
+        if isinstance(pos, dict):
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            side_str = str(pos.get("side", "")).lower()
+            if side_str in ("short", "sell") and qty > 0:
+                qty = -qty
+            price = float(pos.get("entry_price", 0.0) or pos.get("price", 0.0) or 0.0)
+        elif isinstance(pos, (int, float)):
+            qty = float(pos)
+            price = 0.0
+        else:
+            return True
+
+        if abs(qty) <= 1e-12:
+            return True
+
+        side = "sell" if qty > 0 else "buy"
+        if price <= 0.0:
+            price = 1.0
+
+        q_close, _ = self.quantize_leg(symbol, abs(qty) * price, price)
+        if q_close <= 0.0:
+            q_close = abs(qty)
+
+        perp_ex = self.perp_exchange or self._get_exchange("binance")
+        if perp_ex is None or not hasattr(perp_ex, "create_order") or not callable(perp_ex.create_order):
+            logger.warning("Perp exchange missing create_order for overlay close %s", symbol)
+            return False
+
+        try:
+            if side == "buy":
+                res = perp_ex.create_order(symbol, "market", "buy", q_close, params={"reduceOnly": True})
+            else:
+                res = perp_ex.create_order(symbol, "market", "sell", q_close)
+
+            if isinstance(res, dict) and "status" in res:
+                st = res.get("status")
+                if st in {"closed", "filled", "FILLED", "CLOSED"}:
+                    return True
+                else:
+                    logger.warning("Kill switch close overlay %s status: %s", symbol, st)
+                    return False
+            return True
+        except Exception as e_ov:
+            logger.warning("Kill switch close overlay failed for %s %s qty=%.4f: %s", side, symbol, q_close, e_ov)
+            return False
+
+    def _flush_pending_emergency_close(self) -> tuple[int, int]:
+        """Dong not cac vi the ket khi Kill-Switch dang bat pending close."""
+        closed_carry_count = 0
+        if hasattr(self.state, "carry_positions") and isinstance(self.state.carry_positions, dict):
+            for sym in list(self.state.carry_positions.keys()):
+                close_ok = self._close_carry_position_emergency(sym)
+                if close_ok:
+                    self.state.carry_positions.pop(sym, None)
+                    closed_carry_count += 1
+                else:
+                    logger.error("Kill switch close carry failed for %s, keeping in state", sym)
+                    self.state.kill_switch_pending_close = True
+
+        closed_overlay_count = 0
+        if hasattr(self.state, "overlay_positions") and isinstance(self.state.overlay_positions, dict):
+            for sym in list(self.state.overlay_positions.keys()):
+                close_ok = self._close_overlay_position_emergency(sym)
+                if close_ok:
+                    self.state.overlay_positions.pop(sym, None)
+                    closed_overlay_count += 1
+                else:
+                    logger.error("Kill switch close overlay failed for %s, keeping in state", sym)
+                    self.state.kill_switch_pending_close = True
+
+        n_carry = len(self.state.carry_positions) if isinstance(self.state.carry_positions, dict) else 0
+        n_overlay = len(self.state.overlay_positions) if isinstance(self.state.overlay_positions, dict) else 0
+        if n_carry == 0 and n_overlay == 0:
+            self.state.kill_switch_pending_close = False
+
+        logger.info(
+            "FLUSH PENDING EMERGENCY CLOSE: carry_closed=%d, overlay_closed=%d, pending=%s",
+            closed_carry_count,
+            closed_overlay_count,
+            getattr(self.state, "kill_switch_pending_close", False),
+        )
+        try:
+            self.state_store.save(self.state)
+        except Exception as e:
+            logger.warning("Error saving state after flush pending emergency close: %s", e)
+
+        return closed_carry_count, closed_overlay_count
 
     def check_kill_switch(self, current_equity: float) -> bool:
         """Kiem tra nguong drawdown toi da va kich hoat Kill-Switch neu vi pham."""
@@ -1492,6 +1768,9 @@ class CarryLiveExecutor:
 
         if bool(getattr(self.state, "kill_switch_triggered", False)) or getattr(self, "kill_switch_triggered", False):
             self.kill_switch_triggered = True
+            self.state.kill_switch_triggered = True
+            if getattr(self.state, "kill_switch_pending_close", False):
+                self._flush_pending_emergency_close()
             logger.warning("KILL-SWITCH is already triggered: blocking all operations")
             return True
 
@@ -1509,73 +1788,11 @@ class CarryLiveExecutor:
                 for sym, pos in list(self.state.carry_positions.items()):
                     if isinstance(pos, dict) and pos.get("leg1_order_id"):
                         try:
-                            self.cancel_maker_leg1(sym)
+                            cancel_ok = self.cancel_maker_leg1(sym)
                         except Exception as e:
                             logger.warning("Error cancelling maker leg1 for %s on kill switch: %s", sym, e)
 
-            closed_carry_count = 0
-            if hasattr(self.state, "carry_positions") and isinstance(self.state.carry_positions, dict):
-                for sym, pos in list(self.state.carry_positions.items()):
-                    if not isinstance(pos, dict):
-                        self.state.carry_positions.pop(sym, None)
-                        continue
-                    qty = float(pos.get("qty", 0.0) or 0.0)
-                    if self.mode in ("live", "testnet") and qty > 0:
-                        spot_sym = pos.get("spot_symbol", sym.split(":")[0])
-                        try:
-                            if self.spot_exchange is not None and hasattr(self.spot_exchange, "create_order") and callable(self.spot_exchange.create_order):
-                                self.spot_exchange.create_order(spot_sym, "market", "sell", qty)
-                        except Exception as e_spot:
-                            logger.warning("Kill switch close spot failed for %s: %s", spot_sym, e_spot)
-                        try:
-                            if self.perp_exchange is not None and hasattr(self.perp_exchange, "create_order") and callable(self.perp_exchange.create_order):
-                                self.perp_exchange.create_order(sym, "market", "buy", qty, params={"reduceOnly": True})
-                        except Exception as e_perp:
-                            logger.warning("Kill switch close perp failed for %s: %s", sym, e_perp)
-
-                    closed_carry_count += 1
-                    self.state.carry_positions.pop(sym, None)
-
-            closed_overlay_count = 0
-            if hasattr(self.state, "overlay_positions") and isinstance(self.state.overlay_positions, dict):
-                for sym, pos in list(self.state.overlay_positions.items()):
-                    if isinstance(pos, dict):
-                        qty = float(pos.get("qty", 0.0) or 0.0)
-                        side_str = str(pos.get("side", "")).lower()
-                        if side_str in ("short", "sell") and qty > 0:
-                            qty = -qty
-                        price = float(pos.get("entry_price", 0.0) or pos.get("price", 0.0) or 0.0)
-                    elif isinstance(pos, (int, float)):
-                        qty = float(pos)
-                        price = 0.0
-                    else:
-                        continue
-
-                    if abs(qty) <= 1e-12:
-                        continue
-
-                    side = "sell" if qty > 0 else "buy"
-                    if price <= 0.0:
-                        price = 1.0
-
-                    q_close, _ = self.quantize_leg(sym, abs(qty) * price, price)
-                    if q_close <= 0.0:
-                        q_close = abs(qty)
-
-                    if (
-                        self.mode in ("live", "testnet")
-                        and self.perp_exchange is not None
-                        and hasattr(self.perp_exchange, "create_order")
-                        and callable(self.perp_exchange.create_order)
-                    ):
-                        try:
-                            self.perp_exchange.create_order(sym, "market", side, q_close)
-                        except Exception as e_ov:
-                            logger.warning("Kill switch close overlay failed for %s %s qty=%.4f: %s", side, sym, q_close, e_ov)
-
-                    closed_overlay_count += 1
-
-                self.state.overlay_positions = {}
+            closed_carry_count, closed_overlay_count = self._flush_pending_emergency_close()
 
             logger.info(
                 "KILL-SWITCH dong vi the hoan tat: carry_closed=%d, overlay_closed=%d",
@@ -1652,9 +1869,15 @@ class CarryLiveExecutor:
         aligned_universe: Optional[dict[str, pd.DataFrame]] = None,
     ) -> dict[str, Any]:
         """Thực hiện một chu kỳ đối soát hoàn chỉnh: tính điểm, kiểm tra ký quỹ, cân bằng danh mục và lưu state."""
-        # PR-5: Kiem tra Kill-Switch truoc moi thao tac dat lenh hay fetch sau
+        # PR-5 & R2-1: Kiem tra Kill-Switch va xu ly vi the ket truoc moi thao tac
+        if getattr(self.state, "kill_switch_triggered", False) and getattr(self.state, "kill_switch_pending_close", False):
+            self._flush_pending_emergency_close()
         current_equity = float(self.state.current_equity)
-        if self.check_kill_switch(current_equity):
+        if (
+            self.check_kill_switch(current_equity)
+            or bool(getattr(self.state, "kill_switch_triggered", False))
+            or bool(getattr(self.state, "kill_switch_pending_close", False))
+        ):
             latest_ts_str = pd.Timestamp.now(tz="UTC").isoformat()
             if aligned_universe:
                 all_ts = [df.index[-1] for df in aligned_universe.values() if len(df) > 0]
@@ -1918,7 +2141,11 @@ class CarryLiveExecutor:
         _kill_after_close = False
         try:
             _eq_now = float(getattr(self.state, "current_equity", self.capital))
-            if self.check_kill_switch(_eq_now):
+            if (
+                self.check_kill_switch(_eq_now)
+                or bool(getattr(self.state, "kill_switch_triggered", False))
+                or bool(getattr(self.state, "kill_switch_pending_close", False))
+            ):
                 logger.error("KILL-SWITCH kich hoat giua chu ky -> huy bo cac lenh mo moi")
                 _kill_after_close = True
                 plan = {
@@ -2052,6 +2279,7 @@ class CarryLiveExecutor:
                         self.state.current_equity -= fee
                     else:
                         # Chan 1 khong khop: PHAI huy lenh treo truoc khi xoa state
+                        cancel_ok = True
                         # de tranh lenh mo coi (orphaned post-only order).
                         if self.mode in ("live", "testnet"):
                             cancel_ex = (
@@ -2059,12 +2287,16 @@ class CarryLiveExecutor:
                                 or self._leg_states.get(sym, {}).get("exchange_short")
                                 or "binance"
                             )
-                            self.cancel_maker_leg1(
+                            cancel_ok = self.cancel_maker_leg1(
                                 sym,
                                 exchange_name=cancel_ex,
                                 order_symbol=sym,
                             )
-                        self.state.carry_positions.pop(sym, None)
+                        if cancel_ok:
+                            self.state.carry_positions.pop(sym, None)
+                        else:
+                            self.state.kill_switch_pending_close = True
+                            logger.error("Huy maker leg1 that bai cho %s, giu lai state", sym)
                         self.maker_no_fill_count += 1
                 else:
                     fee = target_notional * self.carry_config.one_way_cost()
@@ -2280,6 +2512,8 @@ class CarryLiveExecutor:
             while True:
                 iterations += 1
                 try:
+                    if getattr(self.state, "kill_switch_triggered", False) and getattr(self.state, "kill_switch_pending_close", False):
+                        self._flush_pending_emergency_close()
                     plan = self.reconcile_once()
                     logger.info("\n%s", plan["table_ascii"])
                     cur_eq = float(getattr(self.state, "current_equity", self.capital))

@@ -143,6 +143,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="In thong tin log chi tiet muc DEBUG",
     )
     parser.add_argument(
+        "--reinvest",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="1 = tai dau tu lai (mac dinh), 0 = neo von tinh tai --capital",
+    )
+    parser.add_argument(
         "--download",
         action="store_true",
         help="Tai va cap nhat du lieu Funding da san tu cac san giao dich",
@@ -278,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         data=multi_aligned_data,
         capital=args.capital,
         benchmark_returns=btc_benchmark_returns,
+        reinvest_profits=bool(args.reinvest),
     )
 
     logger.info("Dang kiem thu CarryLiveExecutor tren stub exchange...")
