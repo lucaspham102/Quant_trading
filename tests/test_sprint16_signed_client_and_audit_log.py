@@ -173,3 +173,25 @@ def test_build_cycle_audit_record_net_delta() -> None:
     assert record["overlay_net_delta_usd"] == pytest.approx(0.01, abs=1e-9)
     assert record["overlay_neutrality"] == {"applied": True}
     json.dumps(record)  # phai serialize duoc
+
+
+def test_build_cycle_audit_record_accepts_list_actions() -> None:
+    """Regression: plan['actions'] cua executor la list[str], khong duoc crash."""
+    record = build_cycle_audit_record(
+        cycle=1,
+        mode="paper",
+        execution_style="real_taker",
+        capital=3000.0,
+        equity=2999.34,
+        peak_equity=3000.0,
+        drawdown_pct=0.02,
+        carry_spot_usd=0.0,
+        carry_perp_usd=0.0,
+        overlay_long_usd=100.0,
+        overlay_short_usd=100.03,
+        actions=["HOLD BTC/USDT:USDT", "REBALANCE OVERLAY"],
+        timestamp="2026-10-21T00:00:00+00:00",
+    )
+    assert record["actions"] == ["HOLD BTC/USDT:USDT", "REBALANCE OVERLAY"]
+    assert record["overlay_net_delta_usd"] == pytest.approx(-0.03, abs=1e-9)
+    json.dumps(record)

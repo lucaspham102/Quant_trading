@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -147,7 +147,9 @@ def build_cycle_audit_record(
         "overlay_neutrality": dict(overlay_neutrality or {}),
         "kill_switch": bool(kill_switch),
         "diagnostics": diagnostics_summary,
-        "actions": dict(actions or {}),
+        "actions": dict(actions) if isinstance(actions, Mapping) else (
+            list(actions) if isinstance(actions, (list, tuple)) else {}
+        ),
     }
 
 
@@ -2968,6 +2970,7 @@ class CarryLiveExecutor:
                         (self.last_decision_diagnostics or {}).get("summary", "N/A")
                     )
                     if self.audit_log_path:
+                      try:
                         _record = build_cycle_audit_record(
                             cycle=iterations,
                             mode=str(self.mode),
@@ -2989,6 +2992,8 @@ class CarryLiveExecutor:
                         )
                         if append_audit_record(self.audit_log_path, _record):
                             self.audit_written += 1
+                      except Exception as _audit_err:
+                        logger.warning('Audit log skipped: %s', _audit_err)
                 except Exception as e:
                     logger.error("Error in reconcile_once: %s", e, exc_info=True)
                     if once:
