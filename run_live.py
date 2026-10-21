@@ -114,6 +114,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Neu doi soat khong khop -> fail-closed, khong mo vi the moi.",
     )
     parser.add_argument(
+        "--live-snapshot",
+        action="store_true",
+        help="Sprint 18: lay snapshot tai khoan THAT co ky HMAC-SHA256 tu Binance Testnet "
+        "(/api/v3/account + /fapi/v2/account + /fapi/v2/positionRisk) roi doi soat truoc khi mo lenh.",
+    )
+    parser.add_argument(
         "--symbol",
         default="BTC/USDT:USDT",
         help="Cặp giao dịch (mặc định: BTC/USDT:USDT)",
@@ -340,6 +346,89 @@ def _run_reconcile_preflight(
     return report
 
 
+def _run_signed_snapshot_preflight(
+    args: argparse.Namespace,
+    executor: object,
+) -> dict | None:
+    """Sprint 18: lay snapshot tai khoan THAT co ky HMAC-SHA256 (testnet) roi doi soat.
+
+    Fail-closed: thieu khoa / loi mang / payload la -> report BLOCKED, khong mo lenh moi.
+    """
+    if not getattr(args, "live_snapshot", False):
+        return None
+    from src.cross_exchange_carry import EXCHANGE_LOT_SPECS
+    from src.exchange_reconciler import reconcile_portfolio_state
+
+    def _blocked(status: str, message: str) -> dict:
+        report = {
+            "status": status,
+            "trading_allowed": False,
+            "repair_actions": [],
+            "items": [],
+            "orphans": [],
+            "phantoms": [],
+            "drifting": [],
+            "equity_gap_usd": 0.0,
+            "equity_gap_pct": 0.0,
+            "summary": f"{status} | {message}",
+        }
+        apply_fn = getattr(executor, "apply_reconcile_report", None)
+        if callable(apply_fn):
+            apply_fn(report)
+        else:
+            setattr(executor, "reconcile_report", report)
+            setattr(executor, "reconcile_status", status)
+            setattr(executor, "trading_allowed", False)
+        logger.error("Reconcile(live): BLOCKED (%s) - %s", status, message)
+        return report
+
+    try:
+        from src.binance_signed_client import BinanceSignedTestnetClient
+
+        client = BinanceSignedTestnetClient(dry_run=False)
+    except Exception as exc:  # thieu khoa -> fail-closed
+        return _blocked("SNAPSHOT_CREDENTIALS_MISSING", str(exc))
+
+    symbols = list(getattr(executor, "symbols", []) or [])
+    state = getattr(executor, "state", None)
+    prices: dict[str, float] = {}
+    for sym, pos in (getattr(state, "carry_positions", {}) or {}).items():
+        if not isinstance(pos, dict):
+            continue
+        for key in ("entry_spot_price", "entry_perp_price"):
+            px = float(pos.get(key, 0.0) or 0.0)
+            if px > 0.0:
+                prices[sym] = px
+                break
+
+    snapshot = client.fetch_exchange_reconcile_snapshot(symbols, prices)
+    if not bool(snapshot.get("snapshot_healthy", False)):
+        return _blocked("SNAPSHOT_UNHEALTHY", str(snapshot.get("error", "unknown")))
+
+    for item in snapshot.get("perp_positions_detail") or []:
+        if isinstance(item, dict):
+            px = float(item.get("mark_price", 0.0) or 0.0)
+            sym = str(item.get("symbol") or "")
+            if px > 0.0 and sym:
+                prices[sym] = px
+
+    report = reconcile_portfolio_state(
+        state if state is not None else {},
+        snapshot,
+        prices,
+        EXCHANGE_LOT_SPECS,
+    )
+    apply_fn = getattr(executor, "apply_reconcile_report", None)
+    if callable(apply_fn):
+        apply_fn(report)
+    else:
+        setattr(executor, "reconcile_report", report)
+        setattr(executor, "reconcile_status", report.get("status"))
+        setattr(executor, "trading_allowed", bool(report.get("trading_allowed", False)))
+    logger.info("Reconcile(live): %s", report.get("summary", ""))
+    return report
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -515,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                 tier1b_gate=True,
             )
             logger.info(
-                "Warmup requirement: >= 400h history (lookback_hours=%d).",
+                "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
                 int(getattr(executor, "lookback_hours", 720)),
             )
             if args.audit_log:
@@ -529,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
             _run_reconcile_preflight(args, executor)
+            # Sprint 18: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
+            _run_signed_snapshot_preflight(args, executor)
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -549,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
             strategy=strat,
         )
         logger.info(
-            "Warmup requirement: >= 400h history (lookback_hours=%d).",
+            "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
             int(getattr(executor, "lookback_hours", 720)),
         )
         if args.audit_log:
@@ -563,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
         _run_reconcile_preflight(args, executor)
+        # Sprint 18: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
+        _run_signed_snapshot_preflight(args, executor)
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,

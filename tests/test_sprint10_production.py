@@ -918,7 +918,12 @@ def test_build_barbell_allocations_quantizes_and_gates_overlay(
 
     alloc = executor.build_barbell_allocations(universe, scores_at_t)
 
-    assert alloc["overlay_active"] is True
+    # Sprint 18: bat bien LOT_NEUTRALITY duoc kiem dinh truoc khi phat lenh Overlay.
+    # Legacy path (tier1b_gate=False) luong tu hoa tung chan doc lap nen 2 chan lech
+    # 14.22 USD > max_imbalance_usd mac dinh 10.0 -> fail-closed: huy overlay.
+    assert alloc["overlay_active"] is False
+    assert alloc["momentum_overlay"]["allocations"] == []
+    assert executor.last_lot_neutrality_invariant["passed"] is False
     assert alloc["raw_snr_dispersion"] >= 0.5
 
     carry_allocs = alloc["carry_sleeve"]["allocations"]
@@ -929,7 +934,12 @@ def test_build_barbell_allocations_quantizes_and_gates_overlay(
         price = _s10c3_last_price(universe[item["symbol"]])
         assert item["notional"] == pytest.approx(item["target_qty"] * price)
 
-    overlay_allocs = alloc["momentum_overlay"]["allocations"]
+    # Neu nguong duoc noi long (chap nhan sai so lam tron lot cua legacy path),
+    # overlay duoc phep phat lenh va van phai nam dung step grid.
+    executor.overlay_max_imbalance_usd = 20.0
+    alloc_loose = executor.build_barbell_allocations(universe, scores_at_t)
+    assert alloc_loose["overlay_active"] is True
+    overlay_allocs = alloc_loose["momentum_overlay"]["allocations"]
     assert len(overlay_allocs) == 2
     sides = [str(item["side"]) for item in overlay_allocs]
     assert sum("long" in side for side in sides) == 1
