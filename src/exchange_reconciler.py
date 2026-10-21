@@ -16,6 +16,7 @@ ORPHAN_ON_EXCHANGE = "ORPHAN_ON_EXCHANGE"
 PHANTOM_IN_STATE = "PHANTOM_IN_STATE"
 QTY_DRIFT = "QTY_DRIFT"
 EQUITY_MISMATCH = "EQUITY_MISMATCH"
+MARGIN_DANGER = "MARGIN_DANGER"
 
 RECONCILE_STATUSES: tuple[str, ...] = (
     SYNCED,
@@ -23,6 +24,7 @@ RECONCILE_STATUSES: tuple[str, ...] = (
     PHANTOM_IN_STATE,
     QTY_DRIFT,
     EQUITY_MISMATCH,
+    MARGIN_DANGER,
 )
 
 
@@ -67,6 +69,12 @@ def _get_field(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _has_field(obj: Any, key: str) -> bool:
+    if isinstance(obj, dict):
+        return key in obj and obj[key] is not None
+    return hasattr(obj, key) and getattr(obj, key) is not None
 
 
 def _lookup_price(prices: Any, sym: str, base: str) -> float:
@@ -128,6 +136,261 @@ def _classify_leg(
     return SYNCED, None, 0.0, ""
 
 
+def analyze_equity_and_margin_health(
+    local_state: Any,
+    exchange_snapshot: Any,
+    prices: dict[str, Any],
+    lot_specs: dict[str, Any] | None = None,
+    tolerance_usd: float = 10.0,
+    equity_tolerance_pct: float = 1.5,
+    max_maint_margin_ratio: float = 0.50,
+    min_liq_buffer_pct: float = 25.0,
+) -> dict[str, Any]:
+    """Phan tich suc khoe ky quy Perp, unrealized PnL va khoang cach thanh ly.
+
+    Deterministic, khong side effects, khong mang/network I/O.
+    """
+    # 1. Chuan hoa danh sach vi the chi tiet perp_positions_detail
+    raw_details = _get_field(exchange_snapshot, "perp_positions_detail", None)
+    unnorm_items: list[dict[str, Any]] = []
+
+    if raw_details is not None:
+        if isinstance(raw_details, dict):
+            for k, v in raw_details.items():
+                if isinstance(v, dict):
+                    item = dict(v)
+                    if "symbol" not in item:
+                        item["symbol"] = k
+                    unnorm_items.append(item)
+                elif hasattr(v, "__dict__"):
+                    item = {attr: getattr(v, attr) for attr in dir(v) if not attr.startswith("_")}
+                    if "symbol" not in item:
+                        item["symbol"] = k
+                    unnorm_items.append(item)
+        elif isinstance(raw_details, list):
+            for entry in raw_details:
+                if isinstance(entry, dict):
+                    unnorm_items.append(dict(entry))
+                elif hasattr(entry, "__dict__"):
+                    unnorm_items.append({attr: getattr(entry, attr) for attr in dir(entry) if not attr.startswith("_")})
+    else:
+        # Fallback neu khong co perp_positions_detail
+        perp_positions = _get_field(exchange_snapshot, "perp_positions", None) or {}
+        if isinstance(perp_positions, dict):
+            for k, v in perp_positions.items():
+                unnorm_items.append({
+                    "symbol": k,
+                    "qty": _to_float(v),
+                    "liquidation_price": 0.0,
+                })
+
+    standardized_positions: list[dict[str, Any]] = []
+    for entry in unnorm_items:
+        raw_sym = str(_get_field(entry, "symbol", "") or "").strip()
+        canon_sym = normalize_symbol(raw_sym) if raw_sym else ""
+        base = canon_sym.split("/")[0] if "/" in canon_sym else canon_sym
+
+        raw_qty = _get_field(entry, "qty", None)
+        if raw_qty is None:
+            raw_qty = _get_field(entry, "positionAmt", 0.0)
+        qty = _to_float(raw_qty)
+
+        mark_price = _to_float(_get_field(entry, "mark_price", 0.0))
+        if mark_price <= 0.0 and canon_sym:
+            mark_price = _lookup_price(prices, canon_sym, base)
+
+        entry_price = _to_float(_get_field(entry, "entry_price", 0.0))
+        liq_price = _to_float(_get_field(entry, "liquidation_price", 0.0))
+        maint_margin = _to_float(_get_field(entry, "maint_margin_usd", 0.0))
+        margin_bal = _to_float(_get_field(entry, "margin_balance_usd", 0.0))
+
+        standardized_positions.append({
+            "symbol": canon_sym if canon_sym else raw_sym,
+            "qty": float(qty),
+            "mark_price": float(mark_price),
+            "entry_price": float(entry_price),
+            "liquidation_price": float(liq_price),
+            "maint_margin_usd": float(maint_margin),
+            "margin_balance_usd": float(margin_bal),
+        })
+
+    # 2. Tinh toan chi so suc khoe ky quy (margin_health)
+    snap_maint = _to_float(_get_field(exchange_snapshot, "maint_margin_usd", 0.0))
+    snap_margin_bal = _to_float(_get_field(exchange_snapshot, "margin_balance_usd", 0.0))
+    if snap_maint == 0.0:
+        sum_maint = sum(p["maint_margin_usd"] for p in standardized_positions)
+        if sum_maint > 0.0:
+            snap_maint = sum_maint
+    if snap_margin_bal == 0.0:
+        sum_mb = sum(p["margin_balance_usd"] for p in standardized_positions)
+        if sum_mb > 0.0:
+            snap_margin_bal = sum_mb
+
+    maint_margin_ratio = (snap_maint / snap_margin_bal) if snap_margin_bal > 0.0 else 0.0
+
+    liq_distances: list[float] = []
+    for p in standardized_positions:
+        if abs(p["qty"]) > 0.0 and p["liquidation_price"] > 0.0 and p["mark_price"] > 0.0:
+            d = abs(p["mark_price"] - p["liquidation_price"]) / p["mark_price"] * 100.0
+            liq_distances.append(d)
+
+    min_liq_distance_pct = min(liq_distances) if liq_distances else None
+
+    margin_danger = bool(
+        (maint_margin_ratio > max_maint_margin_ratio)
+        or (min_liq_distance_pct is not None and min_liq_distance_pct < min_liq_buffer_pct)
+    )
+
+    margin_health = {
+        "maint_margin_ratio": float(maint_margin_ratio),
+        "min_liq_distance_pct": min_liq_distance_pct,
+        "max_maint_margin_ratio": float(max_maint_margin_ratio),
+        "min_liq_buffer_pct": float(min_liq_buffer_pct),
+        "margin_danger": margin_danger,
+        "perp_positions_detail": standardized_positions,
+    }
+
+    # 3. Hanh dong khac phuc khan cap khi vi pham an toan ky quy (repair_actions)
+    health_repair_actions: list[dict[str, Any]] = []
+    if margin_danger:
+        dangerous_symbols: set[str] = set()
+        open_positions = [p for p in standardized_positions if abs(p["qty"]) > 0.0]
+
+        if min_liq_distance_pct is not None and min_liq_distance_pct < min_liq_buffer_pct:
+            for p in open_positions:
+                if p["liquidation_price"] > 0.0 and p["mark_price"] > 0.0:
+                    dist = abs(p["mark_price"] - p["liquidation_price"]) / p["mark_price"] * 100.0
+                    if dist < min_liq_buffer_pct:
+                        dangerous_symbols.add(p["symbol"])
+                        health_repair_actions.append({
+                            "symbol": p["symbol"],
+                            "action": "EMERGENCY_DELEVERAGE_PERP",
+                            "side": "perp",
+                            "qty": abs(p["qty"]),
+                            "reason": f"Perp liq distance {dist:.1f}% below min buffer {min_liq_buffer_pct:.1f}%",
+                        })
+
+        if maint_margin_ratio > max_maint_margin_ratio:
+            if open_positions:
+                for p in open_positions:
+                    if p["symbol"] not in dangerous_symbols:
+                        dangerous_symbols.add(p["symbol"])
+                        health_repair_actions.append({
+                            "symbol": p["symbol"],
+                            "action": "EMERGENCY_DELEVERAGE_PERP",
+                            "side": "perp",
+                            "qty": abs(p["qty"]),
+                            "reason": f"Maintenance margin ratio {maint_margin_ratio:.2f} exceeds max {max_maint_margin_ratio:.2f}",
+                        })
+            else:
+                total_qty = sum(abs(p["qty"]) for p in standardized_positions)
+                health_repair_actions.append({
+                    "symbol": "PORTFOLIO",
+                    "action": "EMERGENCY_DELEVERAGE_PERP",
+                    "side": "perp",
+                    "qty": float(total_qty),
+                    "reason": f"Maintenance margin ratio {maint_margin_ratio:.2f} exceeds max {max_maint_margin_ratio:.2f}",
+                })
+
+    # 4. Phan ra nguyen nhan lech equity (equity_drift_attribution)
+    has_attr_fields = (
+        _has_field(exchange_snapshot, "spot_cash_usd")
+        or _has_field(exchange_snapshot, "perp_wallet_balance_usd")
+        or _has_field(exchange_snapshot, "perp_unrealized_pnl_usd")
+    )
+
+    if not has_attr_fields:
+        equity_drift_attribution = None
+    else:
+        local_unrealized_pnl_usd = 0.0
+        carry_positions = _get_field(local_state, "carry_positions") or {}
+        overlay_positions = _get_field(local_state, "overlay_positions") or {}
+
+        def _get_pos_items(positions: Any) -> list[tuple[str, Any]]:
+            if isinstance(positions, dict):
+                return [(str(k), v) for k, v in positions.items()]
+            if isinstance(positions, list):
+                return [(str(_get_field(x, "symbol", "") or ""), x) for x in positions]
+            return []
+
+        for sym_key, pos in _get_pos_items(carry_positions):
+            c_sym = normalize_symbol(sym_key)
+            base = c_sym.split("/")[0] if "/" in c_sym else c_sym
+            p_price = _lookup_price(prices, c_sym, base)
+            leg2 = _get_field(pos, "leg2_hedged_qty", None)
+            c_qty = _to_float(leg2) if leg2 is not None else _to_float(_get_field(pos, "qty", 0.0))
+            c_qty = abs(c_qty)
+            entry_perp = _to_float(
+                _get_field(pos, "entry_perp_price", _get_field(pos, "entry_price", _get_field(pos, "perp_entry_price", 0.0)))
+            )
+            if p_price > 0.0 and entry_perp > 0.0 and c_qty > 0.0:
+                local_unrealized_pnl_usd += (entry_perp - p_price) * c_qty
+
+        for sym_key, pos in _get_pos_items(overlay_positions):
+            o_sym = normalize_symbol(sym_key)
+            base = o_sym.split("/")[0] if "/" in o_sym else o_sym
+            p_price = _lookup_price(prices, o_sym, base)
+            o_qty = abs(_to_float(_get_field(pos, "qty", 0.0)))
+            entry_price = _to_float(_get_field(pos, "entry_price", 0.0))
+            side = str(_get_field(pos, "side", "") or "").strip().lower()
+            if p_price > 0.0 and entry_price > 0.0 and o_qty > 0.0:
+                if side == "short":
+                    local_unrealized_pnl_usd += (entry_price - p_price) * o_qty
+                else:
+                    local_unrealized_pnl_usd += (p_price - entry_price) * o_qty
+
+        if local_unrealized_pnl_usd == 0.0:
+            local_unrealized_pnl_usd = _to_float(
+                _get_field(local_state, "local_unrealized_pnl_usd", _get_field(local_state, "unrealized_pnl_usd", 0.0))
+            )
+
+        spot_cash_usd = _to_float(_get_field(exchange_snapshot, "spot_cash_usd", 0.0))
+        perp_wallet_balance_usd = _to_float(_get_field(exchange_snapshot, "perp_wallet_balance_usd", 0.0))
+        perp_unrealized_pnl_usd = _to_float(_get_field(exchange_snapshot, "perp_unrealized_pnl_usd", 0.0))
+
+        exchange_equity_usd = _to_float(_get_field(exchange_snapshot, "exchange_equity_usd", 0.0))
+        if exchange_equity_usd == 0.0 and (spot_cash_usd != 0.0 or perp_wallet_balance_usd != 0.0 or perp_unrealized_pnl_usd != 0.0):
+            exchange_equity_usd = spot_cash_usd + perp_wallet_balance_usd + perp_unrealized_pnl_usd
+
+        local_expected_equity_usd = _to_float(_get_field(local_state, "current_equity", 0.0))
+
+        total_drift = exchange_equity_usd - local_expected_equity_usd
+        cash_drift = (spot_cash_usd + perp_wallet_balance_usd) - (local_expected_equity_usd - local_unrealized_pnl_usd)
+        upnl_drift = perp_unrealized_pnl_usd - local_unrealized_pnl_usd
+        residual_drift = total_drift - cash_drift - upnl_drift
+        if abs(residual_drift) < 1e-9:
+            residual_drift = 0.0
+
+        c_abs = abs(cash_drift)
+        u_abs = abs(upnl_drift)
+        r_abs = abs(residual_drift)
+        max_drift = max(c_abs, u_abs, r_abs)
+
+        if max_drift < 1e-4:
+            primary_cause = None
+        elif c_abs == max_drift:
+            primary_cause = "CASH_OR_FUNDING_DRIFT"
+        elif u_abs == max_drift:
+            primary_cause = "UNREALIZED_PNL_DRIFT"
+        else:
+            primary_cause = "UNEXPLAINED_EQUITY_DRIFT"
+
+        equity_drift_attribution = {
+            "total_equity_drift_usd": float(total_drift),
+            "cash_and_funding_drift_usd": float(cash_drift),
+            "unrealized_pnl_drift_usd": float(upnl_drift),
+            "unexplained_residual_drift_usd": float(residual_drift),
+            "primary_mismatch_cause": primary_cause,
+        }
+
+    return {
+        "equity_drift_attribution": equity_drift_attribution,
+        "margin_health": margin_health,
+        "margin_danger": margin_danger,
+        "repair_actions": health_repair_actions,
+    }
+
+
 def reconcile_portfolio_state(
     local_state: Any,
     exchange_snapshot: Any,
@@ -135,11 +398,14 @@ def reconcile_portfolio_state(
     lot_specs: dict[str, Any],
     tolerance_usd: float = 10.0,
     equity_tolerance_pct: float = 1.5,
+    max_maint_margin_ratio: float = 0.50,
+    min_liq_buffer_pct: float = 25.0,
 ) -> dict[str, Any]:
     carry_positions = _get_field(local_state, "carry_positions") or {}
     overlay_positions = _get_field(local_state, "overlay_positions") or {}
     spot_balances = _get_field(exchange_snapshot, "spot_balances") or {}
     perp_positions = _get_field(exchange_snapshot, "perp_positions") or {}
+    perp_positions_detail = _get_field(exchange_snapshot, "perp_positions_detail") or {}
 
     canonical_symbols: set[str] = set()
     if isinstance(carry_positions, dict):
@@ -160,6 +426,17 @@ def reconcile_portfolio_state(
     if isinstance(perp_positions, dict):
         for k in perp_positions:
             s = normalize_symbol(str(k))
+            if s:
+                canonical_symbols.add(s)
+    if isinstance(perp_positions_detail, dict):
+        for k in perp_positions_detail:
+            s = normalize_symbol(str(k))
+            if s:
+                canonical_symbols.add(s)
+    elif isinstance(perp_positions_detail, list):
+        for item in perp_positions_detail:
+            raw_s = _get_field(item, "symbol", "")
+            s = normalize_symbol(str(raw_s))
             if s:
                 canonical_symbols.add(s)
 
@@ -201,6 +478,21 @@ def reconcile_portfolio_state(
                 if k in perp_positions:
                     ex_perp = _to_float(perp_positions[k])
                     break
+        if ex_perp == 0.0 and perp_positions_detail:
+            if isinstance(perp_positions_detail, dict):
+                for k in (sym, concat, base):
+                    if k in perp_positions_detail:
+                        det = perp_positions_detail[k]
+                        q = _get_field(det, "qty", _get_field(det, "positionAmt", 0.0))
+                        ex_perp = _to_float(q)
+                        break
+            elif isinstance(perp_positions_detail, list):
+                for item in perp_positions_detail:
+                    item_sym = normalize_symbol(str(_get_field(item, "symbol", "")))
+                    if item_sym == sym:
+                        q = _get_field(item, "qty", _get_field(item, "positionAmt", 0.0))
+                        ex_perp = _to_float(q)
+                        break
 
         price = _lookup_price(prices, sym, base)
         step_sz, min_notional = _lookup_lot_spec(lot_specs, sym, base)
@@ -251,8 +543,25 @@ def reconcile_portfolio_state(
     eq_gap_usd = ex_eq - loc_eq
     eq_gap_pct = (abs(eq_gap_usd) / loc_eq * 100.0) if loc_eq > 0.0 else (0.0 if eq_gap_usd == 0.0 else 100.0)
 
+    # Phan tich suc khoe ky quy va attribution
+    health_result = analyze_equity_and_margin_health(
+        local_state=local_state,
+        exchange_snapshot=exchange_snapshot,
+        prices=prices,
+        lot_specs=lot_specs,
+        tolerance_usd=tolerance_usd,
+        equity_tolerance_pct=equity_tolerance_pct,
+        max_maint_margin_ratio=max_maint_margin_ratio,
+        min_liq_buffer_pct=min_liq_buffer_pct,
+    )
+    repair_actions.extend(health_result["repair_actions"])
+
+    # Thu tu uu tien status:
+    # EQUITY_MISMATCH > MARGIN_DANGER > ORPHAN_ON_EXCHANGE > PHANTOM_IN_STATE > QTY_DRIFT > SYNCED
     if eq_gap_pct > equity_tolerance_pct:
         status = EQUITY_MISMATCH
+    elif health_result["margin_danger"]:
+        status = MARGIN_DANGER
     elif orphans:
         status = ORPHAN_ON_EXCHANGE
     elif phantoms:
@@ -262,7 +571,21 @@ def reconcile_portfolio_state(
     else:
         status = SYNCED
 
-    summary = f"{status} | items={len(items)} | equity_gap={eq_gap_usd:.2f} USD ({eq_gap_pct:.2f}%)"
+    has_margin_data = (
+        _has_field(exchange_snapshot, "margin_balance_usd")
+        or _has_field(exchange_snapshot, "maint_margin_usd")
+        or health_result["margin_health"]["maint_margin_ratio"] > 0.0
+    )
+    mr = health_result["margin_health"]["maint_margin_ratio"]
+    mr_str = f"{mr:.2f}" if (has_margin_data and mr > 0.0) else ("0.00" if has_margin_data else "N/A")
+
+    ld = health_result["margin_health"]["min_liq_distance_pct"]
+    ld_str = f"{ld:.1f}%" if ld is not None else "N/A"
+
+    summary = (
+        f"{status} | items={len(items)} | equity_gap={eq_gap_usd:.2f} USD ({eq_gap_pct:.2f}%)"
+        f" | margin_ratio={mr_str} | liq_dist={ld_str}"
+    )
 
     return {
         "status": status,
@@ -277,4 +600,7 @@ def reconcile_portfolio_state(
         "tolerance_usd": float(tolerance_usd),
         "equity_tolerance_pct": float(equity_tolerance_pct),
         "summary": summary,
+        "equity_drift_attribution": health_result["equity_drift_attribution"],
+        "margin_health": health_result["margin_health"],
+        "margin_danger": health_result["margin_danger"],
     }
