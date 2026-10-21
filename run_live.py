@@ -93,6 +93,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="So giay giua 2 chu ky",
     )
     parser.add_argument(
+        "--audit-log",
+        default=None,
+        help="Sprint 16: duong dan JSONL audit (ghi 1 dong moi chu ky), vd logs/sprint16_paper_audit.jsonl",
+    )
+    parser.add_argument(
+        "--dry-run-sign",
+        action="store_true",
+        help="Sprint 16: chi ky va dong goi lenh testnet, khong gui (bat buoc khi thieu API key)",
+    )
+    parser.add_argument(
+        "--testnet-send-orders",
+        action="store_true",
+        help="Sprint 16: cho phep gui lenh that len testnet (mac dinh TAT, chi ky/dong goi)",
+    )
+    parser.add_argument(
         "--symbol",
         default="BTC/USDT:USDT",
         help="Cặp giao dịch (mặc định: BTC/USDT:USDT)",
@@ -216,6 +231,53 @@ def _run_shadow_live_preflight(args: argparse.Namespace, symbols: list[str]) -> 
     return True
 
 
+def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str]) -> bool:
+    """Sprint 16: chot an toan cho mode testnet - chi ky + dong goi lenh, fail-closed.
+
+    Khong gui lenh o bat ky truong hop nao trong pham vi sprint nay: payload duoc
+    dung de kiem tra chu ky HMAC va lot-size truoc khi noi executor.
+    """
+    from src.binance_signed_client import (
+        BinanceCredentialsMissingError,
+        BinanceSignedTestnetClient,
+    )
+
+    symbol = symbols[0] if symbols else "BTC/USDT:USDT"
+    dry_run = not bool(getattr(args, "testnet_send_orders", False))
+    try:
+        client = BinanceSignedTestnetClient(dry_run=dry_run)
+    except BinanceCredentialsMissingError as e:
+        logger.error("Testnet: %s", e)
+        return False
+
+    logger.info(
+        "Testnet signing preflight: symbol=%s | dry_run=%s | credentials=%s",
+        symbol,
+        client.dry_run,
+        client.has_credentials(),
+    )
+    if client.dry_run:
+        try:
+            proof = client.build_delta_neutral_order_pair(
+                symbol=symbol,
+                spot_qty=0.001,
+                perp_qty=0.001,
+                post_only_spot=False,
+                timestamp_ms=1700000000000,
+            )
+        except Exception as e:
+            logger.warning("Testnet: khong dung duoc payload mau (%s) - bo qua.", e)
+            return True
+        sig = str(proof["spot"]["params"].get("signature", ""))
+        logger.info(
+            "Testnet sign proof: spot=%s | perp=%s | sig_prefix=%s | dry_run=True (no order sent)",
+            proof["spot"]["url"],
+            proof["perp"]["url"],
+            sig[:8] if sig else "<unsigned>",
+        )
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -236,6 +298,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.mode == "testnet":
         if not has_api_keys:
             logger.warning("Testnet: thieu API key, chay Public Live Feed Paper Mode")
+            exec_mode = "paper"
+        else:
+            # Sprint 16: testnet luon chay paper executor, chi ky/dong goi lenh de kiem tra.
+            logger.info("Testnet: ki + dong goi lenh (khong gui), executor van chay paper.")
             exec_mode = "paper"
     elif args.mode == "shadow-live":
         # Shadow-live: chỉ đọc public feed + mô phỏng paper, KHÔNG dùng API key, KHÔNG đặt lệnh thật.
@@ -390,8 +456,14 @@ def main(argv: list[str] | None = None) -> int:
                 "Warmup requirement: >= 400h history (lookback_hours=%d).",
                 int(getattr(executor, "lookback_hours", 720)),
             )
+            if args.audit_log:
+                executor.audit_log_path = str(args.audit_log)
+                logger.info("Audit JSONL: %s", executor.audit_log_path)
             if args.mode == "shadow-live":
                 if not _run_shadow_live_preflight(args, barbell_symbols):
+                    return 1
+            if args.mode == "testnet":
+                if not _run_testnet_signing_preflight(args, barbell_symbols):
                     return 1
             return executor.run_loop(
                 once=bool(args.once),
@@ -416,8 +488,14 @@ def main(argv: list[str] | None = None) -> int:
             "Warmup requirement: >= 400h history (lookback_hours=%d).",
             int(getattr(executor, "lookback_hours", 720)),
         )
+        if args.audit_log:
+            executor.audit_log_path = str(args.audit_log)
+            logger.info("Audit JSONL: %s", executor.audit_log_path)
         if args.mode == "shadow-live":
             if not _run_shadow_live_preflight(args, [args.symbol]):
+                return 1
+        if args.mode == "testnet":
+            if not _run_testnet_signing_preflight(args, [args.symbol]):
                 return 1
         return executor.run_loop(
             once=bool(args.once),

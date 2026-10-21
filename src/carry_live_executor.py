@@ -10,11 +10,13 @@ Module cung cấp:
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional, Sequence
 
@@ -83,6 +85,72 @@ def _spot_symbol_clean_name(spot_symbol: str) -> str:
     return clean
 
 
+AUDIT_SCHEMA_VERSION: str = "sprint16.cycle.v1"
+
+
+def append_audit_record(
+    path: Optional[str | Path], record: dict[str, Any]
+) -> bool:
+    """Sprint 16: ghi 1 dong JSONL audit cho chu ky hien tai (False neu khong ghi)."""
+    if not path:
+        return False
+    try:
+        target = Path(path)
+        if target.parent and str(target.parent) not in ("", "."):
+            target.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=True, sort_keys=True, default=str)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        return True
+    except Exception as exc:  # pragma: no cover - phong thu I/O
+        logger.warning("Khong ghi duoc audit log %s: %s", path, exc)
+        return False
+
+
+def build_cycle_audit_record(
+    *,
+    cycle: int,
+    mode: str,
+    execution_style: str,
+    capital: float,
+    equity: float,
+    peak_equity: float,
+    drawdown_pct: float,
+    carry_spot_usd: float,
+    carry_perp_usd: float,
+    overlay_long_usd: float,
+    overlay_short_usd: float,
+    overlay_neutrality: Optional[dict[str, Any]] = None,
+    kill_switch: bool = False,
+    diagnostics_summary: str = "",
+    actions: Optional[dict[str, Any]] = None,
+    timestamp: Optional[str] = None,
+) -> dict[str, Any]:
+    """Sprint 16: dung payload audit JSONL chuan cho 1 chu ky reconcile."""
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
+    net_delta = float(overlay_long_usd) - float(overlay_short_usd)
+    return {
+        "schema": AUDIT_SCHEMA_VERSION,
+        "ts": ts,
+        "cycle": int(cycle),
+        "mode": mode,
+        "execution_style": execution_style,
+        "capital": float(capital),
+        "equity": float(equity),
+        "peak_equity": float(peak_equity),
+        "drawdown_pct": float(drawdown_pct),
+        "carry_spot_usd": float(carry_spot_usd),
+        "carry_perp_usd": float(carry_perp_usd),
+        "overlay_long_usd": float(overlay_long_usd),
+        "overlay_short_usd": float(overlay_short_usd),
+        "overlay_net_delta_usd": net_delta,
+        "overlay_neutrality": dict(overlay_neutrality or {}),
+        "kill_switch": bool(kill_switch),
+        "diagnostics": diagnostics_summary,
+        "actions": dict(actions or {}),
+    }
+
+
 class CarryLiveExecutor:
     """Bộ điều phối vận hành thực tế / paper cho chiến lược Dynamic Carry xoay vòng 12 coin."""
 
@@ -140,6 +208,9 @@ class CarryLiveExecutor:
         self.overlay_min_viable_leg_usd: float = 50.0
         self.last_overlay_neutrality: dict[str, Any] = {}
         self.last_overlay_delta: dict[str, float] = {}
+        # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
+        self.audit_log_path: Optional[str] = None
+        self.audit_written: int = 0
         self.maker_no_fill_count: int = 0
         self.last_decision_diagnostics: dict[str, Any] = {}
         self._leg_states: dict[str, dict[str, Any]] = {}
@@ -2896,6 +2967,28 @@ class CarryLiveExecutor:
                         "Diagnostics: %s",
                         (self.last_decision_diagnostics or {}).get("summary", "N/A")
                     )
+                    if self.audit_log_path:
+                        _record = build_cycle_audit_record(
+                            cycle=iterations,
+                            mode=str(self.mode),
+                            execution_style=str(self.execution_style),
+                            capital=self.capital,
+                            equity=cur_eq,
+                            peak_equity=peak_eq,
+                            drawdown_pct=dd_pct,
+                            carry_spot_usd=carry_spots,
+                            carry_perp_usd=carry_perps,
+                            overlay_long_usd=ov_long,
+                            overlay_short_usd=ov_short,
+                            overlay_neutrality=getattr(self, "last_overlay_neutrality", {}),
+                            kill_switch=ks_status,
+                            diagnostics_summary=str(
+                                (self.last_decision_diagnostics or {}).get("summary", "")
+                            ),
+                            actions=plan.get("actions") if isinstance(plan, dict) else None,
+                        )
+                        if append_audit_record(self.audit_log_path, _record):
+                            self.audit_written += 1
                 except Exception as e:
                     logger.error("Error in reconcile_once: %s", e, exc_info=True)
                     if once:
