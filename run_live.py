@@ -309,6 +309,10 @@ def main(argv: list[str] | None = None) -> int:
                 reset_state=bool(args.reset_state),
                 strategy=strat,
             )
+            logger.info(
+                "Warmup requirement: >= 400h history (lookback_hours=%d).",
+                int(getattr(executor, "lookback_hours", 720)),
+            )
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -327,6 +331,10 @@ def main(argv: list[str] | None = None) -> int:
             initial_capital=float(args.capital),
             reset_state=bool(args.reset_state),
             strategy=strat,
+        )
+        logger.info(
+            "Warmup requirement: >= 400h history (lookback_hours=%d).",
+            int(getattr(executor, "lookback_hours", 720)),
         )
         return executor.run_loop(
             once=bool(args.once),
