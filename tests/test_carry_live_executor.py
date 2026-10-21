@@ -219,9 +219,10 @@ def test_reconcile_once_open_hold_close_plan(tmp_path: Path) -> None:
     """3 chu kỳ liên tiếp phải tạo OPEN cho 2 symbol funding cao, HOLD rồi CLOSE khi điểm giảm."""
     raw_dir = tmp_path / "raw"
     symbols = ["AAA/USDT:USDT", "BBB/USDT:USDT", "CCC/USDT:USDT"]
-    _write_cache_bundle(raw_dir, "AAA/USDT:USDT", _HIGH_FUNDING)
-    _write_cache_bundle(raw_dir, "BBB/USDT:USDT", _HIGH_FUNDING)
-    _write_cache_bundle(raw_dir, "CCC/USDT:USDT", _LOW_FUNDING)
+    # Sprint 18: lich su phai >= 720h (cong bao hoa warmup) moi duoc mo vi the moi.
+    _write_cache_bundle(raw_dir, "AAA/USDT:USDT", _HIGH_FUNDING, n_hours=720)
+    _write_cache_bundle(raw_dir, "BBB/USDT:USDT", _HIGH_FUNDING, n_hours=720)
+    _write_cache_bundle(raw_dir, "CCC/USDT:USDT", _LOW_FUNDING, n_hours=720)
 
     carry_config = DynamicCarryConfig(
         top_k=2,
@@ -256,7 +257,7 @@ def test_reconcile_once_open_hold_close_plan(tmp_path: Path) -> None:
     for pos in executor.state.carry_positions.values():
         pos["periods_held"] = carry_config.min_hold_periods
     low_universe = {
-        sym: _aligned_frame(sym, funding_rate=_LOW_FUNDING) for sym in expected_high
+        sym: _aligned_frame(sym, funding_rate=_LOW_FUNDING, n_hours=720) for sym in expected_high
     }
     plan_close = executor.reconcile_once(aligned_universe=low_universe)
     actions_close = {action.symbol: action.action for action in plan_close["actions"]}

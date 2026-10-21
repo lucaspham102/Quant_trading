@@ -100,18 +100,18 @@ def test_diagnostics_summary_contains_all_gate_fields(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_warmup_gate_blocks_under_400_hours(tmp_path: Path) -> None:
+def test_warmup_gate_blocks_under_720_hours(tmp_path: Path) -> None:
     ex = _make_executor(tmp_path)
 
-    cold = ex.build_decision_diagnostics(_universe(399), None, None)
-    warm = ex.build_decision_diagnostics(_universe(400), None, None)
+    cold = ex.build_decision_diagnostics(_universe(719), None, None)
+    warm = ex.build_decision_diagnostics(_universe(720), None, None)
 
-    assert cold["warmup_hours_loaded"] == 399
-    assert cold["warmup_min_required"] == 400
+    assert cold["warmup_hours_loaded"] == 719
+    assert cold["warmup_min_required"] == 720
     assert cold["warmup_ok"] is False
     assert "COLD" in cold["summary"]
 
-    assert warm["warmup_hours_loaded"] == 400
+    assert warm["warmup_hours_loaded"] == 720
     assert warm["warmup_ok"] is True
     assert "-> OK" in warm["summary"]
 

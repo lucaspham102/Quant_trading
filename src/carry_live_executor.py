@@ -88,6 +88,13 @@ def _spot_symbol_clean_name(spot_symbol: str) -> str:
 
 AUDIT_SCHEMA_VERSION: str = "sprint16.cycle.v1"
 
+# Sprint 18: nguong bao hoa warmup bat buoc (Sprint 17 forensic: 504h chua du de
+# EMA-42 khung 8h = 336h hoi tu; 720h dat Jaccard = 0.992 -> bao hoa hoan toan).
+WARMUP_MIN_HOURS: int = 720
+# 720h / 8h = 90 ky funding toi thieu truoc khi duoc mo vi the moi.
+WARMUP_MIN_FUNDING_PERIODS_8H: int = 90
+WARMUP_BLOCK_REASON: str = "WARMUP_INSUFFICIENT_BELOW_720H"
+
 
 def append_audit_record(
     path: Optional[str | Path], record: dict[str, Any]
@@ -127,6 +134,9 @@ def build_cycle_audit_record(
     actions: Optional[dict[str, Any]] = None,
     timestamp: Optional[str] = None,
     reconcile_status: Optional[str] = None,
+    invariants_passed: Optional[bool] = None,
+    warmup_threshold_hours: int = WARMUP_MIN_HOURS,
+    warmup_hours_loaded: int = 0,
 ) -> dict[str, Any]:
     """Sprint 16: dung payload audit JSONL chuan cho 1 chu ky reconcile."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
@@ -154,6 +164,10 @@ def build_cycle_audit_record(
         ),
         # Sprint 17: trang thai doi soat san (None = khong bat --reconcile-snapshot)
         "reconcile_status": reconcile_status,
+        # Sprint 18: bat bien dinh luong runtime + nguong bao hoa warmup
+        "invariants_passed": bool(invariants_passed) if invariants_passed is not None else None,
+        "warmup_threshold_hours": int(warmup_threshold_hours),
+        "warmup_hours_loaded": int(warmup_hours_loaded),
     }
 
 
@@ -217,6 +231,14 @@ class CarryLiveExecutor:
         self.last_overlay_delta: dict[str, float] = {}
         # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
         self.audit_log_path: Optional[str] = None
+        # Sprint 18: cong bao hoa warmup 720h + bat bien dinh luong runtime.
+        # warmup_ready=True truoc khi do duoc do dai lich su (khong chan unit test
+        # goi thang build_barbell_allocations); reconcile_once luon do lai moi chu ky.
+        self.min_warmup_hours: int = int(WARMUP_MIN_HOURS)
+        self.warmup_ready: bool = True
+        self.warmup_hours_loaded: int = 0
+        self.invariants_passed: bool = True
+        self.last_lot_neutrality_invariant: dict[str, Any] = {}
         self.audit_written: int = 0
         self.maker_no_fill_count: int = 0
         self.last_decision_diagnostics: dict[str, Any] = {}
@@ -1039,6 +1061,39 @@ class CarryLiveExecutor:
             logger.info("Reconcile: %s | %s", self.reconcile_status, self.reconcile_report.get("summary", ""))
         return self.trading_allowed
 
+    def compute_warmup_readiness(
+        self, aligned_universe: Optional[dict[str, pd.DataFrame]] = None
+    ) -> dict[str, Any]:
+        """Sprint 18: do do dai lich su thuc te va khoa cong bao hoa 720h.
+
+        Tra ve ``warmup_ready == False`` khi lich su nap vao < 720h: luc do executor
+        phai chan mo vi the moi voi ly do ``WARMUP_INSUFFICIENT_BELOW_720H``.
+        """
+        lengths = [
+            len(df)
+            for df in (aligned_universe or {}).values()
+            if df is not None and len(df) > 0
+        ]
+        loaded = int(min(lengths)) if lengths else 0
+        required = int(getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS) or WARMUP_MIN_HOURS)
+        ready = bool(loaded >= required)
+        self.warmup_hours_loaded = loaded
+        self.warmup_ready = ready
+        if not ready:
+            logger.warning(
+                "Warmup: BLOCK (%s) - loaded=%dh < required=%dh -> khong mo vi the moi.",
+                WARMUP_BLOCK_REASON,
+                loaded,
+                required,
+            )
+        return {
+            "warmup_hours_loaded": loaded,
+            "warmup_min_required": required,
+            "warmup_threshold_hours": required,
+            "warmup_ready": ready,
+            "min_funding_periods_8h": int(WARMUP_MIN_FUNDING_PERIODS_8H),
+        }
+
     def build_barbell_allocations(
         self,
         aligned_universe: dict[str, pd.DataFrame],
@@ -1057,6 +1112,22 @@ class CarryLiveExecutor:
                 "raw_snr_dispersion": 0.0,
                 "overlay_active": False,
                 "reconcile_blocked": True,
+            }
+        if not bool(getattr(self, "warmup_ready", True)):
+            # Sprint 18: lich su < 720h (chua bao hoa EMA-42 khung 8h) -> fail-closed.
+            logger.warning(
+                "Warmup: BLOCK (%s) - loaded=%dh < required=%dh -> bo qua mo vi the moi.",
+                WARMUP_BLOCK_REASON,
+                int(getattr(self, "warmup_hours_loaded", 0)),
+                int(getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS)),
+            )
+            return {
+                "carry_sleeve": {"allocations": [], "total_notional": 0.0, "overlay_active": False, "raw_snr_dispersion": 0.0},
+                "momentum_overlay": {"allocations": [], "total_notional": 0.0, "overlay_active": False, "raw_snr_dispersion": 0.0},
+                "raw_snr_dispersion": 0.0,
+                "overlay_active": False,
+                "warmup_blocked": True,
+                "warmup_block_reason": WARMUP_BLOCK_REASON,
             }
         if scores_at_t is None:
             scores_dict = build_carry_basis_scores(aligned_universe, self.carry_config)
@@ -1251,6 +1322,43 @@ class CarryLiveExecutor:
                             "notional": float(notional_short),
                             "min_notional_ok": True,
                         })
+
+        # Sprint 18: kiem dinh bat bien LOT_NEUTRALITY ngay truoc khi phat lenh Overlay.
+        # Neu 2 chan lech > max_imbalance_usd (hoac 1 chan = 0 trong khi chan kia mo)
+        # -> huy toan bo lenh Overlay cua chu ky nay (fail-closed).
+        from src.quant_invariants import verify_lot_neutrality_invariant
+
+        _ov_long_check = 0.0
+        _ov_short_check = 0.0
+        for _alloc in overlay_allocations:
+            _notional = abs(float(_alloc.get("notional", 0.0) or 0.0))
+            _side_txt = str(_alloc.get("side", "")).lower()
+            if "short" in _side_txt:
+                _ov_short_check += _notional
+            else:
+                _ov_long_check += _notional
+
+        _lot_inv = verify_lot_neutrality_invariant(
+            _ov_long_check,
+            _ov_short_check,
+            max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
+            raise_on_fail=False,
+        )
+        self.last_lot_neutrality_invariant = dict(_lot_inv)
+        self.invariants_passed = bool(_lot_inv.get("passed", False))
+        if not self.invariants_passed:
+            logger.error(
+                "LOT_NEUTRALITY invariant FAILED -> huy lenh Overlay chu ky nay (fail-closed): %s",
+                _lot_inv.get("details", ""),
+            )
+            overlay_allocations = []
+            overlay_active = False
+            self.last_overlay_delta = {
+                "long_usd": 0.0,
+                "short_usd": 0.0,
+                "net_delta_usd": 0.0,
+                "invariants_passed": False,
+            }
 
         total_carry_notional = sum(float(a.get("notional", 0.0)) for a in carry_allocations)
         total_overlay_notional = sum(float(a.get("notional", 0.0)) for a in overlay_allocations)
@@ -2201,6 +2309,9 @@ class CarryLiveExecutor:
                     "valid": False,
                 }
 
+        # Sprint 18: do do dai lich su truoc khi dung phan bo -> khoa cong bao hoa 720h.
+        self.compute_warmup_readiness(aligned_universe)
+
         # Lưu trạng thái barbell sleeves
         barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
         self.last_decision_diagnostics = self.build_decision_diagnostics(
@@ -2314,6 +2425,22 @@ class CarryLiveExecutor:
                     "Reconcile: BLOCKED (%s) -> chan %d lanh the carry moi trong chu ky nay.",
                     getattr(self, "reconcile_status", "BLOCKED"),
                     blocked_open,
+                )
+
+        # Sprint 18: warmup < 720h -> chan mo vi the moi (fail-closed); dong/giam vi the
+        # dang co van duoc phep de giam rui ro.
+        if not bool(getattr(self, "warmup_ready", True)):
+            blocked_warmup = 0
+            for _sym, _act in list(resolved_actions.items()):
+                if _act == "OPEN_DELTA_NEUTRAL":
+                    resolved_actions[_sym] = "SKIP"
+                    resolved_reasons[_sym] = WARMUP_BLOCK_REASON
+                    blocked_warmup += 1
+            if blocked_warmup:
+                logger.warning(
+                    "Warmup: BLOCK (%s) -> chan %d lenh carry moi trong chu ky nay.",
+                    WARMUP_BLOCK_REASON,
+                    blocked_warmup,
                 )
 
         # PR-4: Kiem tra va sua delta drift truoc khi thuc thi lenh chu ky
@@ -2726,8 +2853,11 @@ class CarryLiveExecutor:
             if df is not None and len(df) > 0
         ]
         warmup_hours_loaded: int = int(min(valid_lens)) if valid_lens else 0
-        warmup_min_required: int = 400
-        warmup_ok: bool = bool(warmup_hours_loaded >= 400)
+        # Sprint 18: nguong bao hoa 720h (Sprint 17 forensic: 504h chua hoi tu EMA-42/8h).
+        warmup_min_required: int = int(
+            getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS) or WARMUP_MIN_HOURS
+        )
+        warmup_ok: bool = bool(warmup_hours_loaded >= warmup_min_required)
 
         # 2. Carry EMA gating
         carry_ema_span: int = int(getattr(self.carry_config, "ema_span", 42))
@@ -2854,13 +2984,18 @@ class CarryLiveExecutor:
             f"maxEMA={max_carry_ema_bps:.2f} bps vs thr {carry_ema_threshold_bps:.2f}) | "
             f"OverlayGate: {overlay_gate_verdict} (selected={overlay_selected_count}, "
             f"maxDelta={max_overlay_delta:.3f} vs thr {overlay_delta_threshold:.2f}) | "
-            f"TradesExecuted: carryTrades=0, overlayTrades=0"
+            f"TradesExecuted: carryTrades=0, overlayTrades=0 | "
+            f"Invariants: {'OK' if bool(getattr(self, 'invariants_passed', True)) else 'FAIL'}"
         )
 
         res: dict[str, Any] = {
             "warmup_hours_loaded": warmup_hours_loaded,
             "warmup_min_required": warmup_min_required,
+            "warmup_threshold_hours": warmup_min_required,
             "warmup_ok": warmup_ok,
+            "warmup_ready": warmup_ok,
+            "min_funding_periods_8h": int(WARMUP_MIN_FUNDING_PERIODS_8H),
+            "invariants_passed": bool(getattr(self, "invariants_passed", True)),
             "carry_ema_span": carry_ema_span,
             "max_carry_ema_bps": max_carry_ema_bps,
             "carry_ema_threshold_bps": carry_ema_threshold_bps,
@@ -2891,7 +3026,7 @@ class CarryLiveExecutor:
         overlay_verdict = "PASS" if diag.get("overlay_gate_pass") else "BLOCK"
         diag["summary"] = (
             f"Warmup={int(diag.get('warmup_hours_loaded', 0))}h "
-            f"(thr {int(diag.get('warmup_min_required', 400))}h) -> "
+            f"(thr {int(diag.get('warmup_min_required', WARMUP_MIN_HOURS))}h) -> "
             f"{'OK' if diag.get('warmup_ok') else 'COLD'} | "
             f"MaxCarryEMA={float(diag.get('max_carry_ema_bps', 0.0)):.2f} bps "
             f"(thr {float(diag.get('carry_ema_threshold_bps', 0.0)):.2f}) -> {carry_verdict} | "
@@ -2903,7 +3038,8 @@ class CarryLiveExecutor:
             f"OverlayGate: {overlay_verdict} (selected={int(diag.get('overlay_selected_count', 0))}, "
             f"maxDelta={float(diag.get('max_overlay_delta', 0.0)):.3f} vs thr "
             f"{float(diag.get('overlay_delta_threshold', 0.08)):.2f}) | "
-            f"TradesExecuted: carryTrades={c_cnt}, overlayTrades={o_cnt}"
+            f"TradesExecuted: carryTrades={c_cnt}, overlayTrades={o_cnt} | "
+            f"Invariants: {'OK' if bool(diag.get('invariants_passed', True)) else 'FAIL'}"
         )
 
     def format_status_table(self, plan: dict[str, Any]) -> str:
@@ -3066,6 +3202,11 @@ class CarryLiveExecutor:
                             ),
                             actions=plan.get("actions") if isinstance(plan, dict) else None,
                             reconcile_status=getattr(self, "reconcile_status", None),
+                            invariants_passed=bool(getattr(self, "invariants_passed", True)),
+                            warmup_threshold_hours=int(
+                                getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS)
+                            ),
+                            warmup_hours_loaded=int(getattr(self, "warmup_hours_loaded", 0)),
                         )
                         if append_audit_record(self.audit_log_path, _record):
                             self.audit_written += 1

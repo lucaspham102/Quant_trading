@@ -515,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
                 tier1b_gate=True,
             )
             logger.info(
-                "Warmup requirement: >= 400h history (lookback_hours=%d).",
+                "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
                 int(getattr(executor, "lookback_hours", 720)),
             )
             if args.audit_log:
@@ -549,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             strategy=strat,
         )
         logger.info(
-            "Warmup requirement: >= 400h history (lookback_hours=%d).",
+            "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
             int(getattr(executor, "lookback_hours", 720)),
         )
         if args.audit_log:
