@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.barbell_portfolio import (
     BarbellConfig,
+    compute_adaptive_min_viable_leg_usd,
     compute_snr_dispersion,
     enforce_overlay_dollar_neutrality,
 )
@@ -125,6 +126,7 @@ def build_cycle_audit_record(
     diagnostics_summary: str = "",
     actions: Optional[dict[str, Any]] = None,
     timestamp: Optional[str] = None,
+    reconcile_status: Optional[str] = None,
 ) -> dict[str, Any]:
     """Sprint 16: dung payload audit JSONL chuan cho 1 chu ky reconcile."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
@@ -150,6 +152,8 @@ def build_cycle_audit_record(
         "actions": dict(actions) if isinstance(actions, Mapping) else (
             list(actions) if isinstance(actions, (list, tuple)) else {}
         ),
+        # Sprint 17: trang thai doi soat san (None = khong bat --reconcile-snapshot)
+        "reconcile_status": reconcile_status,
     }
 
 
@@ -207,7 +211,8 @@ class CarryLiveExecutor:
         self.last_overlay_targets: dict[str, Any] = {}
         # Sprint 16: guard trung tinh USD sau lam tron lot-size cho overlay.
         self.overlay_max_imbalance_usd: float = 10.0
-        self.overlay_min_viable_leg_usd: float = 50.0
+        # Sprint 17: None = tu co gian theo von hoat dong (adaptive), so cu the = ghim cung.
+        self.overlay_min_viable_leg_usd: Optional[float] = None
         self.last_overlay_neutrality: dict[str, Any] = {}
         self.last_overlay_delta: dict[str, float] = {}
         # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
@@ -215,6 +220,11 @@ class CarryLiveExecutor:
         self.audit_written: int = 0
         self.maker_no_fill_count: int = 0
         self.last_decision_diagnostics: dict[str, Any] = {}
+        # Sprint 17: ket qua doi soat san. None = chua doi soat (khong chan),
+        # "SYNCED" = cho phep mo lenh moi, khac = fail-closed (chi dong/khong mo moi).
+        self.reconcile_status: Optional[str] = None
+        self.reconcile_report: Optional[dict[str, Any]] = None
+        self.trading_allowed: bool = True
         self._leg_states: dict[str, dict[str, Any]] = {}
         self.overlay_config: Optional[BarbellConfig] = overlay_config
         self.enable_lot_quantization: bool = bool(enable_lot_quantization)
@@ -1002,12 +1012,52 @@ class CarryLiveExecutor:
                 out[sym] = float(scores_at_t.get(sym, 0.0))
         return out
 
+    def _reconcile_dashboard_label(self) -> str:
+        """Sprint 17: nhan Dashboard cho trang thai doi soat san."""
+        status = getattr(self, "reconcile_status", None)
+        if status is None:
+            return "OFF"
+        return status if bool(getattr(self, "trading_allowed", False)) else f"BLOCKED ({status})"
+
+    def apply_reconcile_report(self, report: Optional[dict[str, Any]]) -> bool:
+        """Sprint 17: nap ket qua doi soat san; tra ve True neu duoc phep mo lenh moi."""
+        self.reconcile_report = dict(report) if isinstance(report, Mapping) else None
+        if self.reconcile_report is None:
+            self.reconcile_status = None
+            self.trading_allowed = True
+            return True
+        self.reconcile_status = str(self.reconcile_report.get("status") or "BLOCKED")
+        self.trading_allowed = bool(self.reconcile_report.get("trading_allowed", False))
+        if not self.trading_allowed:
+            logger.error(
+                "Reconcile: BLOCKED (%s) | %s | repair_actions=%d",
+                self.reconcile_status,
+                self.reconcile_report.get("summary", ""),
+                len(self.reconcile_report.get("repair_actions") or []),
+            )
+        else:
+            logger.info("Reconcile: %s | %s", self.reconcile_status, self.reconcile_report.get("summary", ""))
+        return self.trading_allowed
+
     def build_barbell_allocations(
         self,
         aligned_universe: dict[str, pd.DataFrame],
         scores_at_t: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Xây dựng phân bổ danh mục Barbell gồm 2 nhánh: carry_sleeve và tactical momentum_overlay."""
+        if not getattr(self, "trading_allowed", True):
+            # Sprint 17: doi soat san chua khop -> khong mo vi the moi trong chu ky nay.
+            logger.warning(
+                "Reconcile: BLOCKED (%s) -> bo qua mo vi the moi trong chu ky nay.",
+                getattr(self, "reconcile_status", "BLOCKED"),
+            )
+            return {
+                "carry_sleeve": {"allocations": [], "total_notional": 0.0, "overlay_active": False, "raw_snr_dispersion": 0.0},
+                "momentum_overlay": {"allocations": [], "total_notional": 0.0, "overlay_active": False, "raw_snr_dispersion": 0.0},
+                "raw_snr_dispersion": 0.0,
+                "overlay_active": False,
+                "reconcile_blocked": True,
+            }
         if scores_at_t is None:
             scores_dict = build_carry_basis_scores(aligned_universe, self.carry_config)
             scores_at_t = {}
@@ -1086,16 +1136,25 @@ class CarryLiveExecutor:
 
             # Sprint 16: sau khi floor lot-size tung ma, can lai 2 chan theo USD
             # de khong bao gio ro ri delta rong (1 lot BTC ~ 96.5 USD).
+            # Sprint 17: nguong toi thieu moi chan tu co gian theo von hoat dong
+            # (von nho 400-600 USDT van chay duoc, khong bi tat toan bo sleeve).
+            _min_leg_override = getattr(self, "overlay_min_viable_leg_usd", None)
+            if _min_leg_override is None:
+                _min_leg_usd = compute_adaptive_min_viable_leg_usd(equity_now)
+            else:
+                _min_leg_usd = float(_min_leg_override)
             neutral_qty = enforce_overlay_dollar_neutrality(
                 target_notional_signed,
                 prices,
                 EXCHANGE_LOT_SPECS,
                 max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
-                min_viable_leg_usd=float(getattr(self, "overlay_min_viable_leg_usd", 50.0)),
+                min_viable_leg_usd=_min_leg_usd,
             )
             self.last_overlay_neutrality = {
                 "target_notional_by_symbol": dict(target_notional_signed),
                 "neutral_qty": dict(neutral_qty),
+                "min_viable_leg_usd": float(_min_leg_usd),
+                "adaptive": _min_leg_override is None,
             }
 
             overlay_long_usd = 0.0
@@ -2241,6 +2300,22 @@ class CarryLiveExecutor:
                 resolved_actions[sym] = "SKIP"
                 resolved_reasons[sym] = raw_rs
 
+        # Sprint 17: doi soat san chua khop -> fail-closed, chan MOI vi the moi
+        # (carry lan overlay); dong/giam vi the van duoc phep de giam rui ro.
+        if not getattr(self, "trading_allowed", True):
+            blocked_open = 0
+            for _sym, _act in list(resolved_actions.items()):
+                if _act == "OPEN_DELTA_NEUTRAL":
+                    resolved_actions[_sym] = "SKIP"
+                    resolved_reasons[_sym] = f"RECONCILE_BLOCKED_{getattr(self, 'reconcile_status', 'BLOCKED')}"
+                    blocked_open += 1
+            if blocked_open:
+                logger.warning(
+                    "Reconcile: BLOCKED (%s) -> chan %d lanh the carry moi trong chu ky nay.",
+                    getattr(self, "reconcile_status", "BLOCKED"),
+                    blocked_open,
+                )
+
         # PR-4: Kiem tra va sua delta drift truoc khi thuc thi lenh chu ky
         try:
             drift_items = self.audit_delta_drift(aligned_universe)
@@ -2952,7 +3027,7 @@ class CarryLiveExecutor:
                         else:
                             ov_long += _q * _px
                     logger.info(
-                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s",
+                        "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s | Reconcile=%s",
                         iterations,
                         self.capital,
                         cur_eq,
@@ -2964,6 +3039,7 @@ class CarryLiveExecutor:
                         ov_short,
                         ov_long - ov_short,
                         ks_status,
+                        self._reconcile_dashboard_label(),
                     )
                     logger.info(
                         "Diagnostics: %s",
@@ -2989,6 +3065,7 @@ class CarryLiveExecutor:
                                 (self.last_decision_diagnostics or {}).get("summary", "")
                             ),
                             actions=plan.get("actions") if isinstance(plan, dict) else None,
+                            reconcile_status=getattr(self, "reconcile_status", None),
                         )
                         if append_audit_record(self.audit_log_path, _record):
                             self.audit_written += 1

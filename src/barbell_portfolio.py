@@ -207,12 +207,32 @@ def _floor_to_step(qty_abs: float, step: float) -> float:
     return round(n_steps * step, digits)
 
 
+def compute_adaptive_min_viable_leg_usd(
+    active_capital: float,
+    min_floor_usd: float = 10.0,
+    max_cap_usd: float = 50.0,
+    capital_ratio: float = 0.015,
+) -> float:
+    """Sprint 17: nguong toi thieu moi chan overlay ty le theo von hoat dong.
+
+    ``max(10, min(50, capital * 1.5%))`` - o von 3,000 USDT giu nguyen 45-50 USDT
+    (tuong thich Sprint 16), nhung khi chay testnet von 400-600 USDT nguong tu ha
+    xuong 10 USDT (van > ``min_notional`` 5-10 USDT cua san va van khoa tuyet doi
+    khi mot chan bi lam tron ve 0).
+    """
+    capital = float(active_capital)
+    if capital != capital or capital < 0.0:  # NaN hoac am
+        capital = 0.0
+    return float(max(float(min_floor_usd), min(float(max_cap_usd), capital * float(capital_ratio))))
+
+
 def enforce_overlay_dollar_neutrality(
     target_notional_by_symbol: dict[str, float],
     prices: dict[str, float],
     lot_specs: dict[str, dict[str, float]],
     max_imbalance_usd: float = 10.0,
-    min_viable_leg_usd: float = 50.0,
+    min_viable_leg_usd: float | None = None,
+    active_capital: float | None = None,
 ) -> dict[str, float]:
     """Sprint 16: bao dam overlay trung tinh USD SAU khi lam tron lot-size.
 
@@ -231,7 +251,18 @@ def enforce_overlay_dollar_neutrality(
 
     Tra ve:
         Dict map {symbol: signed_qty} (qty am = chan short).
+
+    Sprint 17: ``min_viable_leg_usd=None`` (mac dinh) -> tu tinh theo von hoat dong
+    (``active_capital`` neu co, nguoc lai 50.0 de giu tuong thich Sprint 16). Truyen
+    so cu the thi dung dung so do (toan bo test Sprint 16 van chay nguyen).
     """
+    if min_viable_leg_usd is None:
+        min_viable_leg_usd = (
+            compute_adaptive_min_viable_leg_usd(float(active_capital))
+            if active_capital is not None and float(active_capital) > 0.0
+            else 50.0
+        )
+    min_viable_leg_usd = float(min_viable_leg_usd)
     result: dict[str, float] = {sym: 0.0 for sym in target_notional_by_symbol}
     if not target_notional_by_symbol:
         return result
@@ -567,6 +598,9 @@ def _simulate_barbell_equity(
     net_usd = np.zeros(bars, dtype=np.float64)
     weights = np.zeros((bars, n_sym), dtype=np.float64)
     leverage = np.zeros(bars, dtype=np.float64)
+    # Sprint 17: do phap y - von co so dung de nhan PnL overlay va co tai can bang.
+    notional_base = np.zeros(bars, dtype=np.float64)
+    rebal_flag = np.zeros(bars, dtype=bool)
 
     quantization_events = 0
     skipped_rebalances = 0
@@ -582,6 +616,8 @@ def _simulate_barbell_equity(
             "net_usd": net_usd,
             "weights": weights,
             "leverage": leverage,
+            "notional_base": notional_base,
+            "rebal_flag": rebal_flag,
             "quantization_events": quantization_events,
             "skipped_rebalances": skipped_rebalances,
             "turnover_weight": turnover_weight,
@@ -673,10 +709,12 @@ def _simulate_barbell_equity(
         # R2-3: active_capital cho overlay g_base
         active_capital_overlay = max(0.0, min(float(initial_capital), float(prev_eq)))
         g_base = prev_eq if reinvest_profits else active_capital_overlay
+        notional_base[t] = float(g_base)
         g_usd = gross_ret * g_base
         gross_usd[t] = g_usd
 
         is_rebal = ((t + int(rebalance_phase_offset)) % rebalance_hours == 0) or w_changed[t]
+        rebal_flag[t] = bool(is_rebal)
         fee = 0.0
 
         if is_rebal:
@@ -756,6 +794,8 @@ def _simulate_barbell_equity(
 
     return {
         "equity": equity,
+        "notional_base": notional_base,
+        "rebal_flag": rebal_flag,
         "returns": returns,
         "gross_usd": gross_usd,
         "fees_usd": fees_usd,
@@ -1309,6 +1349,22 @@ def run_barbell_portfolio(
     hourly_overlay_pnl = net_usd
     hourly_overlay_fees = fees_usd
 
+    # Sprint 17: chuan hoa du lieu phap y thanh Series (ca 2 nhanh active/inactive).
+    if is_overlay_inactive:
+        notional_base_series = pd.Series(0.0, index=common_index, dtype="float64")
+        rebal_flag_series = pd.Series(False, index=common_index, dtype=bool)
+    else:
+        notional_base_series = pd.Series(
+            sim_res.get("notional_base", np.zeros(n_bars, dtype=np.float64)),
+            index=common_index,
+            dtype="float64",
+        )
+        rebal_flag_series = pd.Series(
+            sim_res.get("rebal_flag", np.zeros(n_bars, dtype=bool)),
+            index=common_index,
+            dtype=bool,
+        )
+
     # 9. Xây dựng attribution_series phân rã 7 cột
     carry_attr = carry_result["attribution_series"]
     if is_overlay_inactive:
@@ -1483,4 +1539,12 @@ def run_barbell_portfolio(
         "overlay_active_ratio": overlay_active_ratio,
         "overlay_leverage_series": leverage_series,
         "snr_dispersion": raw_snr_dispersion,
+        # Sprint 17: du lieu phap y (chi de chan doan, khong doi logic giao dich).
+        "overlay_raw_weights": raw_weights_aligned,
+        "overlay_notional_base": notional_base_series,
+        "overlay_rebal_flags": rebal_flag_series,
+        "overlay_returns_by_symbol": ret_matrix,
+        "overlay_funding_by_symbol": funding_matrix,
+        "overlay_gross_series": gross_usd,
+        "overlay_fee_series": fees_usd,
     }

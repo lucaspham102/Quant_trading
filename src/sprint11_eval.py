@@ -260,6 +260,173 @@ def compute_sleeve_attribution(
     return out
 
 
+def decompose_overlay_pnl_divergence(
+    weights_ref: pd.DataFrame,
+    weights_alt: pd.DataFrame,
+    returns: pd.DataFrame,
+    notional_ref: pd.Series | None = None,
+    notional_alt: pd.Series | None = None,
+    fees_ref: pd.Series | None = None,
+    fees_alt: pd.Series | None = None,
+    funding: pd.DataFrame | None = None,
+    start: str | pd.Timestamp | None = None,
+    end: str | pd.Timestamp | None = None,
+    tolerance_weight: float = 1e-6,
+    lag_weights: bool = True,
+) -> dict[str, Any]:
+    """Sprint 17: phan ra chinh xac chenh lech PnL gross cua nhanh overlay.
+
+    Dang thuc chinh xac (per gio)::
+
+        g_alt - g_ref = (A_alt - A_ref) * n_ref + A_alt * (n_alt - n_ref)
+
+    voi ``A_t = sum_sym w[t, sym] * (ret[t, sym] - funding[t, sym])``.
+    So hang 1 = ``weight_effect_usd`` (khac trong so muc tieu / trang thai giu vi the),
+    so hang 2 = ``capital_effect_usd`` (khac von co so nhan PnL). Phan phi tach rieng
+    qua ``fee_effect_usd``. Tong 3 hieu ung phai bang dung chenh lech net PnL.
+    """
+    empty: dict[str, Any] = {
+        "available": False,
+        "hours": 0,
+        "gross_ref_usd": 0.0,
+        "gross_alt_usd": 0.0,
+        "net_ref_usd": 0.0,
+        "net_alt_usd": 0.0,
+        "gross_gap_usd": 0.0,
+        "net_gap_usd": 0.0,
+        "weight_effect_usd": 0.0,
+        "capital_effect_usd": 0.0,
+        "fee_effect_usd": 0.0,
+        "residual_usd": 0.0,
+        "weights_equal_ratio": 0.0,
+        "rebal_hours_ref": 0,
+        "rebal_hours_alt": 0,
+        "rebal_timing_mismatch_hours": 0,
+        "rebal_timing_match_ratio": 0.0,
+        "notional_ref_mean": 0.0,
+        "notional_alt_mean": 0.0,
+        "weight_effect_by_symbol_usd": {},
+    }
+    if not isinstance(weights_ref, pd.DataFrame) or weights_ref.empty:
+        return empty
+    if not isinstance(weights_alt, pd.DataFrame) or weights_alt.empty:
+        return empty
+    if not isinstance(returns, pd.DataFrame) or returns.empty:
+        return empty
+
+    idx = weights_ref.index
+    if isinstance(idx, pd.DatetimeIndex):
+        mask = pd.Series(True, index=idx)
+        if start is not None:
+            mask &= idx >= pd.Timestamp(start, tz="UTC")
+        if end is not None:
+            mask &= idx <= pd.Timestamp(end, tz="UTC")
+        sel = idx[mask.to_numpy()]
+    else:  # pragma: no cover - defensive
+        sel = idx
+    if len(sel) == 0:
+        return empty
+
+    cols = [c for c in weights_ref.columns if c in weights_alt.columns and c in returns.columns]
+    if not cols:
+        return empty
+
+    w_ref = weights_ref.loc[sel, cols].fillna(0.0).astype(float)
+    w_alt = weights_alt.reindex(sel)[cols].fillna(0.0).astype(float)
+    ret = returns.reindex(sel)[cols].fillna(0.0).astype(float)
+    if isinstance(funding, pd.DataFrame) and not funding.empty:
+        ret_eff = ret - funding.reindex(sel)[cols].fillna(0.0).astype(float)
+    else:
+        ret_eff = ret
+
+    n_ref = (
+        notional_ref.reindex(sel).fillna(0.0).astype(float)
+        if isinstance(notional_ref, pd.Series)
+        else pd.Series(0.0, index=sel, dtype=float)
+    )
+    n_alt = (
+        notional_alt.reindex(sel).fillna(0.0).astype(float)
+        if isinstance(notional_alt, pd.Series)
+        else pd.Series(0.0, index=sel, dtype=float)
+    )
+    f_ref = (
+        fees_ref.reindex(sel).fillna(0.0).astype(float)
+        if isinstance(fees_ref, pd.Series)
+        else pd.Series(0.0, index=sel, dtype=float)
+    )
+    f_alt = (
+        fees_alt.reindex(sel).fillna(0.0).astype(float)
+        if isinstance(fees_alt, pd.Series)
+        else pd.Series(0.0, index=sel, dtype=float)
+    )
+
+    a_ref = (w_ref * ret_eff).sum(axis=1)
+    a_alt = (w_alt * ret_eff).sum(axis=1)
+    gross_ref = float((a_ref * n_ref).sum())
+    gross_alt = float((a_alt * n_alt).sum())
+    weight_effect_series = (a_alt - a_ref) * n_ref
+    capital_effect_series = a_alt * (n_alt - n_ref)
+    fee_effect = float(f_ref.sum() - f_alt.sum())
+
+    weights_equal = (w_ref - w_alt).abs().max(axis=1) <= tolerance_weight
+    w_diff = (w_alt - w_ref).abs().mul(ret_eff.abs(), axis=0).mul(n_ref, axis=0)
+    by_symbol = {str(c): float(w_diff[c].sum()) for c in cols}
+
+    rebal_ref = w_ref.diff().abs().max(axis=1) > tolerance_weight
+    rebal_alt = w_alt.diff().abs().max(axis=1) > tolerance_weight
+    union = int((rebal_ref | rebal_alt).sum())
+    mismatch = int((rebal_ref != rebal_alt).sum())
+
+    if lag_weights and len(w_ref) > 1:
+        # Trong sim, PnL cua gio t dung vi the dang giu (dat tai tai can bang truoc),
+        # tuc weights[t-1]. Bo bar dau de dang thuc khep kin tuyet doi.
+        w_ref = w_ref.shift(1).iloc[1:]
+        w_alt = w_alt.shift(1).iloc[1:]
+        ret_eff = ret_eff.iloc[1:]
+        n_ref = n_ref.iloc[1:]
+        n_alt = n_alt.iloc[1:]
+        f_ref = f_ref.iloc[1:]
+        f_alt = f_alt.iloc[1:]
+        a_ref = (w_ref * ret_eff).sum(axis=1)
+        a_alt = (w_alt * ret_eff).sum(axis=1)
+        gross_ref = float((a_ref * n_ref).sum())
+        gross_alt = float((a_alt * n_alt).sum())
+        weight_effect_series = (a_alt - a_ref) * n_ref
+        capital_effect_series = a_alt * (n_alt - n_ref)
+        fee_effect = float(f_ref.sum() - f_alt.sum())
+        weights_equal = (w_ref - w_alt).abs().max(axis=1) <= tolerance_weight
+        w_diff = (w_alt - w_ref).abs().mul(ret_eff.abs(), axis=0).mul(n_ref, axis=0)
+        by_symbol = {str(c): float(w_diff[c].sum()) for c in cols}
+
+    net_ref = gross_ref - float(f_ref.sum())
+    net_alt = gross_alt - float(f_alt.sum())
+    return {
+        "available": True,
+        "hours": int(len(sel)),
+        "gross_ref_usd": gross_ref,
+        "gross_alt_usd": gross_alt,
+        "net_ref_usd": net_ref,
+        "net_alt_usd": net_alt,
+        "gross_gap_usd": gross_alt - gross_ref,
+        "net_gap_usd": net_alt - net_ref,
+        "weight_effect_usd": float(weight_effect_series.sum()),
+        "capital_effect_usd": float(capital_effect_series.sum()),
+        "fee_effect_usd": fee_effect,
+        "residual_usd": float(
+            (net_alt - net_ref)
+            - (float(weight_effect_series.sum()) + float(capital_effect_series.sum()) + fee_effect)
+        ),
+        "weights_equal_ratio": float(weights_equal.mean()),
+        "rebal_hours_ref": int(rebal_ref.sum()),
+        "rebal_hours_alt": int(rebal_alt.sum()),
+        "rebal_timing_mismatch_hours": mismatch,
+        "rebal_timing_match_ratio": (1.0 - mismatch / union) if union > 0 else 1.0,
+        "notional_ref_mean": float(n_ref.mean()),
+        "notional_alt_mean": float(n_alt.mean()),
+        "weight_effect_by_symbol_usd": by_symbol,
+    }
+
+
 def run_indicator_warm_cash_start(
     data: dict[str, pd.DataFrame],
     capital: float = SPRINT11_INITIAL_CAPITAL,
@@ -270,6 +437,7 @@ def run_indicator_warm_cash_start(
     gating_mode: str = "smooth_conviction",
     warmup_hours: int = SPRINT14_WARMUP_HOURS,
     phase_aligned: bool = False,
+    include_raw: bool = False,
 ) -> dict[str, Any]:
     """Method D: chỉ báo đã ấm (nhìn được lịch sử trước holdout) nhưng tồn kho bằng tiền mặt.
 
@@ -364,6 +532,9 @@ def run_indicator_warm_cash_start(
             split_date=split_date,
             holdout_end=holdout_end,
         ),
+        # Sprint 17: chi tra ve ket qua tho khi duoc yeu cau (chan doan phap y);
+        # mac dinh False de giu payload JSON nhe va on dinh.
+        **({"raw_result": res} if include_raw else {}),
     }
 
 
@@ -1050,6 +1221,8 @@ def compute_holdout_accounting_bridge(
     payload_fixed_base: dict[str, Any] | None = None,
     warm_cash: dict[str, Any] | None = None,
     warm_cash_aligned: dict[str, Any] | None = None,
+    warm_cash_converged: dict[str, Any] | None = None,
+    overlay_forensics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Doi soat 3 phuong phap do lai Holdout (warm-state vs cold-start).
 
@@ -1170,8 +1343,7 @@ def compute_holdout_accounting_bridge(
 
     inventory_carryover = (
         (float(fixed["net_pnl_usd"]) - net_d - entry_fee) if method_d["available"] else warmup_drag
-    )
-    # Dong nhat thuc: Fee + Blindness + ClockPhaseDrift + PureCarryover = B - C
+    )    # Dong nhat thuc: Fee + Blindness + ClockPhaseDrift + PureCarryover = B - C
     pure_inventory_carryover = (
         (float(fixed["net_pnl_usd"]) - net_d_aligned - entry_fee)
         if method_d_aligned["available"]
@@ -1187,6 +1359,35 @@ def compute_holdout_accounting_bridge(
         "explained_total_usd": float(explained_total),
         "unexplained_total_usd": float(cold_start_total_drag - explained_total),
     }
+
+    # Sprint 17 - phep do chuan E: warm cash hoi tu (720h) + pha tai can bang tuyet doi.
+    e_payload = warm_cash_converged if isinstance(warm_cash_converged, dict) else {}
+    net_e = float(e_payload.get("net_pnl_usd", 0.0) or 0.0) if e_payload else 0.0
+    e_true_fixed_warm_cash = {
+        "available": bool(e_payload),
+        "label": "E_true_fixed_warm_cash",
+        "warmup_hours": int(e_payload.get("warmup_hours", 0) or 0),
+        "rebalance_phase_offset": int(e_payload.get("rebalance_phase_offset", 0) or 0),
+        "net_pnl_usd": net_e,
+        "return_on_active_capital_pct": (
+            (net_e / active_capital * 100.0) if (e_payload and active_capital > 0) else 0.0
+        ),
+        "overlay_net_pnl_usd": float(e_payload.get("overlay_net_pnl_usd", 0.0) or 0.0),
+        "entry_fee_usd": float(e_payload.get("entry_fee_usd", 0.0) or 0.0),
+        "gap_b_minus_e_usd": (float(fixed["net_pnl_usd"]) - net_e) if e_payload else 0.0,
+        # Sprint 17: add-back dung phi vao lenh CUA CHINH E (E tra trong cua so holdout,
+        # con B da tra truoc split) - dung `entry_fee` cua A/B se tinh trung hai lan
+        # va lam sai lech con so (2.22 vs 3.97).
+        "revised_pure_carryover_usd": (
+            (float(fixed["net_pnl_usd"]) - net_e - float(e_payload.get("entry_fee_usd", 0.0) or 0.0))
+            if e_payload
+            else 0.0
+        ),
+        "sleeve_attribution": _extract_sleeve_attribution(e_payload),
+    }
+    overlay_divergence_forensics = (
+        dict(overlay_forensics) if isinstance(overlay_forensics, dict) else {"available": False}
+    )
 
     return {
         "holdout_days": float(row_a.get("holdout_days", 0.0) or 0.0),
@@ -1209,6 +1410,8 @@ def compute_holdout_accounting_bridge(
         "sleeve_attribution": _build_sleeve_attribution_block(
             compound, fixed, cold, method_d, method_d_aligned
         ),
+        "e_true_fixed_warm_cash": e_true_fixed_warm_cash,
+        "overlay_divergence_forensics": overlay_divergence_forensics,
         "bridge_decomposition": {
             "compounding_scale_effect_usd": float(compounding_scale_effect),
             "cold_start_total_drag_usd": float(cold_start_total_drag),
