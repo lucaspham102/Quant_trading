@@ -378,7 +378,7 @@ class BinanceSignedTestnetClient:
             for asset, free_val in spot_balances_raw.items():
                 if free_val <= 0.0:
                     continue
-                if asset in ("USDT", "USDC", "BUSD", "USD") or asset.endswith(("USDT", "USDC", "BUSD")):
+                if _is_cash_asset(asset):
                     spot_cash_usd += free_val
                 else:
                     canon_sym = normalize_symbol(asset)
