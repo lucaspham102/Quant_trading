@@ -167,6 +167,99 @@ def _slice_data_range(
 SPRINT14_WARMUP_HOURS = 504
 
 
+def compute_sleeve_attribution(
+    attribution_series: Any,
+    holdings_log: Any,
+    split_date: str = SPRINT11_SPLIT_DATE,
+    holdout_end: str = SPRINT11_HOLDOUT_END,
+    n_carry_slots: int = 4,
+    first_window_hours: int = 720,
+) -> dict[str, Any]:
+    """Sprint 16: phan ra PnL holdout theo nhanh (Carry/Overlay) va cua so 30d/151d.
+
+    Nguon so lieu: ``attribution_series`` cua ``run_barbell_portfolio`` voi cac cot
+    ``funding_pnl``, ``basis_pnl``, ``overlay_pnl``, ``carry_fees``, ``overlay_fees``, ``net_pnl``.
+
+    Dang thuc bat buoc:
+    - ``carry_net_pnl_usd + overlay_net_pnl_usd == net_pnl_usd``
+    - ``first_30d_net_pnl_usd + last_151d_net_pnl_usd == net_pnl_usd``
+    """
+    out: dict[str, Any] = {
+        "available": False,
+        "carry_net_pnl_usd": 0.0,
+        "overlay_net_pnl_usd": 0.0,
+        "carry_fees_usd": 0.0,
+        "overlay_fees_usd": 0.0,
+        "net_pnl_usd": 0.0,
+        "avg_carry_slots_held": 0.0,
+        "carry_utilization_pct": 0.0,
+        "first_30d_net_pnl_usd": 0.0,
+        "last_151d_net_pnl_usd": 0.0,
+        "holdout_hours": 0,
+        "first_window_hours": int(first_window_hours),
+        "n_carry_slots": int(n_carry_slots),
+    }
+    if not isinstance(attribution_series, pd.DataFrame) or attribution_series.empty:
+        return out
+    if not isinstance(attribution_series.index, pd.DatetimeIndex):
+        return out
+
+    start_ts = pd.Timestamp(split_date, tz="UTC")
+    end_ts = pd.Timestamp(holdout_end, tz="UTC")
+    idx = attribution_series.index
+    win = attribution_series.loc[(idx >= start_ts) & (idx <= end_ts)]
+    if win.empty:
+        return out
+
+    def _col(frame: pd.DataFrame, name: str) -> pd.Series:
+        if name in frame.columns:
+            return frame[name].astype("float64").fillna(0.0)
+        return pd.Series(0.0, index=frame.index, dtype="float64")
+
+    funding = _col(win, "funding_pnl")
+    basis = _col(win, "basis_pnl")
+    overlay_net = _col(win, "overlay_pnl")
+    carry_fees = _col(win, "carry_fees")
+    overlay_fees = _col(win, "overlay_fees")
+    if "net_pnl" in win.columns:
+        net = _col(win, "net_pnl")
+    else:
+        net = funding + basis + overlay_net
+
+    carry_net = funding + basis - carry_fees
+    out.update(
+        {
+            "available": True,
+            "carry_net_pnl_usd": float(carry_net.sum()),
+            "overlay_net_pnl_usd": float(overlay_net.sum()),
+            "carry_fees_usd": float(carry_fees.sum()),
+            "overlay_fees_usd": float(overlay_fees.sum()),
+            "net_pnl_usd": float(net.sum()),
+            "holdout_hours": int(len(win)),
+            "first_30d_net_pnl_usd": float(net.iloc[: int(first_window_hours)].sum()),
+            "last_151d_net_pnl_usd": float(net.iloc[int(first_window_hours):].sum()),
+        }
+    )
+
+    # Ty le giai ngan: trung binh so slot carry dang giu tren n_carry_slots.
+    if isinstance(holdings_log, pd.DataFrame) and not holdings_log.empty and "n_active" in holdings_log.columns:
+        log = holdings_log.copy()
+        ts_col = "time" if "time" in log.columns else None
+        if ts_col is not None:
+            ts = pd.to_datetime(log[ts_col], utc=True, errors="coerce")
+            in_win = (ts >= start_ts) & (ts <= end_ts)
+            sub = log.loc[in_win.fillna(False)]
+        else:
+            sub = log
+        if not sub.empty:
+            avg_slots = float(pd.to_numeric(sub["n_active"], errors="coerce").fillna(0.0).mean())
+            out["avg_carry_slots_held"] = avg_slots
+            out["carry_utilization_pct"] = (
+                avg_slots / float(n_carry_slots) * 100.0 if n_carry_slots > 0 else 0.0
+            )
+    return out
+
+
 def run_indicator_warm_cash_start(
     data: dict[str, pd.DataFrame],
     capital: float = SPRINT11_INITIAL_CAPITAL,
@@ -263,6 +356,14 @@ def run_indicator_warm_cash_start(
         "entry_fee_usd": float(entry_fee),
         "carry_pnl_usd": float(carry_pnl),
         "overlay_net_pnl_usd": float(overlay_net),
+        "sleeve_attribution": compute_sleeve_attribution(
+            res.get("attribution_series"),
+            res.get("carry_result", {}).get("holdings_log")
+            if isinstance(res.get("carry_result"), dict)
+            else None,
+            split_date=split_date,
+            holdout_end=holdout_end,
+        ),
     }
 
 
@@ -843,6 +944,107 @@ def _find_primary_row(payload: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _extract_sleeve_attribution(src: Any) -> dict[str, Any]:
+    """Sprint 16: lay khoi sleeve attribution tu payload row/dict neu co."""
+    if not isinstance(src, dict):
+        return {}
+    for key in ("sleeve_attribution", "holdout_sleeve_attribution"):
+        val = src.get(key)
+        if isinstance(val, dict) and val:
+            return dict(val)
+    return {}
+
+
+def _build_sleeve_attribution_block(
+    compound: dict[str, Any],
+    fixed: dict[str, Any],
+    cold: dict[str, Any],
+    method_d: dict[str, Any],
+    method_d_aligned: dict[str, Any],
+) -> dict[str, Any]:
+    """Sprint 16: gom attribution theo nhanh cho A/B/C/D/D' va chenh lech B - D'.
+
+    Moi method co the thieu du lieu (payload cu) -> ``available=False`` va cac field = 0.
+    Dang thuc duoc kiem tra rieng trong ``identity``.
+    """
+    empty: dict[str, Any] = {
+        "available": False,
+        "carry_net_pnl_usd": 0.0,
+        "overlay_net_pnl_usd": 0.0,
+        "avg_carry_slots_held": 0.0,
+        "carry_utilization_pct": 0.0,
+        "first_30d_net_pnl_usd": 0.0,
+        "last_151d_net_pnl_usd": 0.0,
+        "net_pnl_usd": 0.0,
+    }
+
+    def _norm(method: dict[str, Any]) -> dict[str, Any]:
+        sleeve = method.get("sleeve_attribution") if isinstance(method, dict) else None
+        if not isinstance(sleeve, dict) or not sleeve.get("available", False):
+            return dict(empty)
+        out = dict(empty)
+        out.update(
+            {
+                "available": True,
+                "carry_net_pnl_usd": float(sleeve.get("carry_net_pnl_usd", 0.0) or 0.0),
+                "overlay_net_pnl_usd": float(sleeve.get("overlay_net_pnl_usd", 0.0) or 0.0),
+                "avg_carry_slots_held": float(sleeve.get("avg_carry_slots_held", 0.0) or 0.0),
+                "carry_utilization_pct": float(sleeve.get("carry_utilization_pct", 0.0) or 0.0),
+                "first_30d_net_pnl_usd": float(sleeve.get("first_30d_net_pnl_usd", 0.0) or 0.0),
+                "last_151d_net_pnl_usd": float(sleeve.get("last_151d_net_pnl_usd", 0.0) or 0.0),
+                "net_pnl_usd": float(method.get("net_pnl_usd", 0.0) or 0.0),
+            }
+        )
+        return out
+
+    methods = {
+        "A": _norm(compound),
+        "B": _norm(fixed),
+        "C": _norm(cold),
+        "D": _norm(method_d),
+        "D_aligned": _norm(method_d_aligned),
+    }
+
+    identity: dict[str, Any] = {}
+    for name, item in methods.items():
+        if not item["available"]:
+            identity[name] = {"sleeve_gap_usd": 0.0, "window_gap_usd": 0.0}
+            continue
+        identity[name] = {
+            "sleeve_gap_usd": float(
+                (item["carry_net_pnl_usd"] + item["overlay_net_pnl_usd"]) - item["net_pnl_usd"]
+            ),
+            "window_gap_usd": float(
+                (item["first_30d_net_pnl_usd"] + item["last_151d_net_pnl_usd"])
+                - item["net_pnl_usd"]
+            ),
+        }
+
+    b_item = methods["B"]
+    d_item = methods["D_aligned"]
+    delta: dict[str, Any] = {
+        "available": bool(b_item["available"] and d_item["available"]),
+        "total_usd": float(b_item["net_pnl_usd"] - d_item["net_pnl_usd"]),
+        "carry_component_usd": float(
+            b_item["carry_net_pnl_usd"] - d_item["carry_net_pnl_usd"]
+        ),
+        "overlay_component_usd": float(
+            b_item["overlay_net_pnl_usd"] - d_item["overlay_net_pnl_usd"]
+        ),
+        "first_30d_component_usd": float(
+            b_item["first_30d_net_pnl_usd"] - d_item["first_30d_net_pnl_usd"]
+        ),
+        "last_151d_component_usd": float(
+            b_item["last_151d_net_pnl_usd"] - d_item["last_151d_net_pnl_usd"]
+        ),
+    }
+    delta["residual_usd"] = float(
+        delta["total_usd"]
+        - (delta["carry_component_usd"] + delta["overlay_component_usd"])
+    )
+    return {"methods": methods, "identity": identity, "delta_b_vs_d_aligned": delta}
+
+
 def compute_holdout_accounting_bridge(
     payload_compound: dict[str, Any],
     payload_fixed_base: dict[str, Any] | None = None,
@@ -879,6 +1081,7 @@ def compute_holdout_accounting_bridge(
         "end_equity_usd": start_a + net_a,
         "net_pnl_usd": net_a,
         "return_on_start_equity_pct": (net_a / start_a * 100.0) if start_a > 0 else 0.0,
+        "sleeve_attribution": _extract_sleeve_attribution(row_a),
     }
 
     fixed_row = _find_primary_row(payload_fixed_base) if payload_fixed_base else None
@@ -901,6 +1104,7 @@ def compute_holdout_accounting_bridge(
             "net_pnl_usd": net_b,
             "return_on_active_capital_pct": (net_b / active_capital * 100.0) if active_capital > 0 else 0.0,
             "available": True,
+            "sleeve_attribution": _extract_sleeve_attribution(fixed_row),
         }
 
     net_c = float(row_a.get("holdout_net_pnl_resim", 0.0))
@@ -930,6 +1134,7 @@ def compute_holdout_accounting_bridge(
         "entry_fee_usd": float(d_payload.get("entry_fee_usd", 0.0) or 0.0),
         "warmup_hours": int(d_payload.get("warmup_hours", 0) or 0),
         "trade_start_idx": int(d_payload.get("trade_start_idx", 0) or 0),
+        "sleeve_attribution": _extract_sleeve_attribution(d_payload),
     }
 
     indicator_blindness = (net_d - net_c) if method_d["available"] else 0.0
@@ -957,6 +1162,7 @@ def compute_holdout_accounting_bridge(
         "rebalance_phase_offset": int(
             d_aligned_payload.get("rebalance_phase_offset", 0) or 0
         ),
+        "sleeve_attribution": _extract_sleeve_attribution(d_aligned_payload),
     }
     clock_phase_drift = (
         (net_d_aligned - net_d) if (method_d["available"] and method_d_aligned["available"]) else 0.0
@@ -1000,6 +1206,9 @@ def compute_holdout_accounting_bridge(
             "identity_lhs_usd": float(explained_total),
             "identity_gap_usd": float((fixed["net_pnl_usd"] - net_c) - explained_total),
         },
+        "sleeve_attribution": _build_sleeve_attribution_block(
+            compound, fixed, cold, method_d, method_d_aligned
+        ),
         "bridge_decomposition": {
             "compounding_scale_effect_usd": float(compounding_scale_effect),
             "cold_start_total_drag_usd": float(cold_start_total_drag),
