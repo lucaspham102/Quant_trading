@@ -433,6 +433,7 @@ def run_barbell_portfolio(
     multi_aligned_data: dict[str, pd.DataFrame],
     config: BarbellConfig,
     periods_per_year: int = 8760,
+    trade_start_idx: int | None = None,
 ) -> dict[str, Any]:
     """Mô phỏng danh mục Barbell (Core Yield Sleeve + Tactical Alpha Overlay).
 
@@ -635,6 +636,7 @@ def run_barbell_portfolio(
             config=carry_cfg,
             variant=config.carry_variant,
             periods_per_year=periods_per_year,
+            trade_start_idx=trade_start_idx,
         )
         if len(carry_result["equity_curve"]) == 0:
             carry_result = run_cross_exchange_carry(
@@ -720,6 +722,12 @@ def run_barbell_portfolio(
         raw_weights_aligned = pd.DataFrame(
             0.0, index=common_index, columns=symbols, dtype="float64"
         )
+
+    # Sprint 14: trước mốc trade_start_idx giữ 100% tiền mặt -> overlay weight = 0.
+    if trade_start_idx is not None and len(raw_weights_aligned) > 0:
+        _cut = max(0, min(int(trade_start_idx), len(raw_weights_aligned)))
+        if _cut > 0:
+            raw_weights_aligned.iloc[:_cut, :] = 0.0
 
     # 5. Xây dựng close_matrix và tính toán SNR dispersion
     close_dict: dict[str, pd.Series] = {}

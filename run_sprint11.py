@@ -157,47 +157,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Diem nhap chinh cho CLI Runner Sprint 11."""
-    args = parse_args(argv)
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    raw_dir = Path(args.raw_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("=" * 80)
-    logger.info(
-        "KHOI DONG SPRINT 11 RUNNER (VON: %.1f USDT, CHUAN PHI: maker_taker_hedge)",
-        args.capital,
-    )
-    logger.info("Khung thoi gian: %s den %s", args.start, args.end)
-    logger.info("Symbols (%d): %s", len(args.symbols), ", ".join(args.symbols))
-    logger.info("=" * 80)
-
-    # 1. Tai du lieu da san neu duoc yeu cau
-    if args.download:
-        logger.info("[download] Bat dau tai funding rate da san (binance, bybit, okx)...")
-        try:
-            fetch_all_exchanges_funding(
-                symbols=args.symbols,
-                exchanges=SUPPORTED_EXCHANGES,
-                start_date=args.start,
-                end_date=args.end,
-                data_dir=raw_dir,
-            )
-            logger.info("[download] Hoan tat tai funding rate da san.")
-        except Exception as e:
-            logger.warning("[download] Canh bao khi tai du lieu da san: %s", e)
-
-    # 2. Doc va dong bo du lieu cho tung symbol (tai su dung logic tu run_sprint10.main muc 2)
+def load_multi_aligned_data(
+    raw_dir: Path,
+    symbols: list[str],
+    start: str,
+    end: str,
+) -> dict[str, pd.DataFrame]:
+    """Doc cache Parquet + funding da san va dong bo chong look-ahead cho danh sach symbol."""
     multi_aligned_data: dict[str, pd.DataFrame] = {}
-    start_ts = pd.Timestamp(args.start, tz="UTC")
-    end_ts = pd.Timestamp(args.end, tz="UTC")
+    start_ts = pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end, tz="UTC")
 
-    for sym in args.symbols:
+    for sym in symbols:
         clean_raw = _clean_name(sym)
         clean_sym = clean_symbol_name(sym)
 
@@ -256,6 +227,55 @@ def main(argv: list[str] | None = None) -> int:
         multi_aligned_data[sym] = aligned_df
         logger.info("Da dong bo thanh cong symbol %s: %d bars 1h", sym, len(aligned_df))
 
+    if not multi_aligned_data:
+        logger.error("Khong co du lieu hop le cho bat ky symbol nao. Ket thuc.")
+    return multi_aligned_data
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Diem nhap chinh cho CLI Runner Sprint 11."""
+    args = parse_args(argv)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    raw_dir = Path(args.raw_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("=" * 80)
+    logger.info(
+        "KHOI DONG SPRINT 11 RUNNER (VON: %.1f USDT, CHUAN PHI: maker_taker_hedge)",
+        args.capital,
+    )
+    logger.info("Khung thoi gian: %s den %s", args.start, args.end)
+    logger.info("Symbols (%d): %s", len(args.symbols), ", ".join(args.symbols))
+    logger.info("=" * 80)
+
+    # 1. Tai du lieu da san neu duoc yeu cau
+    if args.download:
+        logger.info("[download] Bat dau tai funding rate da san (binance, bybit, okx)...")
+        try:
+            fetch_all_exchanges_funding(
+                symbols=args.symbols,
+                exchanges=SUPPORTED_EXCHANGES,
+                start_date=args.start,
+                end_date=args.end,
+                data_dir=raw_dir,
+            )
+            logger.info("[download] Hoan tat tai funding rate da san.")
+        except Exception as e:
+            logger.warning("[download] Canh bao khi tai du lieu da san: %s", e)
+
+    # 2. Doc va dong bo du lieu cho tung symbol
+    multi_aligned_data = load_multi_aligned_data(
+        raw_dir=raw_dir,
+        symbols=list(args.symbols),
+        start=args.start,
+        end=args.end,
+    )
+    start_ts = pd.Timestamp(args.start, tz="UTC")
+    end_ts = pd.Timestamp(args.end, tz="UTC")
     if not multi_aligned_data:
         logger.error("Khong co du lieu hop le cho bat ky symbol nao. Ket thuc.")
         return 1

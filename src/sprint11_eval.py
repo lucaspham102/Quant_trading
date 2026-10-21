@@ -162,6 +162,91 @@ def _slice_data_range(
 
 
 # ---------------------------------------------------------------------------
+# 4b. run_indicator_warm_cash_start (Method D, Sprint 14)
+# ---------------------------------------------------------------------------
+SPRINT14_WARMUP_HOURS = 504
+
+
+def run_indicator_warm_cash_start(
+    data: dict[str, pd.DataFrame],
+    capital: float = SPRINT11_INITIAL_CAPITAL,
+    split_date: str = SPRINT11_SPLIT_DATE,
+    holdout_end: str = SPRINT11_HOLDOUT_END,
+    reinvest_profits: bool = False,
+    carry_variant: str = "tier1b",
+    gating_mode: str = "smooth_conviction",
+    warmup_hours: int = SPRINT14_WARMUP_HOURS,
+) -> dict[str, Any]:
+    """Method D: chỉ báo đã ấm (nhìn được lịch sử trước holdout) nhưng tồn kho bằng tiền mặt.
+
+    Bot thật khi bật lần đầu sẽ tải ~500 giờ nến/funding gần nhất để tính EMA-42 và
+    momentum/vol 336h, nhưng tài khoản bắt đầu bằng 100% tiền mặt tại ``split_date``.
+    Hàm này mô phỏng đúng trạng thái đó: dữ liệu mở rộng thêm ``warmup_hours`` giờ
+    TRƯỚC ``split_date`` (để chỉ báo có đủ lịch sử) nhưng khoá mọi giao dịch trước
+    ``split_date`` (``trade_start_idx``), nên equity giữ nguyên ``capital`` cho tới mốc đó
+    và mọi vị thế mở sau mốc đều trả đủ phí + làm tròn lô.
+    """
+    from src.barbell_portfolio import BarbellConfig, run_barbell_portfolio
+
+    holdout_start = pd.Timestamp(split_date, tz="UTC")
+    ext_start = holdout_start - pd.Timedelta(hours=int(warmup_hours))
+    ext_data = _slice_data_range(data, ext_start.isoformat(), holdout_end)
+
+    idx_ref = None
+    for df in ext_data.values():
+        if isinstance(df, pd.DataFrame) and not df.empty and isinstance(df.index, pd.DatetimeIndex):
+            idx_ref = df.index
+            break
+    trade_start_idx = 0
+    if idx_ref is not None and len(idx_ref) > 0:
+        trade_start_idx = int(idx_ref.searchsorted(holdout_start, side="left"))
+
+    cfg = BarbellConfig(
+        initial_capital=float(capital),
+        carry_variant=carry_variant,
+        gating_mode=gating_mode,
+        enable_snr_gate=True,
+        overlay_quantize_legs=True,
+        reinvest_profits=bool(reinvest_profits),
+    )
+    res = run_barbell_portfolio(ext_data, cfg, trade_start_idx=trade_start_idx)
+
+    go_inputs = res.get("go_no_go_inputs", {}) if isinstance(res, dict) else {}
+    final_eq = float(go_inputs.get("final_equity", res.get("final_equity", capital)))
+    net_pnl = float(final_eq - capital)
+
+    entry_fee = 0.0
+    carry_pnl = 0.0
+    overlay_net = 0.0
+    attr = res.get("attribution_series")
+    if isinstance(attr, pd.DataFrame) and not attr.empty and isinstance(attr.index, pd.DatetimeIndex):
+        win = attr.loc[attr.index >= holdout_start]
+        if not win.empty:
+            if "fees" in win.columns:
+                entry_fee = float(win["fees"].iloc[:24].sum())
+            if "funding_pnl" in win.columns and "basis_pnl" in win.columns:
+                carry_pnl = float(win["funding_pnl"].sum() + win["basis_pnl"].sum())
+            if "overlay_pnl" in win.columns:
+                overlay_net = float(win["overlay_pnl"].sum())
+
+    return {
+        "method": "indicator_warm_cash_start",
+        "reinvest_profits": bool(reinvest_profits),
+        "capital": float(capital),
+        "warmup_hours": int(warmup_hours),
+        "trade_start_idx": int(trade_start_idx),
+        "trade_start_bars_available": int(len(idx_ref)) if idx_ref is not None else 0,
+        "start_equity_usd": float(capital),
+        "end_equity_usd": float(final_eq),
+        "net_pnl_usd": net_pnl,
+        "return_on_active_capital_pct": (net_pnl / float(capital) * 100.0) if capital > 0 else 0.0,
+        "entry_fee_usd": float(entry_fee),
+        "carry_pnl_usd": float(carry_pnl),
+        "overlay_net_pnl_usd": float(overlay_net),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 4. run_sprint11_tiers
 # ---------------------------------------------------------------------------
 def run_sprint11_tiers(
@@ -741,6 +826,7 @@ def _find_primary_row(payload: dict[str, Any]) -> dict[str, Any] | None:
 def compute_holdout_accounting_bridge(
     payload_compound: dict[str, Any],
     payload_fixed_base: dict[str, Any] | None = None,
+    warm_cash: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Doi soat 3 phuong phap do lai Holdout (warm-state vs cold-start).
 
@@ -809,12 +895,42 @@ def compute_holdout_accounting_bridge(
     entry_fee = float(row_a.get("holdout_resim_entry_fee_usd", 0.0) or 0.0)
     warmup_drag = cold_start_total_drag - entry_fee
 
+    # Sprint 14 - Method D: chi bao da am + ton kho tien mat
+    d_payload = warm_cash if isinstance(warm_cash, dict) else {}
+    net_d = float(d_payload.get("net_pnl_usd", 0.0) or 0.0) if d_payload else 0.0
+    method_d = {
+        "available": bool(d_payload),
+        "start_equity_usd": float(d_payload.get("start_equity_usd", active_capital) or active_capital),
+        "end_equity_usd": float(d_payload.get("end_equity_usd", active_capital) or active_capital),
+        "net_pnl_usd": net_d,
+        "return_on_active_capital_pct": float(
+            d_payload.get("return_on_active_capital_pct", 0.0) or 0.0
+        ),
+        "entry_fee_usd": float(d_payload.get("entry_fee_usd", 0.0) or 0.0),
+        "warmup_hours": int(d_payload.get("warmup_hours", 0) or 0),
+        "trade_start_idx": int(d_payload.get("trade_start_idx", 0) or 0),
+    }
+
+    indicator_blindness = (net_d - net_c) if method_d["available"] else 0.0
+    inventory_carryover = (
+        (float(fixed["net_pnl_usd"]) - net_d - entry_fee) if method_d["available"] else warmup_drag
+    )
+    warm_cash_decomposition = {
+        "cold_start_initial_entry_fee_usd": float(entry_fee),
+        "indicator_blindness_drag_usd": float(indicator_blindness),
+        "inventory_carryover_diff_usd": float(inventory_carryover),
+        "explained_total_usd": float(entry_fee + indicator_blindness + inventory_carryover),
+        "unexplained_total_usd": float(cold_start_total_drag - (entry_fee + indicator_blindness + inventory_carryover)),
+    }
+
     return {
         "holdout_days": float(row_a.get("holdout_days", 0.0) or 0.0),
         "active_capital_usd": active_capital,
         "continuous_compound": compound,
         "continuous_fixed_base": fixed,
         "standalone_cold_start": cold,
+        "indicator_warm_cash_start": method_d,
+        "warm_cash_decomposition": warm_cash_decomposition,
         "bridge_decomposition": {
             "compounding_scale_effect_usd": float(compounding_scale_effect),
             "cold_start_total_drag_usd": float(cold_start_total_drag),

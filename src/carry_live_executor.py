@@ -128,6 +128,7 @@ class CarryLiveExecutor:
             self.capital = float(capital if capital is not None else carry_config.initial_capital)
         self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
         self.maker_no_fill_count: int = 0
+        self.last_decision_diagnostics: dict[str, Any] = {}
         self._leg_states: dict[str, dict[str, Any]] = {}
         self.overlay_config: Optional[BarbellConfig] = overlay_config
         self.enable_lot_quantization: bool = bool(enable_lot_quantization)
@@ -1965,8 +1966,9 @@ class CarryLiveExecutor:
 
         # Lưu trạng thái barbell sleeves
         barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
-        # Lưu trạng thái barbell sleeves
-        barbell_allocations = self.build_barbell_allocations(aligned_universe, scores_at_t)
+        self.last_decision_diagnostics = self.build_decision_diagnostics(
+            aligned_universe, metrics_at_t, barbell_allocations
+        )
         self.persist_sleeve_state(barbell_allocations, timestamp_str)
         try:
             self.execute_overlay_rebalance(
@@ -2156,6 +2158,7 @@ class CarryLiveExecutor:
                     "margin_health_summary": "KILL_SWITCH_ACTIVE",
                     "table_ascii": f"=== KILL SWITCH TRIGGERED | Equity: {_eq_now:.2f} USDT ===",
                     "sleeves": barbell_allocations,
+                    "diagnostics": self.last_decision_diagnostics,
                     "kill_switch": True,
                     "kill_switch_triggered": True,
                 }
@@ -2414,10 +2417,158 @@ class CarryLiveExecutor:
             "margin_health_summary": summary_str,
             "table_ascii": "",
             "sleeves": barbell_allocations,
+            "diagnostics": self.last_decision_diagnostics,
             "kill_switch": bool(getattr(self.state, "kill_switch_triggered", False)) or _kill_after_close,
         }
         plan["table_ascii"] = self.format_status_table(plan)
         return plan
+
+    def build_decision_diagnostics(
+        self,
+        aligned_universe: dict[str, pd.DataFrame],
+        metrics_at_t: dict[str, dict[str, Any]] | None = None,
+        barbell_allocations: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Build decision diagnostics for carry/overlay gating and warmup history."""
+        # 1. Warmup history loaded
+        valid_lens = [
+            len(df)
+            for df in (aligned_universe or {}).values()
+            if df is not None and len(df) > 0
+        ]
+        warmup_hours_loaded: int = int(min(valid_lens)) if valid_lens else 0
+        warmup_min_required: int = 400
+        warmup_ok: bool = bool(warmup_hours_loaded >= 400)
+
+        # 2. Carry EMA gating
+        carry_ema_span: int = int(getattr(self.carry_config, "ema_span", 42))
+        carry_ema_threshold_bps: float = float(
+            getattr(self.carry_config, "entry_funding_threshold", 0.000045)
+        ) * 10000.0
+
+        carry_bps_list: list[float] = []
+        if metrics_at_t:
+            for m in metrics_at_t.values():
+                if isinstance(m, dict) and "f_ewma" in m:
+                    val = m["f_ewma"]
+                    try:
+                        f_val = float(val)
+                        if f_val != f_val or abs(f_val) == float("inf"):
+                            f_val = 0.0
+                    except (ValueError, TypeError):
+                        f_val = 0.0
+                    carry_bps_list.append(abs(f_val) * 10000.0)
+
+        max_carry_ema_bps: float = float(max(carry_bps_list)) if carry_bps_list else 0.0
+        carry_gate_pass: bool = bool(max_carry_ema_bps >= carry_ema_threshold_bps)
+        symbols_above_carry_threshold: int = int(
+            sum(1 for bps in carry_bps_list if bps >= carry_ema_threshold_bps)
+        )
+
+        # 3. Momentum overlay delta gating
+        current_equity: float = float(
+            getattr(self.state, "current_equity", getattr(self, "capital", 3000.0))
+        )
+        overlay_delta_threshold: float = 0.08
+        max_overlay_delta: float = 0.0
+
+        has_overlay_allocs = False
+        target_signed_notionals: dict[str, float] = {}
+
+        if (
+            barbell_allocations is not None
+            and isinstance(barbell_allocations, dict)
+            and "momentum_overlay" in barbell_allocations
+        ):
+            ov_info = barbell_allocations["momentum_overlay"]
+            if isinstance(ov_info, dict):
+                is_active = bool(ov_info.get("overlay_active", ov_info.get("active", True)))
+                allocs = ov_info.get("allocations")
+                if is_active and allocs:
+                    if isinstance(allocs, dict):
+                        for sym, alloc in allocs.items():
+                            if isinstance(alloc, dict):
+                                notional = float(
+                                    alloc.get("notional", alloc.get("target_notional", 0.0))
+                                )
+                                side = str(alloc.get("side", "")).lower()
+                                sign = -1.0 if "short" in side else 1.0
+                                target_signed_notionals[sym] = sign * abs(notional)
+                                has_overlay_allocs = True
+                            elif isinstance(alloc, (int, float)):
+                                target_signed_notionals[sym] = float(alloc)
+                                has_overlay_allocs = True
+                    elif isinstance(allocs, list):
+                        for alloc in allocs:
+                            if isinstance(alloc, dict):
+                                sym = alloc.get("symbol")
+                                if sym:
+                                    notional = float(
+                                        alloc.get("notional", alloc.get("target_notional", 0.0))
+                                    )
+                                    side = str(alloc.get("side", "")).lower()
+                                    sign = -1.0 if "short" in side else 1.0
+                                    target_signed_notionals[sym] = sign * abs(notional)
+                                    has_overlay_allocs = True
+
+        if has_overlay_allocs and current_equity > 0:
+            current_overlay_positions = (
+                getattr(self.state, "overlay_positions", {}) or {}
+            )
+            all_overlay_symbols = set(target_signed_notionals.keys()) | set(
+                current_overlay_positions.keys()
+            )
+            deltas: list[float] = []
+            for sym in all_overlay_symbols:
+                tgt_notional = target_signed_notionals.get(sym, 0.0)
+                tgt_weight = tgt_notional / current_equity
+
+                curr_pos = current_overlay_positions.get(sym, {})
+                curr_notional = 0.0
+                if isinstance(curr_pos, dict):
+                    raw_notional = float(
+                        curr_pos.get(
+                            "notional",
+                            float(curr_pos.get("qty", 0.0))
+                            * float(
+                                curr_pos.get("entry_price", curr_pos.get("price", 0.0))
+                            ),
+                        )
+                    )
+                    side = str(curr_pos.get("side", "")).lower()
+                    sign = -1.0 if "short" in side else 1.0
+                    curr_notional = sign * abs(raw_notional)
+                curr_weight = curr_notional / current_equity
+
+                deltas.append(abs(tgt_weight - curr_weight))
+            max_overlay_delta = float(max(deltas)) if deltas else 0.0
+        else:
+            max_overlay_delta = 0.0
+
+        overlay_gate_pass: bool = bool(max_overlay_delta >= overlay_delta_threshold)
+
+        summary: str = (
+            f"Warmup={warmup_hours_loaded}h (thr {warmup_min_required}h) -> {'OK' if warmup_ok else 'COLD'} | "
+            f"MaxCarryEMA={max_carry_ema_bps:.2f} bps (thr {carry_ema_threshold_bps:.2f}) -> {'PASS' if carry_gate_pass else 'BLOCK'} | "
+            f"MaxOverlayDelta={max_overlay_delta:.3f} (thr {0.08:.2f}) -> {'PASS' if overlay_gate_pass else 'BLOCK'}"
+        )
+
+        res: dict[str, Any] = {
+            "warmup_hours_loaded": warmup_hours_loaded,
+            "warmup_min_required": warmup_min_required,
+            "warmup_ok": warmup_ok,
+            "carry_ema_span": carry_ema_span,
+            "max_carry_ema_bps": max_carry_ema_bps,
+            "carry_ema_threshold_bps": carry_ema_threshold_bps,
+            "carry_gate_pass": carry_gate_pass,
+            "symbols_above_carry_threshold": symbols_above_carry_threshold,
+            "max_overlay_delta": max_overlay_delta,
+            "overlay_delta_threshold": overlay_delta_threshold,
+            "overlay_gate_pass": overlay_gate_pass,
+            "summary": summary,
+        }
+        self.last_decision_diagnostics = res
+        return res
 
     def format_status_table(self, plan: dict[str, Any]) -> str:
         """Định dạng bảng trạng thái đối soát thuần ASCII (mọi ord(ch) < 128, không emoji)."""
@@ -2538,6 +2689,10 @@ class CarryLiveExecutor:
                         carry_spots,
                         carry_perps,
                         ks_status,
+                    )
+                    logger.info(
+                        "Diagnostics: %s",
+                        (self.last_decision_diagnostics or {}).get("summary", "N/A")
                     )
                 except Exception as e:
                     logger.error("Error in reconcile_once: %s", e, exc_info=True)
