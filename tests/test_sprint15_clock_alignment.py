@@ -84,14 +84,24 @@ def test_phase_aligned_offset_matches_global_start_index() -> None:
     global_start_idx = int(data["AAA/USDT:USDT"].index.searchsorted(ext_start, side="left"))
     expected_offset = global_start_idx % 48
 
+    # Sprint 20: phep do D' la LICH SU (504h) -> phai truyen tuong minh warmup.
     warm = run_indicator_warm_cash_start(
-        data=data, split_date=split, holdout_end="2024-02-20", phase_aligned=True
+        data=data,
+        split_date=split,
+        holdout_end="2024-02-20",
+        warmup_hours=504,
+        align_rebalance_clock=True,
+        phase_aligned=True,
     )
     assert warm["phase_aligned"] is True
     assert warm["rebalance_phase_offset"] == expected_offset
 
     legacy = run_indicator_warm_cash_start(
-        data=data, split_date=split, holdout_end="2024-02-20"
+        data=data,
+        split_date=split,
+        holdout_end="2024-02-20",
+        warmup_hours=504,
+        align_rebalance_clock=False,
     )
     assert legacy["phase_aligned"] is False
     assert legacy["rebalance_phase_offset"] == 0

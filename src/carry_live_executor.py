@@ -137,6 +137,7 @@ def build_cycle_audit_record(
     invariants_passed: Optional[bool] = None,
     warmup_threshold_hours: int = WARMUP_MIN_HOURS,
     warmup_hours_loaded: int = 0,
+    testnet_order_ids: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Sprint 16: dung payload audit JSONL chuan cho 1 chu ky reconcile."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
@@ -168,6 +169,8 @@ def build_cycle_audit_record(
         "invariants_passed": bool(invariants_passed) if invariants_passed is not None else None,
         "warmup_threshold_hours": int(warmup_threshold_hours),
         "warmup_hours_loaded": int(warmup_hours_loaded),
+        # Sprint 20: order id THAT tren Binance Testnet (Spot + Perp) neu da gui lenh.
+        "testnet_order_ids": dict(testnet_order_ids or {}),
     }
 
 
@@ -241,6 +244,8 @@ class CarryLiveExecutor:
         self.last_overlay_delta: dict[str, float] = {}
         # Sprint 16: JSONL audit log cho tung chu ky (None = tat).
         self.audit_log_path: Optional[str] = None
+        # Sprint 20: order id THAT tren Binance Testnet (Spot + Perp) khi --testnet-send-orders.
+        self.testnet_order_ids: dict[str, Any] = {}
         # Sprint 18: cong bao hoa warmup 720h + bat bien dinh luong runtime.
         # warmup_ready=True truoc khi do duoc do dai lich su (khong chan unit test
         # goi thang build_barbell_allocations); reconcile_once luon do lai moi chu ky.
@@ -3212,6 +3217,7 @@ class CarryLiveExecutor:
                                 getattr(self, "min_warmup_hours", WARMUP_MIN_HOURS)
                             ),
                             warmup_hours_loaded=int(getattr(self, "warmup_hours_loaded", 0)),
+                            testnet_order_ids=getattr(self, "testnet_order_ids", None),
                         )
                         if append_audit_record(self.audit_log_path, _record):
                             self.audit_written += 1

@@ -31,6 +31,7 @@ from src.cross_exchange_carry import LIQUID_8_SYMBOLS  # noqa: E402
 from src.sprint11_eval import (  # noqa: E402
     SPRINT11_HOLDOUT_END,
     SPRINT11_INITIAL_CAPITAL,
+    LEGACY_SPRINT14_WARMUP_HOURS,
     SPRINT11_SPLIT_DATE,
     compute_holdout_accounting_bridge,
     compute_sleeve_attribution,
@@ -106,8 +107,17 @@ def main() -> int:
         holdout_end=SPRINT11_HOLDOUT_END,
         reinvest_profits=False,
     )
-    warm_cash = run_indicator_warm_cash_start(**kwargs)
-    warm_cash_aligned = run_indicator_warm_cash_start(phase_aligned=True, **kwargs)
+    # Sprint 20: D (504h cat lat) va D' (504h aligned) la phep do LICH SU.
+    warm_cash = run_indicator_warm_cash_start(
+        warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=False,
+        **kwargs,
+    )
+    warm_cash_aligned = run_indicator_warm_cash_start(
+        warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=True,
+        **kwargs,
+    )
     print(
         f"      D : net={warm_cash['net_pnl_usd']:.2f} | "
         f"D': net={warm_cash_aligned['net_pnl_usd']:.2f}"

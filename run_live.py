@@ -280,6 +280,21 @@ def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str])
         client.has_spot_credentials(),
         client.has_futures_credentials(),
     )
+    # Sprint 20: chan doan dinh dang 64 ky tu TRUOC khi goi mang (khong lo khoa).
+    fmt = client.credential_format_report()
+    for venue in ("spot", "futures"):
+        report = (fmt.get(venue) or {}) if isinstance(fmt, dict) else {}
+        if not report.get("ok"):
+            logger.error(
+                "Testnet credential format (%s): %s",
+                venue,
+                report.get("message"),
+            )
+    if not dry_run and not bool(fmt.get("all_ok", False)):
+        logger.error(
+            "Testnet: dinh dang khoa khong hop le (yeu cau dung 64 ky tu alnum) - BLOCKED."
+        )
+        return False
     if client.dry_run:
         try:
             proof = client.build_delta_neutral_order_pair(
@@ -394,9 +409,16 @@ def _run_signed_snapshot_preflight(
 ) -> dict | None:
     """Sprint 18: lay snapshot tai khoan THAT co ky HMAC-SHA256 (testnet) roi doi soat.
 
+    Sprint 20: trong ``--mode testnet`` ham nay TU DONG chay (khong can
+    ``--live-snapshot``) mien la khong truyen ``--reconcile-snapshot`` - nhu vay
+    daemon luon doi soat tren snapshot song truoc khi vao chu ky giao dich.
+
     Fail-closed: thieu khoa / loi mang / payload la -> report BLOCKED, khong mo lenh moi.
     """
-    if not getattr(args, "live_snapshot", False):
+    auto_live = str(getattr(args, "mode", "")) == "testnet" and not getattr(
+        args, "reconcile_snapshot", None
+    )
+    if not (getattr(args, "live_snapshot", False) or auto_live):
         return None
     from src.cross_exchange_carry import EXCHANGE_LOT_SPECS
     from src.exchange_reconciler import reconcile_portfolio_state
@@ -428,8 +450,14 @@ def _run_signed_snapshot_preflight(
         from src.binance_signed_client import (
             DEFAULT_LIVE_RECV_WINDOW_MS,
             BinanceSignedTestnetClient,
+            load_dotenv_testnet,
         )
 
+        # Sprint 20: mode testnet luon nap `.env.testnet` + dong bo gio 2 venue.
+        try:
+            load_dotenv_testnet()
+        except Exception as exc:  # thieu file la binh thuong
+            logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
         # Sprint 19: recvWindow rong hon cho testnet that (bu do tre mang/offset gio).
         client = BinanceSignedTestnetClient(
             dry_run=False, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS
@@ -454,6 +482,9 @@ def _run_signed_snapshot_preflight(
     if not bool(snapshot.get("snapshot_healthy", False)):
         return _blocked("SNAPSHOT_UNHEALTHY", str(snapshot.get("error", "unknown")))
 
+    # Sprint 20: doi soat theo UNIVERSE dang chay (bo qua dust testnet).
+    snapshot = _scope_snapshot_to_symbols(snapshot, symbols)
+
     for item in snapshot.get("perp_positions_detail") or []:
         if isinstance(item, dict):
             px = float(item.get("mark_price", 0.0) or 0.0)
@@ -476,6 +507,177 @@ def _run_signed_snapshot_preflight(
         setattr(executor, "trading_allowed", bool(report.get("trading_allowed", False)))
     logger.info("Reconcile(live): %s", report.get("summary", ""))
     return report
+
+
+def _scope_snapshot_to_symbols(
+    snapshot: dict[str, Any], symbols: list[str]
+) -> dict[str, Any]:
+    """Sprint 20: thu hep `spot_balances` ve dung cac base asset dang giao dich.
+
+    Tai khoan Binance Testnet duoc cap san ~500 tai san "dust"; doi soat toan tai khoan
+    se luon bao ``ORPHAN_ON_EXCHANGE`` cho cac tai san khong giao dich va chan vo ly
+    moi chu ky. Pham vi doi soat cua daemon = universe dang chay; so tai san ngoai
+    pham vi duoc ghi lai de kiem toan.
+    """
+    if not isinstance(snapshot, dict):
+        return snapshot
+    balances = snapshot.get("spot_balances")
+    if not isinstance(balances, dict):
+        return snapshot
+    wanted: set[str] = set()
+    for sym in symbols or []:
+        canon = str(sym).replace(":USDT", "").replace("/", "")
+        base = canon[:-4] if canon.upper().endswith("USDT") else canon
+        if base:
+            wanted.add(base.upper())
+    scoped = {k: v for k, v in balances.items() if str(k).upper() in wanted}
+    snapshot["untracked_spot_assets"] = max(0, len(balances) - len(scoped))
+    snapshot["spot_balances"] = scoped
+    snapshot["reconcile_symbol_scope"] = list(symbols or [])
+    return snapshot
+
+
+def _run_testnet_order_pair(
+    args: argparse.Namespace,
+    executor: object,
+    symbols: list[str],
+) -> dict | None:
+    """Sprint 20: gui 1 cap lenh Delta-Neutral THAT (Spot BUY + Perp SELL) roi dong lai.
+
+    Chi chay khi ``--mode testnet`` + ``--testnet-send-orders`` VA reconcile khong chan.
+    Order id that duoc ghi vao ``--audit-log`` (JSONL) duoi khoa ``testnet_order_ids``.
+    Fail-closed: dinh dang khoa sai / reconcile BLOCKED / loi mang -> khong gui lenh.
+    """
+    if str(getattr(args, "mode", "")) != "testnet":
+        return None
+    if not bool(getattr(args, "testnet_send_orders", False)):
+        return None
+
+    from src.carry_live_executor import append_audit_record
+
+    symbol = symbols[0] if symbols else "BTC/USDT:USDT"
+    reconcile_status = getattr(executor, "reconcile_status", None)
+    trading_allowed = bool(getattr(executor, "trading_allowed", True))
+    record: dict[str, Any] = {
+        "schema": "sprint20.testnet_order_pair.v1",
+        "event": "testnet_order_pair",
+        "symbol": symbol,
+        "reconcile_status": reconcile_status,
+        "testnet_order_ids": {},
+    }
+
+    if reconcile_status is not None and not trading_allowed:
+        record["status"] = "BLOCKED_RECONCILE"
+        logger.error(
+            "Testnet orders: BLOCKED vi reconcile=%s (fail-closed, khong gui lenh).",
+            reconcile_status,
+        )
+        append_audit_record(getattr(args, "audit_log", None), record)
+        setattr(executor, "testnet_order_ids", {})
+        return record
+
+    try:
+        from src.binance_signed_client import (
+            DEFAULT_LIVE_RECV_WINDOW_MS,
+            BinanceSignedTestnetClient,
+            load_dotenv_testnet,
+            quantize_price,
+        )
+
+        try:
+            load_dotenv_testnet()
+        except Exception:  # pragma: no cover - thieu file la binh thuong
+            pass
+        client = BinanceSignedTestnetClient(
+            dry_run=False, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS
+        )
+        client.sync_server_time("both")
+
+        fmt = client.credential_format_report()
+        record["credential_format"] = {
+            "spot_ok": bool((fmt.get("spot") or {}).get("ok")),
+            "futures_ok": bool((fmt.get("futures") or {}).get("ok")),
+        }
+        if not bool(fmt.get("all_ok", False)):
+            record["status"] = "CREDENTIAL_FORMAT_INVALID"
+            record["diagnostics"] = [
+                (fmt.get("spot") or {}).get("message", ""),
+                (fmt.get("futures") or {}).get("message", ""),
+            ]
+            logger.error(
+                "Testnet orders: BLOCKED vi dinh dang khoa sai (%s) - khong gui lenh.",
+                record["diagnostics"],
+            )
+            append_audit_record(getattr(args, "audit_log", None), record)
+            setattr(executor, "testnet_order_ids", {})
+            return record
+
+        ticker = client.fetch_book_ticker(symbol, "spot")
+        mid = float(ticker.get("mid") or ticker.get("bid") or 0.0)
+        qty = 0.001
+        entry = client.execute_live_testnet_order_pair(
+            symbol=symbol,
+            spot_qty=qty,
+            perp_qty=qty,
+            spot_price=quantize_price(
+                float(ticker.get("bid") or mid), 0.01, "BUY"
+            ),
+            direction="open",
+            post_only_spot=True,
+            spot_use_limit_maker=True,
+            perp_post_only=False,
+            maker_ttl_sec=2.0,
+            require_futures=False,
+            perp_available=client.has_futures_credentials(),
+        )
+        spot_entry = entry.get("spot") or {}
+        perp_entry = entry.get("perp") or {}
+        filled_qty = float(spot_entry.get("executedQty") or 0.0)
+        ids: dict[str, Any] = {
+            "spot_entry_order_id": spot_entry.get("orderId"),
+            "perp_entry_order_id": perp_entry.get("orderId"),
+            "spot_exit_order_id": None,
+            "perp_exit_order_id": None,
+        }
+        exit_status = None
+        if filled_qty > 0.0:
+            exit_res = client.execute_live_testnet_order_pair(
+                symbol=symbol,
+                spot_qty=filled_qty,
+                perp_qty=filled_qty,
+                spot_price=quantize_price(
+                    float(ticker.get("ask") or mid), 0.01, "SELL"
+                ),
+                direction="close",
+                post_only_spot=True,
+                spot_use_limit_maker=True,
+                perp_post_only=False,
+                maker_ttl_sec=2.0,
+                require_futures=False,
+                perp_available=client.has_futures_credentials(),
+            )
+            ids["spot_exit_order_id"] = (exit_res.get("spot") or {}).get("orderId")
+            ids["perp_exit_order_id"] = (exit_res.get("perp") or {}).get("orderId")
+            exit_status = exit_res.get("status")
+
+        record["testnet_order_ids"] = ids
+        record["entry_status"] = entry.get("status")
+        record["exit_status"] = exit_status
+        record["executed_qty"] = filled_qty
+        record["status"] = "SENT" if entry.get("status") == "FILLED" else str(
+            entry.get("status")
+        )
+    except Exception as exc:  # fail-closed: khong lam chet daemon
+        record["status"] = "ERROR"
+        record["error"] = str(exc)
+        logger.error("Testnet orders: loi khi gui lenh (%s).", exc)
+
+    append_audit_record(getattr(args, "audit_log", None), record)
+    setattr(executor, "testnet_order_ids", record.get("testnet_order_ids") or {})
+    logger.info(
+        "Testnet orders: status=%s | ids=%s", record.get("status"), record.get("testnet_order_ids")
+    )
+    return record
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -667,8 +869,10 @@ def main(argv: list[str] | None = None) -> int:
                     return 1
             # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
             _run_reconcile_preflight(args, executor)
-            # Sprint 18: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
+            # Sprint 18/20: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
             _run_signed_snapshot_preflight(args, executor)
+            # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
+            _run_testnet_order_pair(args, executor, barbell_symbols)
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -703,8 +907,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         # Sprint 17: doi soat san truoc khi mo vi the moi (fail-closed).
         _run_reconcile_preflight(args, executor)
-        # Sprint 18: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
+        # Sprint 18/20: doi soat dong qua snapshot tai khoan co ky HMAC (testnet that).
         _run_signed_snapshot_preflight(args, executor)
+        # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
+        _run_testnet_order_pair(args, executor, [args.symbol])
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,
