@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 SYNCED = "SYNCED"
 ORPHAN_ON_EXCHANGE = "ORPHAN_ON_EXCHANGE"
@@ -17,6 +17,13 @@ PHANTOM_IN_STATE = "PHANTOM_IN_STATE"
 QTY_DRIFT = "QTY_DRIFT"
 EQUITY_MISMATCH = "EQUITY_MISMATCH"
 MARGIN_DANGER = "MARGIN_DANGER"
+BLOCKED = "BLOCKED"
+
+# Sprint 21: canh bao tai san la tren Mainnet (vi the Perp / Spot ngoai danh muc).
+UNTRACKED_MAINNET_ASSET_WARNING = "UNTRACKED_MAINNET_ASSET_WARNING"
+# Sprint 21: canh bao vi the Perp ngoai danh muc tren Testnet (khong chan, nhung KHONG
+# duoc im lang tra ve SYNCED - de nguoi van hanh thay ro rui ro delta).
+UNTRACKED_TESTNET_PERP_WARNING = "UNTRACKED_TESTNET_PERP_POSITION"
 
 RECONCILE_STATUSES: tuple[str, ...] = (
     SYNCED,
@@ -25,7 +32,33 @@ RECONCILE_STATUSES: tuple[str, ...] = (
     QTY_DRIFT,
     EQUITY_MISMATCH,
     MARGIN_DANGER,
+    BLOCKED,
 )
+
+# Fallback khi khong import duoc src.cross_exchange_carry (tranh circular import).
+_FALLBACK_UNIVERSE: tuple[str, ...] = (
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "XRP/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+)
+
+
+def default_universe_symbols() -> list[str]:
+    """Sprint 21: ro mac dinh day du (LIQUID_8_SYMBOLS) de doi soat toan ro."""
+    try:
+        from src.cross_exchange_carry import LIQUID_8_SYMBOLS
+
+        symbols = [normalize_symbol(str(s)) for s in LIQUID_8_SYMBOLS]
+        if symbols:
+            return symbols
+    except Exception:  # noqa: BLE001 - fallback tinh (khong phu thuoc import)
+        pass
+    return list(_FALLBACK_UNIVERSE)
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -400,14 +433,55 @@ def reconcile_portfolio_state(
     equity_tolerance_pct: float = 1.5,
     max_maint_margin_ratio: float = 0.50,
     min_liq_buffer_pct: float = 25.0,
+    universe_symbols: Sequence[str] | None = None,
+    environment: str = "testnet",
+    ignored_spot_assets: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    """Doi soat danh muc local vs san.
+
+    Sprint 21:
+    - Quet **toan ro** ``universe_symbols`` (mac dinh ``LIQUID_8_SYMBOLS``) thay vi
+      chi cac ma dang giu vi the, nho do phat hien vi the mo coi tren bat ky ma nao.
+    - ``environment="mainnet"`` bat canh bao ``UNTRACKED_MAINNET_ASSET_WARNING`` khi
+      co tai san Spot/Perp ngoai danh muc; vi the Perp la -> ``BLOCKED`` (cam giao dich).
+      O ``"testnet"`` cac tai san faucet chi duoc thong ke, khong chan giao dich.
+    """
+    env = str(environment or "testnet").strip().lower()
+    if env not in ("testnet", "mainnet"):
+        raise ValueError(f"environment must be 'testnet' or 'mainnet', got {environment!r}")
+
+    if universe_symbols is None:
+        universe = default_universe_symbols()
+    else:
+        universe = [normalize_symbol(str(s)) for s in universe_symbols if str(s).strip()]
+    universe_set = set(universe)
+    universe_bases = {sym.split("/")[0].upper() for sym in universe_set if "/" in sym}
+    ignored_assets = {str(a).strip().upper() for a in (ignored_spot_assets or ()) if str(a).strip()}
+
     carry_positions = _get_field(local_state, "carry_positions") or {}
     overlay_positions = _get_field(local_state, "overlay_positions") or {}
     spot_balances = _get_field(exchange_snapshot, "spot_balances") or {}
     perp_positions = _get_field(exchange_snapshot, "perp_positions") or {}
     perp_positions_detail = _get_field(exchange_snapshot, "perp_positions_detail") or {}
 
-    canonical_symbols: set[str] = set()
+    canonical_symbols: set[str] = set(universe_set)
+
+    def _add_snapshot_symbol(raw: Any) -> None:
+        """Chi them symbol THUOC RO vao danh sach doi soat.
+
+        Sprint 21: tai san Spot/Perp ngoai ro (faucet testnet, dust) duoc thong ke
+        rieng trong ``untracked_spot_assets`` / ``untracked_perp_positions`` va
+        KHONG duoc bien thanh ORPHAN_ON_EXCHANGE (tru khi o mainnet -> BLOCKED).
+        """
+        sym = normalize_symbol(str(raw))
+        if not sym:
+            return
+        if universe_set:
+            base = sym.split("/")[0].upper()
+            if sym not in universe_set and f"{base}/USDT:USDT" not in universe_set:
+                return
+        canonical_symbols.add(sym)
+
     if isinstance(carry_positions, dict):
         for k in carry_positions:
             s = normalize_symbol(str(k))
@@ -422,29 +496,75 @@ def reconcile_portfolio_state(
         for b in spot_balances:
             b_str = str(b).strip()
             if b_str:
-                canonical_symbols.add(normalize_symbol(b_str) if "/" in b_str else f"{b_str.upper()}/USDT:USDT")
+                _add_snapshot_symbol(b_str)
     if isinstance(perp_positions, dict):
         for k in perp_positions:
-            s = normalize_symbol(str(k))
-            if s:
-                canonical_symbols.add(s)
+            _add_snapshot_symbol(k)
     if isinstance(perp_positions_detail, dict):
         for k in perp_positions_detail:
-            s = normalize_symbol(str(k))
-            if s:
-                canonical_symbols.add(s)
+            _add_snapshot_symbol(k)
     elif isinstance(perp_positions_detail, list):
         for item in perp_positions_detail:
-            raw_s = _get_field(item, "symbol", "")
-            s = normalize_symbol(str(raw_s))
-            if s:
-                canonical_symbols.add(s)
+            _add_snapshot_symbol(_get_field(item, "symbol", ""))
 
     norm_carry = {normalize_symbol(str(k)): v for k, v in carry_positions.items()} if isinstance(carry_positions, dict) else {}
     norm_overlay = {normalize_symbol(str(k)): v for k, v in overlay_positions.items()} if isinstance(overlay_positions, dict) else {}
 
+    # --- Sprint 21: phat hien tai san ngoai danh muc (untracked) ---
+    untracked_spot_assets: dict[str, float] = {}
+    raw_untracked = _get_field(exchange_snapshot, "untracked_spot_assets", None)
+    if isinstance(raw_untracked, dict):
+        for k, v in raw_untracked.items():
+            asset = str(k).strip().upper()
+            qty = _to_float(v)
+            if asset and qty > 0.0:
+                untracked_spot_assets[asset] = qty
+    if isinstance(spot_balances, dict):
+        for k, v in spot_balances.items():
+            asset = str(k).split("/")[0].strip().upper()
+            if not asset or asset in universe_bases:
+                continue
+            qty = _to_float(v)
+            if qty > 0.0:
+                untracked_spot_assets.setdefault(asset, qty)
+
+    untracked_perp_positions: dict[str, float] = {}
+    if isinstance(perp_positions, dict):
+        for k, v in perp_positions.items():
+            canon = normalize_symbol(str(k))
+            qty = _to_float(v)
+            if canon and canon not in universe_set and abs(qty) > 0.0:
+                untracked_perp_positions[canon] = qty
+    if isinstance(perp_positions_detail, dict):
+        for k, det in perp_positions_detail.items():
+            canon = normalize_symbol(str(k))
+            qty = _to_float(_get_field(det, "qty", _get_field(det, "positionAmt", 0.0)))
+            if canon and canon not in universe_set and abs(qty) > 0.0:
+                untracked_perp_positions.setdefault(canon, qty)
+    elif isinstance(perp_positions_detail, list):
+        for item in perp_positions_detail:
+            canon = normalize_symbol(str(_get_field(item, "symbol", "")))
+            qty = _to_float(_get_field(item, "qty", _get_field(item, "positionAmt", 0.0)))
+            if canon and canon not in universe_set and abs(qty) > 0.0:
+                untracked_perp_positions.setdefault(canon, qty)
+
+    untracked_spot_flagged = {
+        a: q for a, q in untracked_spot_assets.items() if a not in ignored_assets
+    }
+    warnings: list[str] = []
+    mainnet_untracked_warning = False
+    if env == "mainnet" and (untracked_spot_flagged or untracked_perp_positions):
+        mainnet_untracked_warning = True
+        warnings.append(UNTRACKED_MAINNET_ASSET_WARNING)
+    elif env == "testnet" and untracked_perp_positions:
+        # Testnet KHONG chan giao dich (chinh sach faucet), nhung phai canh bao de
+        # khong bao "SYNCED" mot cach im lang khi co vi the Perp ngoai danh muc.
+        warnings.append(UNTRACKED_TESTNET_PERP_WARNING)
+    blocked_by_untracked_perp = bool(env == "mainnet" and untracked_perp_positions)
+
     items: list[dict[str, Any]] = []
     repair_actions: list[dict[str, Any]] = []
+
 
     for sym in sorted(canonical_symbols):
         base = sym.split("/")[0]
@@ -557,8 +677,11 @@ def reconcile_portfolio_state(
     repair_actions.extend(health_result["repair_actions"])
 
     # Thu tu uu tien status:
-    # EQUITY_MISMATCH > MARGIN_DANGER > ORPHAN_ON_EXCHANGE > PHANTOM_IN_STATE > QTY_DRIFT > SYNCED
-    if eq_gap_pct > equity_tolerance_pct:
+    # BLOCKED > EQUITY_MISMATCH > MARGIN_DANGER > ORPHAN_ON_EXCHANGE > PHANTOM_IN_STATE
+    # > QTY_DRIFT > SYNCED
+    if blocked_by_untracked_perp:
+        status = BLOCKED
+    elif eq_gap_pct > equity_tolerance_pct:
         status = EQUITY_MISMATCH
     elif health_result["margin_danger"]:
         status = MARGIN_DANGER
@@ -582,9 +705,16 @@ def reconcile_portfolio_state(
     ld = health_result["margin_health"]["min_liq_distance_pct"]
     ld_str = f"{ld:.1f}%" if ld is not None else "N/A"
 
+    untracked_str = ""
+    if env == "mainnet":
+        untracked_str = (
+            f" | untracked_spot={len(untracked_spot_flagged)}"
+            f" untracked_perp={len(untracked_perp_positions)}"
+        )
+
     summary = (
         f"{status} | items={len(items)} | equity_gap={eq_gap_usd:.2f} USD ({eq_gap_pct:.2f}%)"
-        f" | margin_ratio={mr_str} | liq_dist={ld_str}"
+        f" | margin_ratio={mr_str} | liq_dist={ld_str}{untracked_str}"
     )
 
     return {
@@ -603,4 +733,17 @@ def reconcile_portfolio_state(
         "equity_drift_attribution": health_result["equity_drift_attribution"],
         "margin_health": health_result["margin_health"],
         "margin_danger": health_result["margin_danger"],
+        # --- Sprint 21: doi soat toan ro + canh bao tai san la Mainnet ---
+        "environment": env,
+        "universe_symbols": sorted(universe_set),
+        "ignored_spot_assets": sorted(ignored_assets),
+        "untracked_spot_assets": dict(sorted(untracked_spot_assets.items())),
+        "untracked_spot_assets_flagged": dict(sorted(untracked_spot_flagged.items())),
+        "untracked_spot_count": len(untracked_spot_assets),
+        "untracked_perp_positions": dict(sorted(untracked_perp_positions.items())),
+        "untracked_perp_count": len(untracked_perp_positions),
+        "untracked_mainnet_asset_warning": mainnet_untracked_warning,
+        "untracked_testnet_perp_warning": bool(env == "testnet" and untracked_perp_positions),
+        "warnings": warnings,
+        "blocked": status == BLOCKED,
     }

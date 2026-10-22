@@ -104,7 +104,56 @@ def _clean_credential(value: str | None) -> str:
     return text
 
 
-def validate_credential_format(key: str | None, secret: str | None, venue: str) -> dict[str, Any]:
+def _credential_pair_is_valid(key: str | None, secret: str | None) -> bool:
+    """Sprint 21: cap khoa chuyen biet dat chuan 64/64 va chi gom chu/so?"""
+    clean_key = _clean_credential(key)
+    clean_secret = _clean_credential(secret)
+    return (
+        len(clean_key) == CREDENTIAL_EXPECTED_LENGTH
+        and len(clean_secret) == CREDENTIAL_EXPECTED_LENGTH
+        and clean_key.isalnum()
+        and clean_secret.isalnum()
+    )
+
+
+def prune_legacy_fallback_env(environ: dict[str, str] | None = None) -> dict[str, Any]:
+    """Sprint 21: don bien fallback legacy khi khoa chuyen biet da dat chuan 64/64.
+
+    Neu ``BINANCE_SPOT_TESTNET_API_KEY/SECRET`` hoac
+    ``BINANCE_FUTURES_TESTNET_API_KEY/SECRET`` hop le (64/64), cac bien cu
+    ``BINANCE_TESTNET_API_KEY/SECRET`` co do dai khac 64 bi xoa khoi moi truong
+    va bao ``legacy_fallback_ignored=True`` (chi metadata, khong lo gia tri khoa).
+    """
+    env: dict[str, str] = environ if environ is not None else os.environ
+    spot_valid = _credential_pair_is_valid(env.get(ENV_SPOT_API_KEY), env.get(ENV_SPOT_API_SECRET))
+    futures_valid = _credential_pair_is_valid(
+        env.get(ENV_FUTURES_API_KEY), env.get(ENV_FUTURES_API_SECRET)
+    )
+    ignored_keys: list[str] = []
+    if spot_valid or futures_valid:
+        for legacy_key in (ENV_API_KEY, ENV_API_SECRET):
+            raw = env.get(legacy_key)
+            if raw is None:
+                continue
+            if len(_clean_credential(raw)) == CREDENTIAL_EXPECTED_LENGTH:
+                continue
+            env.pop(legacy_key, None)
+            ignored_keys.append(legacy_key)
+    return {
+        "spot_specific_valid": bool(spot_valid),
+        "futures_specific_valid": bool(futures_valid),
+        "legacy_fallback_ignored": bool(ignored_keys),
+        "ignored_legacy_keys": ignored_keys,
+    }
+
+
+def validate_credential_format(
+    key: str | None,
+    secret: str | None,
+    venue: str,
+    legacy_key: str | None = None,
+    legacy_secret: str | None = None,
+) -> dict[str, Any]:
     """Sprint 20: kiem dinh dinh dang khoa Binance TRUOC khi gui mang.
 
     Quy tac (HMAC-SHA256 Binance): key/secret sau khi chuan hoa phai dai dung
@@ -113,8 +162,13 @@ def validate_credential_format(key: str | None, secret: str | None, venue: str) 
     Tra ve dict CHI chua metadata an toan (do dai + ma chan doan), KHONG chua
     gia tri khoa. Ma chan doan vi du:
     ``spot_SECRET_INVALID_LENGTH_65_EXPECTED_64``.
+
+    Sprint 21: khi cap khoa chuyen biet da hop le 64/64 ma cap fallback legacy
+    (``BINANCE_TESTNET_API_KEY/SECRET``) sai do dai, tra them
+    ``legacy_fallback_ignored=True`` de caller bo qua bien cu an toan.
     """
     venue_name = str(venue or VENUE_SPOT).strip().lower() or VENUE_SPOT
+
     raw_key = key if key is not None else ""
     raw_secret = secret if secret is not None else ""
 
@@ -147,7 +201,7 @@ def validate_credential_format(key: str | None, secret: str | None, venue: str) 
         secret_ok = False
         errors.append(f"{venue_name}_SECRET_INVALID_CHARSET_ALNUM_REQUIRED")
 
-    return {
+    result = {
         "venue": venue_name,
         "expected_length": CREDENTIAL_EXPECTED_LENGTH,
         "key_present": bool(clean_key),
@@ -165,12 +219,27 @@ def validate_credential_format(key: str | None, secret: str | None, venue: str) 
         "message": " | ".join(errors) if errors else f"{venue_name}_CREDENTIAL_FORMAT_OK",
     }
 
+    # Sprint 21: bo qua bien fallback legacy neu khoa chuyen biet da dat chuan 64/64.
+    legacy_present = legacy_key is not None or legacy_secret is not None
+    legacy_invalid = False
+    if legacy_present:
+        for legacy_val in (legacy_key, legacy_secret):
+            if legacy_val is not None:
+                cleaned_legacy = _clean_credential(legacy_val)
+                if cleaned_legacy and len(cleaned_legacy) != CREDENTIAL_EXPECTED_LENGTH:
+                    legacy_invalid = True
+                    break
+    result["legacy_fallback_present"] = bool(legacy_present)
+    result["legacy_fallback_ignored"] = bool(result["ok"] and legacy_invalid)
+    return result
+
 
 def load_dotenv_testnet(
     dotenv_path: str | Path | None = DEFAULT_DOTENV_TESTNET,
     extra_paths: tuple[str | Path, ...] = (DEFAULT_DOTENV,),
     override: bool = False,
     environ: dict[str, str] | None = None,
+    report: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Nap bien moi truong tu `.env.testnet` (+ `.env`) vao os.environ (khong ghi de).
 
@@ -179,6 +248,9 @@ def load_dotenv_testnet(
     - Ho tro tien to ``export KEY=VALUE`` va gia tri duoc quote ``"..."``/``'...'``.
     - Chi nap khi bien chua ton tai hoac dang rong (tru khi ``override=True``).
     - Tra ve dict cac cap KEY->VALUE da PARSE (khong in ra console).
+
+    Sprint 21: truyen ``report={}`` de nhan metadata ``legacy_fallback_ignored`` khi
+    cap khoa chuyen biet da hop le 64/64 khien bien fallback legacy sai do dai bi bo qua.
 
     Luu y bao mat: KHONG BAO GIO log/in gia tri khoa tu ham nay.
     """
@@ -226,6 +298,15 @@ def load_dotenv_testnet(
                 continue
             target_env[key] = value
             loaded[key] = value
+
+    # Sprint 21: ve sinh bien fallback legacy (chi khi khoa chuyen biet dat chuan).
+    legacy_report = prune_legacy_fallback_env(target_env)
+    if report is not None:
+        report["loaded_keys"] = sorted(loaded)
+        report["legacy_fallback_ignored"] = legacy_report["legacy_fallback_ignored"]
+        report["ignored_legacy_keys"] = legacy_report["ignored_legacy_keys"]
+        report["spot_specific_valid"] = legacy_report["spot_specific_valid"]
+        report["futures_specific_valid"] = legacy_report["futures_specific_valid"]
     return loaded
 
 
@@ -1478,15 +1559,296 @@ class BinanceSignedTestnetClient:
                 return last
         return last
 
+    def place_maker_with_fallback(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        best_bid: float,
+        best_ask: float,
+        tick_size: float,
+        venue: str = VENUE_SPOT,
+        improve_inside_spread: bool = True,
+        maker_ttl_sec: float = 2.0,
+        poll_interval_sec: float = 0.2,
+        timeout_sec: float = 10.0,
+        reduce_only: bool = False,
+    ) -> dict[str, Any]:
+        """Sprint 21: dat lenh Maker Post-Only voi gia Smart Inside-Spread + fallback market.
+
+        Khong bao gio gui GTX tai gia cat qua spread (nguyen nhan bi tu choi -2010/-2021),
+        nho do giam ty le fallback market va tang toc do khop Maker tren Testnet/Mainnet.
+        """
+        venue_name = str(venue or VENUE_SPOT).strip().lower()
+        if venue_name not in (VENUE_SPOT, VENUE_FUTURES):
+            return {
+                "status": "INVALID_VENUE",
+                "filled": False,
+                "venue": venue_name,
+                "error": f"venue must be '{VENUE_SPOT}' or '{VENUE_FUTURES}'",
+            }
+
+        pricing = compute_maker_limit_price(
+            side=side,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            tick_size=tick_size,
+            improve_inside_spread=improve_inside_spread,
+        )
+        price = float(pricing.get("price", 0.0) or 0.0)
+        side_u = str(side or "").strip().upper()
+        if price <= 0.0:
+            return {
+                "status": "INVALID_PRICE",
+                "filled": False,
+                "venue": venue_name,
+                "side": side_u,
+                "qty": float(qty),
+                "pricing": pricing,
+                "error": "Khong the tinh gia maker tu so lenh (book rong)",
+            }
+
+        if self.dry_run:
+            return {
+                "dry_run": True,
+                "submitted": False,
+                "status": "DRY_RUN",
+                "filled": False,
+                "venue": venue_name,
+                "symbol": symbol,
+                "side": side_u,
+                "qty": float(qty),
+                "price": price,
+                "pricing": pricing,
+                "events": [],
+            }
+
+        events: list[dict[str, Any]] = []
+        if venue_name == VENUE_SPOT:
+            order, events = self._execute_spot_leg(
+                symbol=symbol,
+                qty=float(qty),
+                side=side_u,
+                price=price,
+                post_only=True,
+                use_limit_maker=True,
+                maker_ttl_sec=maker_ttl_sec,
+                poll_interval_sec=poll_interval_sec,
+                timeout_sec=timeout_sec,
+                events=events,
+            )
+        else:
+            gtx_submitted = True
+            try:
+                order = self._execute_perp_leg(
+                    symbol=symbol,
+                    qty=float(qty),
+                    side=side_u,
+                    price=price,
+                    post_only=True,
+                    reduce_only=reduce_only,
+                    maker_ttl_sec=maker_ttl_sec,
+                    poll_interval_sec=poll_interval_sec,
+                    timeout_sec=timeout_sec,
+                    events=events,
+                )
+            except BinanceHttpError as exc:
+                # GTX bi tu choi (post-only/crossing) -> khong duoc crash, phai ban MARKET.
+                gtx_submitted = False
+                events.append(
+                    {"stage": "perp", "event": "GTX_REJECTED", "code": exc.code,
+                     "fallback": "MARKET"}
+                )
+                req = self.build_order_request(
+                    VENUE_FUTURES, symbol, side_u, float(qty), "MARKET",
+                    reduce_only=reduce_only,
+                )
+                try:
+                    market_raw = self.submit_signed_order(
+                        VENUE_FUTURES, req, timeout_sec=timeout_sec
+                    )
+                except BinanceHttpError as mkt_exc:
+                    return {
+                        "status": "MARKET_FALLBACK_REJECTED",
+                        "filled": False,
+                        "venue": venue_name,
+                        "symbol": symbol,
+                        "side": side_u,
+                        "qty": float(qty),
+                        "price": price,
+                        "pricing": pricing,
+                        "error": f"market fallback rejected: {mkt_exc}",
+                        "events": events + [
+                            {"stage": "perp", "event": "MARKET_FALLBACK_REJECTED",
+                             "code": mkt_exc.code}
+                        ],
+                    }
+                order = dict(self._await_fill(
+                    VENUE_FUTURES, symbol, market_raw,
+                    maker_ttl_sec, poll_interval_sec, events,
+                ))
+                order["fallback_from"] = "GTX_REJECTED"
+                order["maker_filled_qty"] = 0.0
+                order["filled"] = _is_filled(order)
+
+            # Sprint 21: GTX Futures het TTL ma chua khop -> HUY + MARKET phan con lai
+            # (khong de lenh limit treo lo lung lam lech delta-neutral).
+            # Chi chay nhanh nay khi lenh vua gui THAT SU la GTX: neu da fallback MARKET
+            # do bi tu choi thi KHONG duoc huy/ban tiep (tranh double fill).
+            if gtx_submitted and not _is_filled(order):
+                order_id = order.get("orderId")
+                filled_qty = _safe_float(order.get("executedQty"))
+                state_known = True
+                final_state: dict[str, Any] = {}
+                if order_id is not None:
+                    try:
+                        cancel_res = self.cancel_order(
+                            VENUE_FUTURES, symbol, order_id, timeout_sec=timeout_sec
+                        )
+                        events.append(
+                            {"stage": "perp", "event": "GTX_CANCELED", "orderId": order_id,
+                             "canceled": bool(cancel_res.get("canceled"))}
+                        )
+                    except Exception as exc:  # noqa: BLE001 - huy that bai khong chan query
+                        events.append(
+                            {"stage": "perp", "event": "GTX_CANCEL_ERROR", "detail": str(exc)}
+                        )
+                    try:
+                        final_state = self.query_order(
+                            VENUE_FUTURES, symbol, order_id, timeout_sec=timeout_sec
+                        )
+                        filled_qty = max(filled_qty, _safe_float(final_state.get("executedQty")))
+                    except Exception as exc:  # noqa: BLE001 - khong chac trang thai lenh
+                        state_known = False
+                        events.append(
+                            {"stage": "perp", "event": "POST_CANCEL_QUERY_ERROR", "detail": str(exc)}
+                        )
+                remaining_qty = round(float(qty) - filled_qty, 12)
+                if not state_known:
+                    # Khong xac dinh duoc da khop bao nhieu -> TUYET DOI khong ban MARKET
+                    # tiep (tranh double fill), bao UNKNOWN de caller xu ly an toan.
+                    order = dict(order)
+                    order["filled"] = False
+                    order["status"] = "UNKNOWN_AFTER_CANCEL"
+                    order["fallback_from"] = "GTX_TTL_UNKNOWN_STATE"
+                elif remaining_qty > 0.0:
+                    req = self.build_order_request(
+                        VENUE_FUTURES, symbol, side_u, remaining_qty, "MARKET",
+                        reduce_only=reduce_only,
+                    )
+                    try:
+                        market_raw = self.submit_signed_order(
+                            VENUE_FUTURES, req, timeout_sec=timeout_sec
+                        )
+                    except BinanceHttpError as mkt_exc:
+                        # Lenh MARKET bi tu choi (min notional/step size/ky quy) ->
+                        # tra ve cau truc loi thay vi crash giua chu ky.
+                        events.append(
+                            {"stage": "perp", "event": "MARKET_FALLBACK_REJECTED",
+                             "code": mkt_exc.code}
+                        )
+                        order = dict(order)
+                        order["filled"] = False
+                        order["status"] = "MARKET_FALLBACK_REJECTED"
+                        order["fallback_from"] = "GTX_TTL_EXPIRED"
+                        order["maker_filled_qty"] = filled_qty
+                        order["error"] = str(mkt_exc)
+                        return {
+                            "status": "MARKET_FALLBACK_REJECTED",
+                            "filled": False,
+                            "venue": venue_name,
+                            "symbol": symbol,
+                            "side": side_u,
+                            "qty": float(qty),
+                            "price": price,
+                            "pricing": pricing,
+                            "order": order,
+                            "error": str(mkt_exc),
+                            "events": events,
+                        }
+                    events.append(
+                        {"stage": "perp", "event": "MARKET_FALLBACK",
+                         "orderId": market_raw.get("orderId"),
+                         "remaining_qty": remaining_qty, "maker_filled_qty": filled_qty}
+                    )
+                    final = dict(self._await_fill(
+                        VENUE_FUTURES, symbol, market_raw,
+                        maker_ttl_sec, poll_interval_sec, events,
+                    ))
+                    final["fallback_from"] = "GTX_TTL_EXPIRED"
+                    final["maker_filled_qty"] = filled_qty
+                    market_filled = _safe_float(final.get("executedQty"))
+                    final["market_executed_qty"] = market_filled
+                    final["executedQty"] = min(float(qty), filled_qty + market_filled)
+                    # Chi bao FILLED khi lenh MARKET thuc su FILLED (khong "fake FILLED"
+                    # khi chi khop mot phan -> de caller rollback/dung an toan).
+                    final["filled"] = _is_filled(final)
+                    if final["filled"]:
+                        final["status"] = str(final.get("status") or "FILLED")
+                    order = final
+                else:
+                    # Maker da khop 100% ngay truoc/trong luc huy -> phai ghi nhan
+                    # trang thai THAT tu san, neu khong se bao that bai sai.
+                    if state_known and final_state:
+                        filled_state = dict(final_state)
+                        filled_state["filled"] = _is_filled(filled_state) or (
+                            filled_qty + 1e-12 >= float(qty)
+                        )
+                        if filled_state["filled"]:
+                            filled_state["status"] = "FILLED"
+                        filled_state["maker_filled_qty"] = filled_qty
+                        order = filled_state
+
+        filled = (
+            bool(order.get("filled"))
+            and _is_filled(order)
+            and _safe_float(order.get("executedQty")) > 0.0
+        )
+        return {
+            "status": str(order.get("status") or ("FILLED" if filled else "UNFILLED")),
+            "filled": filled,
+            "venue": venue_name,
+            "symbol": symbol,
+            "side": side_u,
+            "qty": float(qty),
+            "price": price,
+            "pricing": pricing,
+            "order": order,
+            "events": events,
+        }
+
     def fetch_exchange_reconcile_snapshot(
         self,
         symbols: list[str],
         prices: dict[str, float],
         mock_responses: dict | None = None,
         timeout_sec: float = 5.0,
+        universe_symbols: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Lay snapshot so du spot va vi the perp de doi soat danh muc (fail-closed)."""
+        """Lay snapshot so du spot va vi the perp de doi soat danh muc (fail-closed).
+
+        Sprint 21: ``universe_symbols`` (mac dinh LIQUID_8_SYMBOLS) duoc quet **toan ro**
+        thay vi chi cac ma truyen trong ``symbols``, dong thoi tra them
+        ``untracked_spot_assets`` (tai san Spot ngoai danh muc, vd faucet testnet).
+        """
         snapshot_source = "mock" if mock_responses is not None else "testnet_http"
+
+        scan_symbols: list[str] = []
+        for raw in list(universe_symbols or []) + list(symbols or []):
+            canon = normalize_symbol(str(raw))
+            if canon and canon not in scan_symbols:
+                scan_symbols.append(canon)
+        if not scan_symbols:
+            try:
+                from src.cross_exchange_carry import LIQUID_8_SYMBOLS
+
+                scan_symbols = [normalize_symbol(str(s)) for s in LIQUID_8_SYMBOLS]
+            except Exception:  # noqa: BLE001 - fallback tinh de khong vo luong chinh
+                scan_symbols = [
+                    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+                    "DOGE/USDT:USDT", "XRP/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
+                ]
+        universe_bases = {s.split("/")[0].upper() for s in scan_symbols if "/" in s}
 
         if mock_responses is None:
             if not self.has_credentials():
@@ -1595,13 +1957,24 @@ class BinanceSignedTestnetClient:
                 if free_val > 0.0:
                     spot_balances[asset] = free_val
 
-            # Keep base assets present in symbols even if free == 0
-            for sym in (symbols or []):
+            # Keep base assets present in the scanned universe even if free == 0
+            for sym in scan_symbols:
                 canon = normalize_symbol(str(sym))
                 base = canon.split("/")[0] if "/" in canon else canon
                 base = base.upper().strip()
                 if base and base not in spot_balances:
                     spot_balances[base] = float(spot_balances_raw.get(base, 0.0))
+
+            # Sprint 21: tai san Spot ngoai danh muc (vd faucet testnet) -> thong ke rieng
+            untracked_spot_assets: dict[str, float] = {}
+            for asset, free_val in spot_balances_raw.items():
+                if free_val <= 0.0:
+                    continue
+                if _is_cash_asset(asset):
+                    continue
+                if asset.upper() in universe_bases:
+                    continue
+                untracked_spot_assets[asset] = float(free_val)
 
             spot_cash_usd = 0.0
             for asset, free_val in spot_balances_raw.items():
@@ -1688,6 +2061,8 @@ class BinanceSignedTestnetClient:
                 "exchange_equity_usd": float(exchange_equity_usd),
                 "perp_positions": perp_positions,
                 "perp_positions_detail": perp_positions_detail,
+                "universe_symbols": list(scan_symbols),
+                "untracked_spot_assets": dict(untracked_spot_assets),
             }
         except Exception as exc:
             return {
@@ -1788,4 +2163,80 @@ def quantize_price(price: float, tick_size: float, side: str = "BUY") -> float:
     steps = d_price / d_tick
     rounding = ROUND_FLOOR if str(side).upper() == "BUY" else ROUND_CEILING
     return float(steps.to_integral_value(rounding=rounding) * d_tick)
+
+
+def compute_maker_limit_price(
+    side: str,
+    best_bid: float,
+    best_ask: float,
+    tick_size: float,
+    improve_inside_spread: bool = True,
+) -> dict[str, Any]:
+    """Sprint 21: gia dat lenh Maker Post-Only (GTX) theo chien luoc Smart Inside-Spread.
+
+    - Neu spread >= 2 tick va ``improve_inside_spread=True``: BUY dat tai
+      ``best_bid + tick`` va SELL dat tai ``best_ask - tick``. Gia nay van nam
+      nghiem ngat trong spread nen KHONG BAO GIO bi tu choi GTX, nhung duoc uu tien
+      dung dau so lenh (top-of-queue) -> tang ty le khop Maker, giam fallback market.
+    - Neu spread <= 1 tick: giu nguyen ``best_bid`` (BUY) / ``best_ask`` (SELL).
+
+    Tra ve dict metadata; ``price <= 0`` nghia la khong the tinh gia (caller phai
+    fallback sang MARKET).
+    """
+    side_u = str(side or "").strip().upper()
+    bid = _safe_float(best_bid)
+    ask = _safe_float(best_ask)
+    tick = _safe_float(tick_size)
+
+    info: dict[str, Any] = {
+        "side": side_u,
+        "best_bid": bid,
+        "best_ask": ask,
+        "tick_size": tick,
+        "spread_ticks": 0,
+        "improve_inside_spread": bool(improve_inside_spread),
+        "improved": False,
+        "mode": "FALLBACK_NO_BOOK",
+        "price": 0.0,
+    }
+    if side_u not in ("BUY", "SELL"):
+        info["mode"] = "INVALID_SIDE"
+        return info
+
+    # Sprint 21 (audit fix): chi coi la so lenh HOP LE khi bid < ask nghiem ngat.
+    # - ask == bid (locked book) hoac ask < bid (crossed): moi gia deu co the khop
+    #   ngay -> Post-Only GTX bi tu choi (-2010). Tra price=0 de caller dung MARKET.
+    # - So lenh mot phia (bid hoac ask = 0): khong an toan cho GTX -> price=0.
+    has_book = (tick > 0.0) and (bid > 0.0) and (ask > 0.0) and (ask > bid)
+    if not has_book:
+        info["mode"] = "FALLBACK_NO_BOOK"
+        info["price"] = 0.0
+        return info
+
+    spread_ticks = int(round((ask - bid) / tick))
+    info["spread_ticks"] = spread_ticks
+
+    if improve_inside_spread and spread_ticks >= 2:
+        if side_u == "BUY":
+            candidate = quantize_price(bid + tick, tick, side="BUY")
+            if candidate <= bid:
+                candidate = quantize_price(bid + tick, tick, side="SELL")
+        else:
+            candidate = quantize_price(ask - tick, tick, side="SELL")
+            if candidate >= ask:
+                candidate = quantize_price(ask - tick, tick, side="BUY")
+        strictly_inside = (candidate > bid and candidate < ask) if side_u == "BUY" else (
+            candidate < ask and candidate > bid
+        )
+        if strictly_inside and candidate > 0.0:
+            info["price"] = float(candidate)
+            info["improved"] = True
+            info["mode"] = "INSIDE_SPREAD"
+            return info
+
+    # spread <= 1 tick (hoac khong cai thien duoc): dat ngay tai mep so lenh.
+    touch = bid if side_u == "BUY" else ask
+    info["price"] = float(quantize_price(touch, tick, side=side_u))
+    info["mode"] = "TOUCH_BEST"
+    return info
 
