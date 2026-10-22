@@ -1,10 +1,11 @@
-"""Sprint 16 & Sprint 18 - Adapter ky lenh Binance HMAC-SHA256 cho Testnet/Demo (fail-closed).
+"""Sprint 16 / 18 / 19 - Adapter ky lenh Binance HMAC-SHA256 cho Testnet (fail-closed).
 
 Nguyen tac an toan:
-- KHONG hardcode khoa: chi doc tu tham so hoac bien moi truong
-  BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET.
+- KHONG hardcode khoa: chi doc tu tham so, file `.env.testnet` hoac bien moi truong.
+- Sprint 19: ho tro KHOA KEP rieng biet cho Spot Testnet va USDS-M Futures Testnet.
 - dry_run=True mac dinh: chi dong goi payload + tao chu ky, KHONG gui lenh.
 - Thieu khoa ma dry_run=False -> raise BinanceCredentialsMissingError (fail-closed).
+- Sprint 19: `sync_server_time` bu lech gio may chu de triet tieu loi -1021.
 
 Chuan chu ky Binance: query string duoc sap xep theo key, urlencode, kem timestamp
 va recvWindow; signature = HMAC_SHA256(secret, query_string).hexdigest().
@@ -15,11 +16,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
 
 from src.cross_exchange_carry import DEFAULT_MIN_NOTIONAL, EXCHANGE_LOT_SPECS
@@ -32,13 +35,114 @@ PERP_ORDER_PATH: str = "/fapi/v1/order"
 SPOT_ACCOUNT_PATH: str = "/api/v3/account"
 PERP_ACCOUNT_PATH: str = "/fapi/v2/account"
 PERP_POSITION_RISK_PATH: str = "/fapi/v2/positionRisk"
+SPOT_TIME_PATH: str = "/api/v3/time"
+PERP_TIME_PATH: str = "/fapi/v1/time"
+SPOT_BOOK_TICKER_PATH: str = "/api/v3/ticker/bookTicker"
+PERP_BOOK_TICKER_PATH: str = "/fapi/v1/ticker/bookTicker"
 DEFAULT_RECV_WINDOW_MS: int = 5000
+DEFAULT_LIVE_RECV_WINDOW_MS: int = 10000
 ENV_API_KEY: str = "BINANCE_TESTNET_API_KEY"
 ENV_API_SECRET: str = "BINANCE_TESTNET_API_SECRET"
+ENV_SPOT_API_KEY: str = "BINANCE_SPOT_TESTNET_API_KEY"
+ENV_SPOT_API_SECRET: str = "BINANCE_SPOT_TESTNET_API_SECRET"
+ENV_FUTURES_API_KEY: str = "BINANCE_FUTURES_TESTNET_API_KEY"
+ENV_FUTURES_API_SECRET: str = "BINANCE_FUTURES_TESTNET_API_SECRET"
+DEFAULT_DOTENV_TESTNET: str = ".env.testnet"
+DEFAULT_DOTENV: str = ".env"
+
+VENUE_SPOT: str = "spot"
+VENUE_FUTURES: str = "futures"
+
+FUTURES_KEY_INVALID_CODE = "FUTURES_KEY_INVALID_OR_SPOT_KEY_USED_ON_FUTURES"
+FUTURES_KEY_INVALID_HINT: str = (
+    "FUTURES_KEY_INVALID_OR_SPOT_KEY_USED_ON_FUTURES: "
+    "Hay tao them khoa rieng tai https://testnet.binancefuture.com"
+)
+FUTURES_INVALID_ERROR_CODES: frozenset[int] = frozenset({-2014, -2015})
+POST_ONLY_REJECT_CODES: frozenset[int] = frozenset({-2010, -2021, -1102})
 
 
 class BinanceCredentialsMissingError(RuntimeError):
     """Thieu API key/secret khi can ky lenh that (fail-closed)."""
+
+
+class BinanceHttpError(RuntimeError):
+    """Loi HTTP/API tra ve tu Binance (kem code/msg de chan doan)."""
+
+    def __init__(self, message: str, code: int | None = None, msg: str = "") -> None:
+        super().__init__(message)
+        self.code: int | None = code
+        self.msg: str = msg or message
+
+
+def _mask_secret(value: str | None) -> str:
+    """Mo ta trang thai khoa an danh: KHONG BAO GIO lo gia tri that."""
+    if not value:
+        return "not_loaded"
+    return f"loaded=True (len={len(value)}, prefix={value[:4]}***)"
+
+
+def load_dotenv_testnet(
+    dotenv_path: str | Path | None = DEFAULT_DOTENV_TESTNET,
+    extra_paths: tuple[str | Path, ...] = (DEFAULT_DOTENV,),
+    override: bool = False,
+    environ: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Nap bien moi truong tu `.env.testnet` (+ `.env`) vao os.environ (khong ghi de).
+
+    - Doc voi ``encoding="utf-8-sig"`` de xu ly an toan BOM tren Windows.
+    - Bo qua dong trong va dong comment ``#``.
+    - Ho tro tien to ``export KEY=VALUE`` va gia tri duoc quote ``"..."``/``'...'``.
+    - Chi nap khi bien chua ton tai hoac dang rong (tru khi ``override=True``).
+    - Tra ve dict cac cap KEY->VALUE da PARSE (khong in ra console).
+
+    Luu y bao mat: KHONG BAO GIO log/in gia tri khoa tu ham nay.
+    """
+    target_env: dict[str, str] = environ if environ is not None else os.environ
+    loaded: dict[str, str] = {}
+
+    paths: list[Path] = []
+    if dotenv_path is not None:
+        paths.append(Path(dotenv_path))
+    for extra in extra_paths or ():
+        if extra is not None:
+            paths.append(Path(extra))
+
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:  # pragma: no cover - duong dan la
+            resolved = path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:  # pragma: no cover - quyen doc
+            continue
+        for line in raw.splitlines():
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            if text.lower().startswith("export "):
+                text = text[7:].strip()
+            if "=" not in text:
+                continue
+            key, _, value = text.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            if not override and target_env.get(key):
+                continue
+            target_env[key] = value
+            loaded[key] = value
+    return loaded
 
 
 CASH_ASSETS: frozenset[str] = frozenset(
@@ -128,7 +232,11 @@ def _lookup_price(prices: Mapping[str, Any] | None, sym: str, base: str) -> floa
 
 
 class BinanceSignedTestnetClient:
-    """Client ky lenh testnet (Spot + USDS-M Futures), mac dinh dry-run."""
+    """Client ky lenh testnet (Spot + USDS-M Futures), mac dinh dry-run.
+
+    Sprint 19: quan ly 2 cap khoa rieng biet (Spot / Futures), nap `.env.testnet`,
+    dong bo gio may chu va bu `time_offset_ms` vao moi request ky HMAC.
+    """
 
     def __init__(
         self,
@@ -138,22 +246,110 @@ class BinanceSignedTestnetClient:
         recv_window: int = DEFAULT_RECV_WINDOW_MS,
         spot_base_url: str = SPOT_TESTNET_BASE_URL,
         perp_base_url: str = PERP_TESTNET_BASE_URL,
+        spot_api_key: str | None = None,
+        spot_api_secret: str | None = None,
+        futures_api_key: str | None = None,
+        futures_api_secret: str | None = None,
+        dotenv_path: str | Path | None = None,
+        autoload_dotenv: bool = True,
+        transport: Callable[..., dict[str, Any]] | None = None,
     ) -> None:
-        self.api_key: str | None = api_key or os.environ.get(ENV_API_KEY)
-        self.api_secret: str | None = api_secret or os.environ.get(ENV_API_SECRET)
+        # Sprint 19: chi tu dong nap `.env.testnet` khi caller KHONG truyen khoa
+        # tuong minh -> giu hanh vi tat dinh cho unit test (api_key="" van la rong).
+        if autoload_dotenv and api_key is None and api_secret is None:
+            try:
+                load_dotenv_testnet(
+                    dotenv_path if dotenv_path is not None else DEFAULT_DOTENV_TESTNET
+                )
+            except Exception:  # pragma: no cover - thieu file la binh thuong
+                pass
+
+        # -- cap khoa legacy (alias tuong thich nguoc) --------------------
+        self.api_key: str | None = (
+            api_key if api_key is not None else os.environ.get(ENV_API_KEY)
+        )
+        self.api_secret: str | None = (
+            api_secret if api_secret is not None else os.environ.get(ENV_API_SECRET)
+        )
+
+        # -- Sprint 19: cap khoa kep Spot / Futures -----------------------
+        self.spot_api_key: str = self._resolve_credential(
+            explicit=spot_api_key,
+            generic=api_key,
+            env_specific=ENV_SPOT_API_KEY,
+            env_legacy=ENV_API_KEY,
+        )
+        self.spot_api_secret: str = self._resolve_credential(
+            explicit=spot_api_secret,
+            generic=api_secret,
+            env_specific=ENV_SPOT_API_SECRET,
+            env_legacy=ENV_API_SECRET,
+        )
+        self.futures_api_key: str = self._resolve_credential(
+            explicit=futures_api_key,
+            generic=api_key,
+            env_specific=ENV_FUTURES_API_KEY,
+            env_legacy=ENV_API_KEY,
+        )
+        self.futures_api_secret: str = self._resolve_credential(
+            explicit=futures_api_secret,
+            generic=api_secret,
+            env_specific=ENV_FUTURES_API_SECRET,
+            env_legacy=ENV_API_SECRET,
+        )
+
+        # Sprint 19: bu lech gio may chu (ms) cho tung venue.
+        self.spot_time_offset_ms: int = 0
+        self.futures_time_offset_ms: int = 0
+
         self.dry_run: bool = bool(dry_run)
         self.recv_window: int = int(recv_window)
         self.spot_base_url: str = spot_base_url.rstrip("/")
         self.perp_base_url: str = perp_base_url.rstrip("/")
+        self.transport: Callable[..., dict[str, Any]] | None = transport
+        self.last_error: dict[str, Any] | None = None
         if not self.dry_run and not self.has_credentials():
             raise BinanceCredentialsMissingError(
                 "Thieu BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET: "
                 "bat buoc dung --dry-run-sign hoac cau hinh bien moi truong (fail-closed)."
             )
 
+    @staticmethod
+    def _resolve_credential(
+        explicit: str | None,
+        generic: str | None,
+        env_specific: str,
+        env_legacy: str,
+    ) -> str:
+        """Uu tien: tham so rieng > tham so chung > env rieng > env legacy."""
+        if explicit is not None:
+            return str(explicit)
+        if generic is not None:
+            return str(generic)
+        return str(os.environ.get(env_specific) or os.environ.get(env_legacy) or "")
+
     # -- credentials -----------------------------------------------------
+    def has_spot_credentials(self) -> bool:
+        return bool(self.spot_api_key) and bool(self.spot_api_secret)
+
+    def has_futures_credentials(self) -> bool:
+        return bool(self.futures_api_key) and bool(self.futures_api_secret)
+
     def has_credentials(self) -> bool:
-        return bool(self.api_key) and bool(self.api_secret)
+        return self.has_spot_credentials() or self.has_futures_credentials()
+
+    def credential_status(self) -> dict[str, str]:
+        """Trang thai khoa AN DANH (du an toan de in ra log/bao cao)."""
+        return {
+            "spot_key": _mask_secret(self.spot_api_key),
+            "spot_secret": _mask_secret(self.spot_api_secret),
+            "futures_key": _mask_secret(self.futures_api_key),
+            "futures_secret": _mask_secret(self.futures_api_secret),
+            "spot_credentials": self.has_spot_credentials(),
+            "futures_credentials": self.has_futures_credentials(),
+            "spot_time_offset_ms": self.spot_time_offset_ms,
+            "futures_time_offset_ms": self.futures_time_offset_ms,
+        }
 
     def require_credentials(self) -> None:
         if not self.has_credentials():
@@ -161,21 +357,154 @@ class BinanceSignedTestnetClient:
                 "Thieu BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET (fail-closed)."
             )
 
-    def _headers(self) -> dict[str, str]:
-        return {"X-MBX-APIKEY": self.api_key or ""}
+    def api_key_for(self, venue: str) -> str:
+        return self.futures_api_key if venue == VENUE_FUTURES else self.spot_api_key
+
+    def api_secret_for(self, venue: str) -> str:
+        return self.futures_api_secret if venue == VENUE_FUTURES else self.spot_api_secret
+
+    def time_offset_ms(self, venue: str) -> int:
+        return (
+            self.futures_time_offset_ms
+            if venue == VENUE_FUTURES
+            else self.spot_time_offset_ms
+        )
+
+    def _headers(self, venue: str = VENUE_SPOT) -> dict[str, str]:
+        return {"X-MBX-APIKEY": self.api_key_for(venue) or ""}
+
+    # -- HTTP transport --------------------------------------------------
+    def _http_request(
+        self,
+        method: str,
+        url: str,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout_sec: float = 10.0,
+    ) -> Any:
+        """Gui 1 request HTTP toi Binance va tra JSON (dict hoac list)."""
+        payload = dict(params or {})
+        hdrs = dict(headers or {})
+        if self.transport is not None:
+            result = self.transport(
+                method=method,
+                url=url,
+                params=payload,
+                headers=hdrs,
+                timeout_sec=float(timeout_sec),
+            )
+            if isinstance(result, Exception):
+                raise result
+            if not isinstance(result, (dict, list)):
+                raise BinanceHttpError(f"Transport tra ve kieu khong hop le: {type(result)!r}")
+            if isinstance(result, dict) and result.get("code") is not None and "msg" in result:
+                code = int(result.get("code") or 0)
+                raise BinanceHttpError(
+                    f"Binance API loi {code}: {result.get('msg')}",
+                    code=code,
+                    msg=str(result.get("msg")),
+                )
+            return result
+
+        query = build_query_string(payload)
+        if method.upper() == "GET":
+            full_url = f"{url}?{query}" if query else url
+            body: bytes | None = None
+        else:
+            full_url = url
+            body = query.encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        req = urllib.request.Request(
+            full_url, data=body, headers=hdrs, method=method.upper()
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # pragma: no cover
+                detail = ""
+            code, msg = _parse_binance_error(detail)
+            raise BinanceHttpError(
+                f"HTTP {exc.code} {url}: {detail[:300]}", code=code, msg=msg
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise BinanceHttpError(f"Network error {url}: {exc.reason}") from exc
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError as exc:
+            raise BinanceHttpError(f"JSON decode loi ({url}): {raw[:200]}") from exc
+        if isinstance(parsed, dict) and parsed.get("code") is not None and "msg" in parsed:
+            code = int(parsed.get("code") or 0)
+            raise BinanceHttpError(
+                f"Binance API loi {code}: {parsed.get('msg')}", code=code, msg=str(parsed.get("msg"))
+            )
+        return parsed
+
+    # -- server time sync ------------------------------------------------
+    def sync_server_time(
+        self,
+        venue: str = "both",
+        timeout_sec: float = 5.0,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Dong bo gio may chu Spot/Futures -> spot/futures_time_offset_ms.
+
+        offset = serverTime - local_ms. Moi request ky sau do se cong offset nay,
+        trieu tieu 100% loi -1021 Timestamp outside of recvWindow.
+        """
+        result: dict[str, Any] = {
+            "spot_offset_ms": self.spot_time_offset_ms,
+            "futures_offset_ms": self.futures_time_offset_ms,
+            "errors": [],
+        }
+        venues = [VENUE_SPOT, VENUE_FUTURES] if venue == "both" else [venue]
+        for v in venues:
+            path = PERP_TIME_PATH if v == VENUE_FUTURES else SPOT_TIME_PATH
+            base = self.perp_base_url if v == VENUE_FUTURES else self.spot_base_url
+            local_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+            try:
+                resp = self._http_request(
+                    "GET", f"{base}{path}", {}, {}, timeout_sec=timeout_sec
+                )
+                server_ms = int(resp.get("serverTime") or 0)
+                if server_ms <= 0:
+                    raise BinanceHttpError(f"{v}: serverTime khong hop le")
+                offset = server_ms - local_ms
+            except Exception as exc:
+                result["errors"].append(f"{v}: {exc}")
+                continue
+            if v == VENUE_FUTURES:
+                self.futures_time_offset_ms = int(offset)
+                result["futures_offset_ms"] = int(offset)
+            else:
+                self.spot_time_offset_ms = int(offset)
+                result["spot_offset_ms"] = int(offset)
+            result[f"{v}_server_time_ms"] = server_ms
+        result["synced"] = not result["errors"]
+        return result
 
     # -- signing ---------------------------------------------------------
     def sign_params(
-        self, params: Mapping[str, Any], timestamp_ms: int | None = None
+        self,
+        params: Mapping[str, Any],
+        timestamp_ms: int | None = None,
+        venue: str = VENUE_SPOT,
     ) -> dict[str, Any]:
-        """Them timestamp + recvWindow roi tra payload da ky."""
+        """Them timestamp (da bu offset) + recvWindow roi tra payload da ky."""
         self.require_credentials()
         payload: dict[str, Any] = dict(params)
         payload["timestamp"] = int(
-            timestamp_ms if timestamp_ms is not None else int(time.time() * 1000)
+            timestamp_ms
+            if timestamp_ms is not None
+            else int(time.time() * 1000) + self.time_offset_ms(venue)
         )
         payload["recvWindow"] = int(self.recv_window)
-        payload["signature"] = sign_binance_payload(payload, self.api_secret or "")
+        payload["signature"] = sign_binance_payload(
+            payload, self.api_secret_for(venue)
+        )
         return payload
 
     def build_signed_get_request(
@@ -186,14 +515,20 @@ class BinanceSignedTestnetClient:
         timestamp_ms: int | None = None,
     ) -> dict[str, Any]:
         """Dong goi request GET da ky HMAC-SHA256."""
-        self.require_credentials()
+        venue = VENUE_FUTURES if futures else VENUE_SPOT
+        if not self.has_credentials():
+            raise BinanceCredentialsMissingError(
+                "Thieu BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET (fail-closed)."
+            )
         base_url = self.perp_base_url if futures else self.spot_base_url
         clean_endpoint = endpoint if endpoint.startswith("/") else f"/{endpoint}"
-        signed_params = self.sign_params(params or {}, timestamp_ms=timestamp_ms)
+        signed_params = self.sign_params(
+            params or {}, timestamp_ms=timestamp_ms, venue=venue
+        )
         return {
             "method": "GET",
             "url": f"{base_url}{clean_endpoint}",
-            "headers": self._headers(),
+            "headers": self._headers(venue),
             "params": signed_params,
         }
 
@@ -206,35 +541,65 @@ class BinanceSignedTestnetClient:
         spot_price: float | None = None,
         post_only_spot: bool = True,
         timestamp_ms: int | None = None,
+        spot_use_limit_maker: bool = False,
+        perp_post_only: bool = False,
+        perp_price: float | None = None,
+        spot_side: str = "BUY",
+        perp_side: str = "SELL",
+        perp_reduce_only: bool = False,
     ) -> dict[str, Any]:
-        """Dung cap lenh Spot BUY + Perp SELL (delta-neutral) da ky day du."""
+        """Dung cap lenh Spot + Perp (delta-neutral) da ky day du.
+
+        Sprint 19 - Sua chuan Post-Only:
+        - Spot (`/api/v3/order`): Post-Only BAT BUOC dung ``type="LIMIT_MAKER"`` va
+          KHONG duoc gui ``timeInForce`` (gui GTX len Spot se bi loi -1102).
+        - Perp (`/fapi/v1/order`): Post-Only dung ``type="LIMIT", timeInForce="GTX"``.
+        """
         lot_spot = _check_lot(symbol, float(spot_qty), spot_price)
         lot_perp = _check_lot(symbol, float(perp_qty))
 
         spot_params: dict[str, Any] = {
             "symbol": _binance_symbol(symbol),
-            "side": "BUY",
+            "side": spot_side,
             "quantity": float(spot_qty),
         }
         if post_only_spot:
             if spot_price is None or spot_price <= 0.0:
                 raise ValueError("post_only_spot=True yeu cau spot_price > 0")
-            spot_params.update(
-                {
-                    "type": "LIMIT",
-                    "timeInForce": "GTX",
-                    "price": float(spot_price),
-                }
-            )
+            if spot_use_limit_maker:
+                # Binance Spot API v3: LIMIT_MAKER la cach duy nhat dat Post-Only,
+                # va KHONG duoc kem timeInForce.
+                spot_params.update({"type": "LIMIT_MAKER", "price": float(spot_price)})
+            else:
+                spot_params.update(
+                    {
+                        "type": "LIMIT",
+                        "timeInForce": "GTX",
+                        "price": float(spot_price),
+                    }
+                )
         else:
             spot_params["type"] = "MARKET"
 
         perp_params: dict[str, Any] = {
             "symbol": _binance_symbol(symbol),
-            "side": "SELL",
-            "type": "MARKET",
-            "quantity": float(perp_qty),
+            "side": perp_side,
         }
+        if perp_post_only:
+            if perp_price is None or perp_price <= 0.0:
+                raise ValueError("perp_post_only=True yeu cau perp_price > 0")
+            perp_params.update(
+                {
+                    "type": "LIMIT",
+                    "timeInForce": "GTX",
+                    "price": float(perp_price),
+                    "quantity": float(perp_qty),
+                }
+            )
+        else:
+            perp_params.update({"type": "MARKET", "quantity": float(perp_qty)})
+        if perp_reduce_only:
+            perp_params["reduceOnly"] = True
 
         return {
             "symbol": symbol,
@@ -248,19 +613,763 @@ class BinanceSignedTestnetClient:
             },
             "spot": {
                 "method": "POST",
+                "venue": VENUE_SPOT,
                 "url": f"{self.spot_base_url}{SPOT_ORDER_PATH}",
-                "headers": self._headers(),
-                "params": self.sign_params(spot_params, timestamp_ms=timestamp_ms),
+                "headers": self._headers(VENUE_SPOT),
+                "params": self.sign_params(
+                    spot_params, timestamp_ms=timestamp_ms, venue=VENUE_SPOT
+                ),
             },
             "perp": {
                 "method": "POST",
+                "venue": VENUE_FUTURES,
                 "url": f"{self.perp_base_url}{PERP_ORDER_PATH}",
-                "headers": self._headers(),
-                "params": self.sign_params(perp_params, timestamp_ms=timestamp_ms),
+                "headers": self._headers(VENUE_FUTURES),
+                "params": self.sign_params(
+                    perp_params, timestamp_ms=timestamp_ms, venue=VENUE_FUTURES
+                ),
             },
         }
 
-    # -- snapshot fetching -----------------------------------------------
+    def build_order_request(
+        self,
+        venue: str,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        time_in_force: str | None = None,
+        reduce_only: bool = False,
+        price_check: float | None = None,
+        timestamp_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Dong goi 1 request dat lenh da ky (dung cho entry/exit/rollback)."""
+        params: dict[str, Any] = {
+            "symbol": _binance_symbol(symbol),
+            "side": str(side).upper(),
+            "quantity": float(quantity),
+            "type": str(order_type).upper(),
+        }
+        if order_type.upper() in ("LIMIT", "LIMIT_MAKER", "STOP", "TAKE_PROFIT"):
+            if price is None or float(price) <= 0.0:
+                raise ValueError(f"{order_type} yeu cau price > 0")
+            params["price"] = float(price)
+        if time_in_force and order_type.upper() not in ("LIMIT_MAKER", "MARKET"):
+            params["timeInForce"] = str(time_in_force).upper()
+        if reduce_only and venue == VENUE_FUTURES:
+            params["reduceOnly"] = True
+        if price_check is not None and price_check > 0.0:
+            _check_lot(symbol, float(quantity), float(price_check))
+        base = self.perp_base_url if venue == VENUE_FUTURES else self.spot_base_url
+        path = PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH
+        return {
+            "method": "POST",
+            "venue": venue,
+            "url": f"{base}{path}",
+            "headers": self._headers(venue),
+            "params": self.sign_params(params, timestamp_ms=timestamp_ms, venue=venue),
+        }
+
+    def fetch_symbol_filters(
+        self, symbol: str, venue: str = VENUE_SPOT, timeout_sec: float = 5.0
+    ) -> dict[str, float]:
+        """Lay tick_size / step_size / min_notional THAT tu exchangeInfo.
+
+        Bat buoc de tranh -1013 (PRICE_FILTER) khi gui Post-Only voi gia qua nhieu
+        chu so thap phan, va de kiem tra min_notional chinh xac truoc khi dat lenh.
+        """
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        base = self.perp_base_url if venue == VENUE_FUTURES else self.spot_base_url
+        path = "/fapi/v1/exchangeInfo" if venue == VENUE_FUTURES else "/api/v3/exchangeInfo"
+        raw = self._http_request(
+            "GET", f"{base}{path}", {"symbol": _binance_symbol(symbol)}, {},
+            timeout_sec=timeout_sec,
+        )
+        filters = {"tick_size": 0.0, "step_size": 0.0, "min_notional": 0.0}
+        entries = raw.get("symbols") if isinstance(raw, dict) else None
+        if not isinstance(entries, list) or not entries:
+            return filters
+        entry = entries[0] if isinstance(entries[0], dict) else {}
+        for f in entry.get("filters", []) or []:
+            if not isinstance(f, dict):
+                continue
+            ftype = str(f.get("filterType", "")).upper()
+            if ftype == "PRICE_FILTER":
+                filters["tick_size"] = _safe_float(f.get("tickSize"))
+            elif ftype == "LOT_SIZE":
+                filters["step_size"] = _safe_float(f.get("stepSize"))
+            elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                val = f.get("minNotional", f.get("notional"))
+                filters["min_notional"] = _safe_float(val)
+        return filters
+
+    # -- live order submission (Sprint 19) --------------------------------
+    def submit_signed_order(
+        self,
+        venue: str,
+        params: dict,
+        timeout_sec: float = 10.0,
+        already_signed: bool = False,
+    ) -> dict[str, Any]:
+        """Gui lenh that (dry_run=False) hoac tra payload mo phong (dry_run=True).
+
+        ``params`` co the la:
+        - dict tham so lenh chua ky (tu dong ky voi offset gio dung venue), hoac
+        - request envelope ``{"url":..,"headers":..,"params":..}`` (tu build_order_request).
+
+        dry_run=True: chi ky + tra payload mo phong (tuong thich 100% unit test cu).
+        """
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        envelope: dict[str, Any] | None = None
+        if (
+            isinstance(params, dict)
+            and "params" in params
+            and "url" in params
+            and isinstance(params.get("params"), dict)
+        ):
+            envelope = dict(params)
+            raw_params: dict[str, Any] = dict(envelope.get("params") or {})
+        else:
+            raw_params = dict(params or {})
+
+        base = self.perp_base_url if venue == VENUE_FUTURES else self.spot_base_url
+        path = PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH
+        url = str(envelope.get("url")) if envelope else f"{base}{path}"
+        headers = dict(envelope.get("headers") or {}) if envelope else self._headers(venue)
+        headers.setdefault("X-MBX-APIKEY", self.api_key_for(venue) or "")
+
+        signed = raw_params
+        # Bat bien: KHONG BAO GIO ky lai payload da co signature (se tao chu ky
+        # long nhau -> Binance tra -1022 Signature for this request is not valid).
+        if not already_signed and "signature" not in raw_params:
+            signed = self.sign_params(raw_params, venue=venue)
+
+        if self.dry_run:
+            return {
+                "dry_run": True,
+                "submitted": False,
+                "venue": venue,
+                "url": url,
+                "headers": headers,
+                "params": signed,
+                "orderId": None,
+                "status": "DRY_RUN",
+                "executedQty": 0.0,
+                "cummulativeQuoteQty": 0.0,
+                "avgPrice": 0.0,
+                "filled": False,
+            }
+
+        raw = self._http_request(
+            "POST", url, signed, headers, timeout_sec=float(timeout_sec)
+        )
+        result = normalize_order_result(venue, raw)
+        # KHONG tra ve headers: header chua X-MBX-APIKEY, rat de ro ri vao log.
+        result.update({"dry_run": False, "submitted": True, "url": url})
+        result["filled"] = _is_filled(result)
+        return result
+
+    def query_order(
+        self,
+        venue: str,
+        symbol: str,
+        order_id: int | str,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        """Truy van trang thai 1 lenh da dat (GET /api/v3/order hoac /fapi/v1/order)."""
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        params = {"symbol": _binance_symbol(symbol), "orderId": order_id}
+        req = self.build_signed_get_request(
+            PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH,
+            params=params,
+            futures=(venue == VENUE_FUTURES),
+        )
+        raw = self._http_request(
+            "GET", req["url"], req["params"], req["headers"], timeout_sec=timeout_sec
+        )
+        result = normalize_order_result(venue, raw)
+        result["filled"] = _is_filled(result)
+        return result
+
+    def cancel_order(
+        self,
+        venue: str,
+        symbol: str,
+        order_id: int | str,
+        timeout_sec: float = 10.0,
+    ) -> dict[str, Any]:
+        """Huy 1 lenh con treo (DELETE) - dung khi Post-Only khong khop sau TTL."""
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        params = {"symbol": _binance_symbol(symbol), "orderId": order_id}
+        if self.dry_run:
+            return {"dry_run": True, "canceled": False, "orderId": order_id}
+        base = self.perp_base_url if venue == VENUE_FUTURES else self.spot_base_url
+        path = PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH
+        signed = self.sign_params(params, venue=venue)
+        try:
+            raw = self._http_request(
+                "DELETE", f"{base}{path}", signed, self._headers(venue),
+                timeout_sec=timeout_sec,
+            )
+        except BinanceHttpError as exc:
+            return {"canceled": False, "orderId": order_id, "error": str(exc)}
+        return {"canceled": True, "orderId": order_id, "raw": raw}
+
+    def fetch_book_ticker(
+        self, symbol: str, venue: str = VENUE_SPOT, timeout_sec: float = 5.0
+    ) -> dict[str, float]:
+        """Lay best bid/ask that tu bookTicker (public, khong can ky)."""
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        base = self.perp_base_url if venue == VENUE_FUTURES else self.spot_base_url
+        path = PERP_BOOK_TICKER_PATH if venue == VENUE_FUTURES else SPOT_BOOK_TICKER_PATH
+        raw = self._http_request(
+            "GET", f"{base}{path}", {"symbol": _binance_symbol(symbol)}, {},
+            timeout_sec=timeout_sec,
+        )
+        bid = _safe_float(raw.get("bidPrice"))
+        ask = _safe_float(raw.get("askPrice"))
+        mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else max(bid, ask)
+        return {"bid": bid, "ask": ask, "mid": mid, "raw": raw}
+
+    def check_account_access(
+        self, venue: str, timeout_sec: float = 5.0
+    ) -> dict[str, Any]:
+        """Kiem tra xac thuc cua tung venue; chan doan ro loi dung nham khoa."""
+        venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
+        if not (self.has_futures_credentials() if venue == VENUE_FUTURES
+                else self.has_spot_credentials()):
+            return {
+                "venue": venue,
+                "authenticated": False,
+                "error": f"MISSING_{venue.upper()}_CREDENTIALS",
+                "hint": (
+                    FUTURES_KEY_INVALID_HINT if venue == VENUE_FUTURES
+                    else "Hay tao khoa Spot Testnet tai https://testnet.binance.vision"
+                ),
+            }
+        try:
+            req = self.build_signed_get_request(
+                PERP_ACCOUNT_PATH if venue == VENUE_FUTURES else SPOT_ACCOUNT_PATH,
+                futures=(venue == VENUE_FUTURES),
+            )
+            raw = self._http_request(
+                "GET", req["url"], req["params"], req["headers"], timeout_sec=timeout_sec
+            )
+        except BinanceHttpError as exc:
+            if venue == VENUE_FUTURES and exc.code in FUTURES_INVALID_ERROR_CODES:
+                return {
+                    "venue": venue,
+                    "authenticated": False,
+                    "error": FUTURES_KEY_INVALID_CODE,
+                    "hint": FUTURES_KEY_INVALID_HINT,
+                    "api_error_code": exc.code,
+                }
+            return {
+                "venue": venue,
+                "authenticated": False,
+                "error": f"API_ERROR_{exc.code}",
+                "hint": str(exc),
+                "api_error_code": exc.code,
+            }
+        except Exception as exc:
+            return {
+                "venue": venue,
+                "authenticated": False,
+                "error": "NETWORK_OR_AUTH_FAILURE",
+                "hint": str(exc),
+            }
+        holdings: dict[str, float] = {}
+        if isinstance(raw.get("balances"), list):
+            for b in raw["balances"]:
+                if isinstance(b, dict):
+                    a = str(b.get("asset", "")).upper()
+                    free = _safe_float(b.get("free"))
+                    if a and free > 0.0:
+                        holdings[a] = free
+        elif isinstance(raw.get("assets"), list):
+            for b in raw["assets"]:
+                if isinstance(b, dict):
+                    a = str(b.get("asset", "")).upper()
+                    free = _safe_float(b.get("availableBalance", b.get("walletBalance")))
+                    if a and free > 0.0:
+                        holdings[a] = free
+        return {
+            "venue": venue,
+            "authenticated": True,
+            "error": None,
+            "holdings": holdings,
+            "server_time_offset_ms": self.time_offset_ms(venue),
+        }
+
+    def execute_live_testnet_order_pair(
+        self,
+        symbol: str,
+        spot_qty: float,
+        perp_qty: float,
+        spot_price: float | None = None,
+        perp_price: float | None = None,
+        direction: str = "open",
+        post_only_spot: bool = True,
+        spot_use_limit_maker: bool = True,
+        perp_post_only: bool = False,
+        maker_ttl_sec: float = 2.0,
+        poll_interval_sec: float = 0.2,
+        timeout_sec: float = 10.0,
+        require_futures: bool = False,
+        perp_available: bool | None = None,
+    ) -> dict[str, Any]:
+        """Dat cap lenh Spot + Perp voi fallback maker->market va Atomic Leg Rollback.
+
+        Bat bien an toan: KHONG BAO GIO de lai vi the tran (naked leg). Neu chan 1
+        (Spot) da khop ma chan 2 (Perp) that bai -> lap tuc gui lenh MARKET nguoc
+        chieu dong chan 1 va tra ve ``status="ROLLED_BACK_SAFE"``.
+        """
+        open_leg = str(direction).lower() != "close"
+        spot_side = "BUY" if open_leg else "SELL"
+        perp_side = "SELL" if open_leg else "BUY"
+        events: list[dict[str, Any]] = []
+
+        if self.dry_run:
+            pair = self.build_delta_neutral_order_pair(
+                symbol=symbol,
+                spot_qty=spot_qty,
+                perp_qty=perp_qty,
+                spot_price=spot_price,
+                post_only_spot=post_only_spot,
+                spot_use_limit_maker=spot_use_limit_maker,
+                perp_post_only=perp_post_only,
+                perp_price=perp_price,
+                spot_side=spot_side,
+                perp_side=perp_side,
+                perp_reduce_only=not open_leg,
+            )
+            return {
+                "dry_run": True,
+                "submitted": False,
+                "status": "DRY_RUN",
+                "rolled_back": False,
+                "direction": "open" if open_leg else "close",
+                "spot": pair["spot"],
+                "perp": pair["perp"],
+                "events": events,
+            }
+
+        # --- Chan 1: Spot (maker -> market fallback) --------------------
+        # A.1: bat moi ngoai le cua chan Spot de con duong rollback luon duoc cham toi
+        # (neu maker da khop mot phan roi loi mang -> phai dong ngay phan da khop).
+        spot_tracker: dict[str, float] = {"executed_qty": 0.0}
+        try:
+            spot_result, events = self._execute_spot_leg(
+                symbol=symbol,
+                qty=float(spot_qty),
+                side=spot_side,
+                price=spot_price,
+                post_only=post_only_spot,
+                use_limit_maker=spot_use_limit_maker,
+                maker_ttl_sec=maker_ttl_sec,
+                poll_interval_sec=poll_interval_sec,
+                timeout_sec=timeout_sec,
+                events=events,
+                tracker=spot_tracker,
+            )
+        except Exception as exc:  # noqa: BLE001 - khong duoc de lo vi the tran
+            events.append({"stage": "spot", "event": "SPOT_LEG_EXCEPTION", "detail": str(exc)})
+            known_qty = _safe_float(spot_tracker.get("executed_qty"))
+            if known_qty > 0.0:
+                rollback = self._rollback_filled_spot(
+                    symbol=symbol,
+                    reverse_side="SELL" if spot_side == "BUY" else "BUY",
+                    qty=known_qty,
+                    timeout_sec=timeout_sec,
+                    events=events,
+                )
+                rolled_back_ok = bool(rollback.get("filled")) and _safe_float(
+                    rollback.get("executedQty")
+                ) > 0.0
+                return {
+                    "dry_run": False,
+                    "status": "ROLLED_BACK_SAFE" if rolled_back_ok else "NAKED_LEG_ALERT",
+                    "rolled_back": True,
+                    "naked_leg": not rolled_back_ok,
+                    "direction": "open" if open_leg else "close",
+                    "spot": {"venue": VENUE_SPOT, "status": "EXCEPTION",
+                             "executedQty": known_qty, "filled": False, "error": str(exc)},
+                    "perp": None,
+                    "rollback": rollback,
+                    "events": events,
+                }
+            return {
+                "dry_run": False,
+                "status": "SPOT_LEG_EXCEPTION",
+                "rolled_back": False,
+                "naked_leg": False,
+                "direction": "open" if open_leg else "close",
+                "spot": {"venue": VENUE_SPOT, "status": "EXCEPTION", "executedQty": 0.0,
+                         "filled": False, "error": str(exc)},
+                "perp": None,
+                "events": events,
+            }
+        spot_qty_filled = _safe_float(spot_result.get("executedQty"))
+
+        if not spot_result.get("filled") or spot_qty_filled <= 0.0:
+            return {
+                "dry_run": False,
+                "status": "SPOT_LEG_FAILED",
+                "rolled_back": False,
+                "naked_leg": False,
+                "direction": "open" if open_leg else "close",
+                "spot": spot_result,
+                "perp": None,
+                "events": events,
+            }
+
+        # --- Chan 2: Perp ----------------------------------------------
+        futures_usable = self.has_futures_credentials() and (perp_available is not False)
+        if not futures_usable:
+            # Che do "mot khoa": mo phong CO KY tren nhanh chua co khoa hop le,
+            # khong bao gio gui lenh that (tranh kich hoat rollback vo ich).
+            perp_result = self._simulate_signed_perp_leg(
+                symbol=symbol,
+                qty=float(perp_qty),
+                side=perp_side,
+                reduce_only=not open_leg,
+                reason=(
+                    "FUTURES_KEY_UNUSABLE" if self.has_futures_credentials()
+                    else "NO_FUTURES_CREDENTIALS"
+                ),
+            )
+            events.append(
+                {"stage": "perp", "event": "SIMULATED_SIGNED_ONLY",
+                 "reason": perp_result.get("reason")}
+            )
+            perp_ok = False
+        else:
+            try:
+                perp_result = self._execute_perp_leg(
+                    symbol=symbol,
+                    qty=float(perp_qty),
+                    side=perp_side,
+                    price=perp_price,
+                    post_only=perp_post_only,
+                    reduce_only=not open_leg,
+                    maker_ttl_sec=maker_ttl_sec,
+                    poll_interval_sec=poll_interval_sec,
+                    timeout_sec=timeout_sec,
+                    events=events,
+                )
+                perp_ok = bool(perp_result.get("filled")) and _safe_float(
+                    perp_result.get("executedQty")
+                ) > 0.0
+            except Exception as exc:  # noqa: BLE001 - rollback bat buoc
+                perp_result = {
+                    "venue": VENUE_FUTURES,
+                    "status": "PERP_LEG_EXCEPTION",
+                    "executedQty": 0.0,
+                    "filled": False,
+                    "error": str(exc),
+                }
+                events.append({"stage": "perp", "event": "EXCEPTION", "detail": str(exc)})
+                perp_ok = False
+
+        if perp_ok or (perp_result.get("simulated") and not require_futures):
+            return {
+                "dry_run": False,
+                "status": "FILLED",
+                "rolled_back": False,
+                "naked_leg": False,
+                "perp_simulated": bool(perp_result.get("simulated")),
+                "direction": "open" if open_leg else "close",
+                "spot": spot_result,
+                "perp": perp_result,
+                "events": events,
+            }
+
+        # --- ATOMIC LEG ROLLBACK ---------------------------------------
+        reverse_side = "SELL" if spot_side == "BUY" else "BUY"
+        rollback = self._rollback_filled_spot(
+            symbol=symbol,
+            reverse_side=reverse_side,
+            qty=spot_qty_filled,
+            timeout_sec=timeout_sec,
+            events=events,
+        )
+
+        rolled_back_ok = bool(rollback.get("filled")) and _safe_float(
+            rollback.get("executedQty")
+        ) > 0.0
+        return {
+            "dry_run": False,
+            "status": "ROLLED_BACK_SAFE" if rolled_back_ok else "NAKED_LEG_ALERT",
+            "rolled_back": True,
+            "naked_leg": not rolled_back_ok,
+            "direction": "open" if open_leg else "close",
+            "spot": spot_result,
+            "perp": perp_result,
+            "rollback": rollback,
+            "events": events,
+        }
+
+    def _rollback_filled_spot(
+        self,
+        symbol: str,
+        reverse_side: str,
+        qty: float,
+        timeout_sec: float,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Gui lenh MARKET nguoc chieu de dong ngay khoi luong Spot da khop."""
+        rollback: dict[str, Any] = {
+            "venue": VENUE_SPOT,
+            "side": reverse_side,
+            "qty": qty,
+            "orderId": None,
+            "status": "ROLLBACK_FAILED",
+            "filled": False,
+            "executedQty": 0.0,
+        }
+        try:
+            rb_req = self.build_order_request(
+                venue=VENUE_SPOT,
+                symbol=symbol,
+                side=reverse_side,
+                quantity=qty,
+                order_type="MARKET",
+            )
+            rb_res = self.submit_signed_order(
+                VENUE_SPOT, rb_req, timeout_sec=timeout_sec, already_signed=True
+            )
+            rollback.update(rb_res)
+            rollback["side"] = reverse_side
+            rollback["qty"] = qty
+            rollback["filled"] = bool(rb_res.get("filled"))
+            events.append(
+                {
+                    "stage": "rollback",
+                    "event": "REVERSE_MARKET_SUBMITTED",
+                    "orderId": rb_res.get("orderId"),
+                    "filled": bool(rb_res.get("filled")),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - bao dong naked leg
+            rollback["error"] = str(exc)
+            events.append({"stage": "rollback", "event": "ROLLBACK_EXCEPTION", "detail": str(exc)})
+        return rollback
+
+    # -- leg-level helpers ------------------------------------------------
+    def _simulate_signed_perp_leg(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        reduce_only: bool,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Mo phong CO KY cho chan Perp khi khoa Futures chua hop le (khong gui)."""
+        result: dict[str, Any] = {
+            "venue": VENUE_FUTURES,
+            "status": "SIMULATED_SIGNED_ONLY",
+            "orderId": None,
+            "executedQty": 0.0,
+            "filled": False,
+            "simulated": True,
+            "reason": reason,
+            "error": FUTURES_KEY_INVALID_HINT,
+        }
+        try:
+            req = self.build_order_request(
+                VENUE_FUTURES, symbol, side, qty, "MARKET", reduce_only=reduce_only
+            )
+            sig = str(req["params"].get("signature", ""))
+            result["signed"] = bool(sig)
+            result["signature_prefix"] = sig[:8]
+            result["params"] = req["params"]
+            result["url"] = req["url"]
+        except Exception as exc:  # noqa: BLE001 - chan doan, khong raise
+            result["signed"] = False
+            result["signing_error"] = str(exc)
+        return result
+
+    def _execute_spot_leg(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        price: float | None,
+        post_only: bool,
+        use_limit_maker: bool,
+        maker_ttl_sec: float,
+        poll_interval_sec: float,
+        timeout_sec: float,
+        events: list[dict[str, Any]],
+        tracker: dict[str, float] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        def _track(result: Mapping[str, Any]) -> Mapping[str, Any]:
+            """Ghi lai khoi luong da khop LON NHAT duoc biet (de rollback khi loi)."""
+            if tracker is not None:
+                tracker["executed_qty"] = max(
+                    _safe_float(tracker.get("executed_qty")),
+                    _safe_float(result.get("executedQty")),
+                )
+            return result
+
+        want_maker = bool(post_only and use_limit_maker and price and price > 0.0)
+        if not want_maker:
+            req = self.build_order_request(
+                VENUE_SPOT, symbol, side, qty, "MARKET", price_check=price
+            )
+            res = _track(self.submit_signed_order(VENUE_SPOT, req, timeout_sec=timeout_sec))
+            events.append({"stage": "spot", "event": "MARKET_SUBMITTED", "orderId": res.get("orderId")})
+            return self._await_fill(VENUE_SPOT, symbol, res, maker_ttl_sec, poll_interval_sec, events), events
+
+        # 1. Thu Post-Only LIMIT_MAKER (Khong kem timeInForce tren Spot!)
+        try:
+            req = self.build_order_request(
+                VENUE_SPOT, symbol, side, qty, "LIMIT_MAKER", price=price, price_check=price
+            )
+            res = _track(self.submit_signed_order(VENUE_SPOT, req, timeout_sec=timeout_sec))
+            events.append({"stage": "spot", "event": "LIMIT_MAKER_SUBMITTED", "orderId": res.get("orderId")})
+        except BinanceHttpError as exc:
+            events.append(
+                {
+                    "stage": "spot",
+                    "event": "LIMIT_MAKER_REJECTED",
+                    "code": exc.code,
+                    "fallback": "MARKET",
+                }
+            )
+            req = self.build_order_request(
+                VENUE_SPOT, symbol, side, qty, "MARKET", price_check=price
+            )
+            res = _track(self.submit_signed_order(VENUE_SPOT, req, timeout_sec=timeout_sec))
+            res["fallback_from"] = "LIMIT_MAKER"
+            events.append({"stage": "spot", "event": "MARKET_FALLBACK", "orderId": res.get("orderId")})
+            return self._await_fill(VENUE_SPOT, symbol, res, maker_ttl_sec, poll_interval_sec, events), events
+
+        if _is_filled(res):
+            return res, events
+
+        filled = _track(
+            self._await_fill(VENUE_SPOT, symbol, res, maker_ttl_sec, poll_interval_sec, events)
+        )
+        if filled.get("filled"):
+            return filled, events
+
+        # 2. Khong khop sau TTL -> huy va ban MARKET phan CON LAI (tranh double fill)
+        order_id = res.get("orderId")
+        if order_id is not None:
+            cancel_res = self.cancel_order(VENUE_SPOT, symbol, order_id, timeout_sec=timeout_sec)
+            events.append(
+                {"stage": "spot", "event": "LIMIT_MAKER_CANCELED", "orderId": order_id,
+                 "canceled": bool(cancel_res.get("canceled"))}
+            )
+        # Sau khi huy, doc lai khoi luong DA KHOP de chi mua phan con thieu.
+        already_filled = _safe_float(filled.get("executedQty"))
+        if order_id is not None:
+            try:
+                final_state = self.query_order(VENUE_SPOT, symbol, order_id, timeout_sec=timeout_sec)
+                already_filled = max(already_filled, _safe_float(final_state.get("executedQty")))
+            except Exception as exc:  # noqa: BLE001 - giu already_filled da biet
+                events.append({"stage": "spot", "event": "POST_CANCEL_QUERY_ERROR", "detail": str(exc)})
+        remaining_qty = round(float(qty) - already_filled, 12)
+        if remaining_qty <= 0.0:
+            events.append(
+                {"stage": "spot", "event": "MAKER_FILLED_AFTER_CANCEL",
+                 "executedQty": already_filled}
+            )
+            filled["filled"] = _safe_float(filled.get("executedQty")) > 0.0
+            return filled, events
+        req = self.build_order_request(
+            VENUE_SPOT, symbol, side, remaining_qty, "MARKET", price_check=price
+        )
+        mkt_raw = self.submit_signed_order(VENUE_SPOT, req, timeout_sec=timeout_sec)
+        events.append({"stage": "spot", "event": "MARKET_FALLBACK", "orderId": mkt_raw.get("orderId"),
+                       "remaining_qty": remaining_qty, "maker_filled_qty": already_filled})
+        # Poll tren ket qua THO (chua cong don), roi moi cong don -> neu lenh MARKET
+        # can poll thi ket qua poll van duoc cong dung khoi luong maker da khop.
+        final = dict(self._await_fill(
+            VENUE_SPOT, symbol, mkt_raw, maker_ttl_sec, poll_interval_sec, events
+        ))
+        final["fallback_from"] = "LIMIT_MAKER_TTL_EXPIRED"
+        final["maker_filled_qty"] = already_filled
+        final["requested_qty"] = float(remaining_qty)
+        final["market_executed_qty"] = _safe_float(final.get("executedQty"))
+        # Cong don khoi luong da khop o lenh maker + lenh market (khong bao gio > qty goc).
+        total_filled = min(
+            float(qty), already_filled + _safe_float(final.get("market_executed_qty"))
+        )
+        final["executedQty"] = total_filled
+        final["filled"] = total_filled > 0.0 and (
+            _is_filled(final) or _safe_float(final.get("market_executed_qty")) > 0.0
+        )
+        _track(final)
+        return final, events
+
+    def _execute_perp_leg(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        price: float | None,
+        post_only: bool,
+        reduce_only: bool,
+        maker_ttl_sec: float,
+        poll_interval_sec: float,
+        timeout_sec: float,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if post_only and price and price > 0.0:
+            req = self.build_order_request(
+                VENUE_FUTURES, symbol, side, qty, "LIMIT",
+                price=price, time_in_force="GTX", reduce_only=reduce_only,
+            )
+        else:
+            req = self.build_order_request(
+                VENUE_FUTURES, symbol, side, qty, "MARKET", reduce_only=reduce_only
+            )
+        res = self.submit_signed_order(VENUE_FUTURES, req, timeout_sec=timeout_sec)
+        events.append(
+            {"stage": "perp", "event": f"{res.get('type') or 'PERP'}_SUBMITTED",
+             "orderId": res.get("orderId")}
+        )
+        return self._await_fill(
+            VENUE_FUTURES, symbol, res, maker_ttl_sec, poll_interval_sec, events
+        )
+
+    def _await_fill(
+        self,
+        venue: str,
+        symbol: str,
+        res: dict[str, Any],
+        max_wait_sec: float,
+        poll_interval_sec: float,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Poll trang thai lenh toi khi FILLED hoac het TTL (best-effort)."""
+        if _is_filled(res) or res.get("dry_run"):
+            return res
+        order_id = res.get("orderId")
+        if order_id is None:
+            return res
+        deadline = time.time() + max(0.0, float(max_wait_sec))
+        interval = max(0.0, float(poll_interval_sec))
+        last = res
+        while time.time() < deadline:
+            if interval:
+                time.sleep(interval)
+            try:
+                last = self.query_order(venue, symbol, order_id)
+            except Exception as exc:  # noqa: BLE001 - khong lam hong luong chinh
+                events.append({"stage": venue, "event": "POLL_ERROR", "detail": str(exc)})
+                return res
+            if _is_filled(last):
+                events.append(
+                    {"stage": venue, "event": "FILLED", "orderId": order_id,
+                     "executedQty": last.get("executedQty")}
+                )
+                return last
+        return last
+
     def fetch_exchange_reconcile_snapshot(
         self,
         symbols: list[str],
@@ -296,18 +1405,30 @@ class BinanceSignedTestnetClient:
                 risk_req = self.build_signed_get_request(PERP_POSITION_RISK_PATH, futures=True)
 
                 def _do_get(req_dict: dict[str, Any]) -> Any:
-                    url = req_dict["url"]
-                    params = req_dict.get("params", {})
-                    qs = build_query_string(params)
-                    full_url = f"{url}?{qs}" if qs else url
-                    headers = req_dict.get("headers", {})
-                    req = urllib.request.Request(full_url, headers=headers, method="GET")
-                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                        return json.loads(resp.read().decode("utf-8"))
+                    return self._http_request(
+                        "GET",
+                        req_dict["url"],
+                        req_dict.get("params", {}),
+                        req_dict.get("headers", {}),
+                        timeout_sec=timeout_sec,
+                    )
 
                 spot_account = _do_get(spot_req)
-                futures_account = _do_get(futures_req)
-                position_risk = _do_get(risk_req)
+                try:
+                    futures_account = _do_get(futures_req)
+                    position_risk = _do_get(risk_req)
+                except BinanceHttpError as exc:
+                    if exc.code in FUTURES_INVALID_ERROR_CODES:
+                        return {
+                            "snapshot_healthy": False,
+                            "error": FUTURES_KEY_INVALID_HINT,
+                            "futures_key_status": FUTURES_KEY_INVALID_CODE,
+                            "api_error_code": exc.code,
+                            "spot_balances": {},
+                            "perp_positions": {},
+                            "exchange_equity_usd": 0.0,
+                        }
+                    raise
             except Exception as exc:
                 return {
                     "snapshot_healthy": False,
@@ -470,7 +1591,93 @@ class BinanceSignedTestnetClient:
             }
 
 
+def _parse_binance_error(raw: str) -> tuple[int | None, str]:
+    """Trich (code, msg) tu body loi JSON cua Binance (neu co)."""
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and obj.get("code") is not None:
+            return int(obj.get("code")), str(obj.get("msg", ""))
+    except Exception:
+        pass
+    return None, raw.strip()[:200]
+
+
+def normalize_order_result(venue: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Chuan hoa response dat lenh Binance (Spot v3 / FAPI v1) ve 1 schema."""
+    data = dict(raw or {})
+    executed = _safe_float(data.get("executedQty"))
+    quote_qty = _safe_float(data.get("cummulativeQuoteQty", data.get("cumQuote")))
+    avg_price = _safe_float(data.get("avgPrice"))
+    if avg_price <= 0.0 and executed > 0.0 and quote_qty > 0.0:
+        avg_price = quote_qty / executed
+    fills = data.get("fills") or []
+    if avg_price <= 0.0 and isinstance(fills, list):
+        notional = 0.0
+        qty_sum = 0.0
+        for f in fills:
+            if not isinstance(f, dict):
+                continue
+            qf = _safe_float(f.get("qty"))
+            pf = _safe_float(f.get("price"))
+            notional += qf * pf
+            qty_sum += qf
+        if qty_sum > 0.0 and notional > 0.0:
+            avg_price = notional / qty_sum
+            if quote_qty <= 0.0:
+                quote_qty = notional
+    return {
+        "venue": venue,
+        "orderId": data.get("orderId"),
+        "clientOrderId": data.get("clientOrderId"),
+        "symbol": data.get("symbol"),
+        "side": data.get("side"),
+        "type": data.get("type"),
+        "status": str(data.get("status", "UNKNOWN")).upper(),
+        "executedQty": executed,
+        "cummulativeQuoteQty": quote_qty,
+        "avgPrice": avg_price,
+        "transactTime": data.get("transactTime", data.get("updateTime")),
+        "raw": data,
+    }
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _binance_symbol(symbol: str) -> str:
     """'BTC/USDT:USDT' -> 'BTCUSDT'."""
     base = symbol.split(":")[0].strip()
     return base.replace("/", "").replace("-", "").upper()
+
+def _is_filled(result: Mapping[str, Any] | None) -> bool:
+    """True CHI khi lenh da khop 100% (status == FILLED).
+
+    PARTIALLY_FILLED KHONG duoc coi la xong: con khoi luong chua khop thi phai
+    tiep tuc cho / huy / mua bu, neu khong delta-neutral se bi lech.
+    """
+    if not isinstance(result, Mapping):
+        return False
+    return str(result.get("status", "")).upper() == "FILLED"
+
+
+def quantize_price(price: float, tick_size: float, side: str = "BUY") -> float:
+    """Lam tron gia theo tick_size cua san (BUY -> xuong, SELL -> len).
+
+    Dung de tranh loi -1013 PRICE_FILTER khi dat Post-Only tren Spot Testnet.
+    Tinh bang Decimal de khong bi sai so IEEE-754 (vd 82872.54000000001) va
+    hoat dong ca voi tick_size khong phai luy thua 10 (vd 0.25).
+    """
+    if tick_size is None or tick_size <= 0.0 or price <= 0.0:
+        return float(price)
+    from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+
+    d_tick = Decimal(str(tick_size))
+    d_price = Decimal(str(price))
+    steps = d_price / d_tick
+    rounding = ROUND_FLOOR if str(side).upper() == "BUY" else ROUND_CEILING
+    return float(steps.to_integral_value(rounding=rounding) * d_tick)
+

@@ -244,29 +244,41 @@ def _run_shadow_live_preflight(args: argparse.Namespace, symbols: list[str]) -> 
 
 
 def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str]) -> bool:
-    """Sprint 16: chot an toan cho mode testnet - chi ky + dong goi lenh, fail-closed.
+    """Sprint 16/19: chot an toan cho mode testnet, fail-closed.
 
-    Khong gui lenh o bat ky truong hop nao trong pham vi sprint nay: payload duoc
-    dung de kiem tra chu ky HMAC va lot-size truoc khi noi executor.
+    dry_run=True  : chi ky + dong goi payload (khong gui lenh).
+    dry_run=False : nap `.env.testnet`, dong bo gio may chu Spot/Futures, kiem tra
+                    xac thuc tai khoan THAT cua tung venue (khong dat lenh o day -
+                    dat lenh that do `scripts/run_testnet_live_roundtrip.py` dam nhiem).
     """
     from src.binance_signed_client import (
+        DEFAULT_LIVE_RECV_WINDOW_MS,
         BinanceCredentialsMissingError,
         BinanceSignedTestnetClient,
+        load_dotenv_testnet,
     )
 
     symbol = symbols[0] if symbols else "BTC/USDT:USDT"
     dry_run = not bool(getattr(args, "testnet_send_orders", False))
     try:
-        client = BinanceSignedTestnetClient(dry_run=dry_run)
+        load_dotenv_testnet()
+    except Exception as e:  # thieu file .env.testnet la binh thuong
+        logger.info("Testnet: khong nap duoc .env.testnet (%s) - dung bien moi truong.", e)
+    try:
+        client = BinanceSignedTestnetClient(
+            dry_run=dry_run,
+            recv_window=DEFAULT_RECV_WINDOW_MS if not dry_run else 5000,
+        )
     except BinanceCredentialsMissingError as e:
         logger.error("Testnet: %s", e)
         return False
 
     logger.info(
-        "Testnet signing preflight: symbol=%s | dry_run=%s | credentials=%s",
+        "Testnet signing preflight: symbol=%s | dry_run=%s | spot_creds=%s | futures_creds=%s",
         symbol,
         client.dry_run,
-        client.has_credentials(),
+        client.has_spot_credentials(),
+        client.has_futures_credentials(),
     )
     if client.dry_run:
         try:
@@ -287,6 +299,36 @@ def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str])
             proof["perp"]["url"],
             sig[:8] if sig else "<unsigned>",
         )
+        return True
+
+    # Sprint 19: dong bo gio may chu + xac thuc tai khoan THAT (khong dat lenh).
+    sync = client.sync_server_time("both")
+    logger.info(
+        "Testnet server time sync: spot_offset=%sms | futures_offset=%sms | errors=%s",
+        sync.get("spot_offset_ms"),
+        sync.get("futures_offset_ms"),
+        sync.get("errors"),
+    )
+    ok_any = False
+    for venue in ("spot", "futures"):
+        report = client.check_account_access(venue)
+        if report.get("authenticated"):
+            ok_any = True
+            logger.info(
+                "Testnet account OK: venue=%s | assets=%s | offset=%sms",
+                venue,
+                sorted(report.get("holdings", {}).keys()),
+                report.get("server_time_offset_ms"),
+            )
+        else:
+            logger.warning(
+                "Testnet account FAIL: venue=%s | error=%s | hint=%s",
+                venue,
+                report.get("error"),
+                report.get("hint"),
+            )
+    if not ok_any:
+        logger.error("Testnet: khong venue nao xac thuc duoc - BLOCKED (fail-closed).")
     return True
 
 
@@ -383,9 +425,16 @@ def _run_signed_snapshot_preflight(
         return report
 
     try:
-        from src.binance_signed_client import BinanceSignedTestnetClient
+        from src.binance_signed_client import (
+            DEFAULT_LIVE_RECV_WINDOW_MS,
+            BinanceSignedTestnetClient,
+        )
 
-        client = BinanceSignedTestnetClient(dry_run=False)
+        # Sprint 19: recvWindow rong hon cho testnet that (bu do tre mang/offset gio).
+        client = BinanceSignedTestnetClient(
+            dry_run=False, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS
+        )
+        client.sync_server_time("both")
     except Exception as exc:  # thieu khoa -> fail-closed
         return _blocked("SNAPSHOT_CREDENTIALS_MISSING", str(exc))
 
