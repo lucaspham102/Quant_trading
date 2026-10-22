@@ -29,6 +29,7 @@ from src.binance_signed_client import (  # noqa: E402
     FUTURES_KEY_INVALID_HINT,
     load_dotenv_testnet,
     quantize_price,
+    validate_credential_format,
 )
 from src.cross_exchange_carry import EXCHANGE_LOT_SPECS  # noqa: E402
 from src.exchange_reconciler import reconcile_portfolio_state  # noqa: E402
@@ -282,6 +283,11 @@ def _append_evidence_and_log(
         f"- **Futures Auth**: `{result.get('futures_auth')}` ({result.get('futures_key_status')})\n"
         f"- **Entry Order**: `{result.get('entry_order_id')}` (Qty: {result.get('executed_qty')}, Price: {result.get('fill_price')})\n"
         f"- **Exit Order**: `{result.get('exit_order_id')}` (Qty: {result.get('exit_executed_qty')})\n"
+        f"- **Spot Entry Order ID**: `{result.get('spot_entry_order_id')}`\n"
+        f"- **Perp Entry Order ID**: `{result.get('perp_entry_order_id')}`\n"
+        f"- **Spot Exit Order ID**: `{result.get('spot_exit_order_id')}`\n"
+        f"- **Perp Exit Order ID**: `{result.get('perp_exit_order_id')}`\n"
+        f"- **Dual-Venue SYNCED**: `{result.get('dual_venue_synced')}`\n"
         f"- **Entry Reconcile Status**: `{result.get('entry_reconcile_status')}`\n"
         f"- **Exit Reconcile Status**: `{result.get('exit_reconcile_status')}`\n\n"
     )
@@ -331,6 +337,18 @@ def _build_snapshot(
         if snap.get("snapshot_healthy"):
             snap["perp_positions_verified"] = True
             snap["snapshot_scope"] = "spot_and_futures"
+            # Sprint 20: Binance Testnet cap san ~500 tai san "dust" cho moi tai khoan
+            # demo. Doi soat TOAN TAI KHOAN se luon bao ORPHAN_ON_EXCHANGE cho cac tai
+            # san khong giao dich -> vo nghia voi muc tieu "dual-venue SYNCED".
+            # Vi vay pham vi doi soat o day la SYMBOL DANG GIAO DICH (base + cash),
+            # va so tai san ngoai pham vi duoc ghi lai de kiem toan minh bach.
+            full_balances = snap.get("spot_balances") or {}
+            scoped_balances = _filter_holdings(full_balances, symbol)
+            snap["spot_balances"] = scoped_balances
+            snap["reconcile_symbol_scope"] = [symbol]
+            snap["untracked_spot_assets"] = max(
+                0, len(full_balances) - len(scoped_balances)
+            )
             return snap
     access = client.check_account_access("spot")
     holdings = access.get("holdings") or {}
@@ -374,6 +392,36 @@ def _scoped_status(raw_status: str, verified: bool) -> str:
     return f"SPOT_ONLY_{raw_status}"
 
 
+def _validate_client_credentials(
+    client: Any, venue: str
+) -> dict[str, Any]:
+    """Sprint 20: chan doan dinh dang khoa cho 1 venue, an toan voi client gia lap.
+
+    - Uu tien `client.credential_format_report()` (client that).
+    - Fallback sang thuoc tinh `<venue>_api_key` / `<venue>_api_secret`.
+    - Client stub khong co credential attribute -> tra trang thai `skipped`.
+    """
+    report_fn = getattr(client, "credential_format_report", None)
+    if callable(report_fn):
+        try:
+            full = report_fn()
+            if isinstance(full, dict) and isinstance(full.get(venue), dict):
+                return dict(full[venue])
+        except Exception:  # pragma: no cover - client la
+            pass
+    key = getattr(client, f"{venue}_api_key", None)
+    secret = getattr(client, f"{venue}_api_secret", None)
+    if key is None and secret is None:
+        return {
+            "venue": venue,
+            "ok": True,
+            "skipped": True,
+            "diagnostics": [],
+            "message": f"{venue}_CREDENTIAL_FORMAT_CHECK_SKIPPED_NO_CREDENTIAL_ATTRIBUTE",
+        }
+    return validate_credential_format(key, secret, venue)
+
+
 def run_roundtrip(
     *,
     symbol: str = "BTC/USDT:USDT",
@@ -382,8 +430,8 @@ def run_roundtrip(
     maker_ttl_sec: float = 3.0,
     client: BinanceSignedTestnetClient | None = None,
     write_files: bool = True,
-    evidence_path: str = "docs/sprint19_testnet_live_evidence.md",
-    log_path: str = "logs/sprint19_testnet_roundtrip.jsonl",
+    evidence_path: str = "docs/sprint20_dual_leg_live_evidence.md",
+    log_path: str = "logs/sprint20_testnet_roundtrip.jsonl",
 ) -> dict:
     """Thuc hien tron ven 5 buoc round-trip testnet."""
     steps: list[dict[str, Any]] = []
@@ -399,6 +447,13 @@ def run_roundtrip(
         "futures_key_status": "not_loaded",
         "entry_order_id": None,
         "exit_order_id": None,
+        # Sprint 20: 4 order id that tren 2 chan (Spot entry/exit, Perp entry/exit).
+        "spot_entry_order_id": None,
+        "perp_entry_order_id": None,
+        "spot_exit_order_id": None,
+        "perp_exit_order_id": None,
+        "dual_venue_synced": False,
+        "credential_validation": {},
         "executed_qty": 0.0,
         "exit_executed_qty": 0.0,
         "fill_price": 0.0,
@@ -424,6 +479,22 @@ def run_roundtrip(
     cred_status = client.credential_status()
     result["spot_key_status"] = str(cred_status.get("spot_key", "not_loaded"))
     result["futures_key_status"] = str(cred_status.get("futures_key", "not_loaded"))
+
+    # Sprint 20: kiem dinh DINH DANG khoa 64 ky tu TRUOC khi gui bat ky request mang nao.
+    spot_format = _validate_client_credentials(client, "spot")
+    futures_format = _validate_client_credentials(client, "futures")
+    result["credential_validation"] = {
+        "spot": spot_format,
+        "futures": futures_format,
+        "all_ok": bool(spot_format.get("ok") and futures_format.get("ok")),
+    }
+    for _venue, _report in (("spot", spot_format), ("futures", futures_format)):
+        if not _report.get("ok"):
+            # Chi in ma chan doan (do dai + ten venue), KHONG in gia tri khoa.
+            print(
+                f"CREDENTIAL_FORMAT_BLOCKED: {_report.get('message')}",
+                file=sys.stderr,
+            )
 
     time_sync = client.sync_server_time("both")
     result["server_offsets"]["spot"] = int(time_sync.get("spot_offset_ms", 0))
@@ -452,6 +523,7 @@ def run_roundtrip(
                 "server_sync": time_sync,
                 "spot_access": spot_access,
                 "futures_access": futures_access,
+                "credential_validation": result["credential_validation"],
             },
         }
     )
@@ -598,6 +670,8 @@ def run_roundtrip(
     fill_price = float(spot_entry.get("avgPrice") or mid_price)
 
     result["entry_order_id"] = entry_order_id
+    result["spot_entry_order_id"] = entry_order_id
+    result["perp_entry_order_id"] = (perp_entry or {}).get("orderId")
     result["executed_qty"] = executed_qty
     result["fill_price"] = fill_price
 
@@ -718,6 +792,8 @@ def run_roundtrip(
         exit_executed_qty = float(spot_exit.get("executedQty") or 0.0)
 
         result["exit_order_id"] = exit_order_id
+        result["spot_exit_order_id"] = exit_order_id
+        result["perp_exit_order_id"] = (exit_res.get("perp") or {}).get("orderId")
         result["exit_executed_qty"] = exit_executed_qty
 
         exit_status = exit_res.get("status")
@@ -776,8 +852,20 @@ def run_roundtrip(
     # -------------------------------------------------------------------------
     all_steps_ok = len(steps) == 5 and all(s.get("ok", False) for s in steps)
     has_orders = result["entry_order_id"] is not None and result["exit_order_id"] is not None
+    # Sprint 20: doi hoi DU 4 order id that (Spot entry/exit + Perp entry/exit).
+    dual_leg_orders = all(
+        result.get(key) is not None
+        for key in (
+            "spot_entry_order_id",
+            "perp_entry_order_id",
+            "spot_exit_order_id",
+            "perp_exit_order_id",
+        )
+    )
+    result["dual_leg_order_ids_complete"] = bool(dual_leg_orders)
     futures_verified = bool(result.get("exit_futures_positions_verified", False))
     synced = result["exit_reconcile_status"] == "SYNCED" and futures_verified
+    result["dual_venue_synced"] = bool(synced)
     spot_only_synced = result["exit_reconcile_status"] == "SPOT_ONLY_SYNCED"
     simulated_futures = (
         not futures_auth
@@ -792,8 +880,9 @@ def run_roundtrip(
             "Futures positions were NOT verified - spot-only reconciliation"
         )
 
-    if all_steps_ok and has_orders and synced and not simulated_futures:
+    if all_steps_ok and has_orders and synced and not simulated_futures and dual_leg_orders:
         result["verdict"] = "PASS"
+        result["verdict_scope"] = "dual_leg_live_verified"
     elif all_steps_ok and has_orders and (synced or spot_only_synced) and (
         simulated_futures or not futures_verified
     ):
@@ -828,12 +917,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Dry run sign only")
     parser.add_argument(
         "--evidence-doc",
-        default="docs/sprint19_testnet_live_evidence.md",
+        default="docs/sprint20_dual_leg_live_evidence.md",
         help="Path to evidence markdown document",
     )
     parser.add_argument(
         "--log-jsonl",
-        default="logs/sprint19_testnet_roundtrip.jsonl",
+        default="logs/sprint20_testnet_roundtrip.jsonl",
         help="Path to jsonl log file",
     )
     parser.add_argument(

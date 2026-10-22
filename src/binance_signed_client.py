@@ -75,11 +75,95 @@ class BinanceHttpError(RuntimeError):
         self.msg: str = msg or message
 
 
+# Sprint 20: do dai chuan cua API key/secret Binance (HMAC-SHA256, base64-like 64 ky tu).
+CREDENTIAL_EXPECTED_LENGTH: int = 64
+
+
 def _mask_secret(value: str | None) -> str:
     """Mo ta trang thai khoa an danh: KHONG BAO GIO lo gia tri that."""
     if not value:
         return "not_loaded"
     return f"loaded=True (len={len(value)}, prefix={value[:4]}***)"
+
+
+def _clean_credential(value: str | None) -> str:
+    """Sprint 20: chuan hoa khoa doc tu `.env.testnet`.
+
+    - Bo khoang trang / ky tu xuong dong thua o 2 dau (va ca ben trong chuoi).
+    - Bo dau nhay boc ngoai (`"` hoac `'`) do copy/paste tu dashboard.
+    - KHONG bao gio log gia tri khoa.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    # Giu nguyen ky tu ben trong nhung loai bo moi whitespace/newline (khoa Binance
+    # khong bao gio chua whitespace hop le).
+    text = "".join(text.split())
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    return text
+
+
+def validate_credential_format(key: str | None, secret: str | None, venue: str) -> dict[str, Any]:
+    """Sprint 20: kiem dinh dinh dang khoa Binance TRUOC khi gui mang.
+
+    Quy tac (HMAC-SHA256 Binance): key/secret sau khi chuan hoa phai dai dung
+    ``CREDENTIAL_EXPECTED_LENGTH`` (64) ky tu va chi gom chu/so (``isalnum``).
+
+    Tra ve dict CHI chua metadata an toan (do dai + ma chan doan), KHONG chua
+    gia tri khoa. Ma chan doan vi du:
+    ``spot_SECRET_INVALID_LENGTH_65_EXPECTED_64``.
+    """
+    venue_name = str(venue or VENUE_SPOT).strip().lower() or VENUE_SPOT
+    raw_key = key if key is not None else ""
+    raw_secret = secret if secret is not None else ""
+
+    clean_key = _clean_credential(raw_key)
+    clean_secret = _clean_credential(raw_secret)
+
+    errors: list[str] = []
+    key_ok = True
+    secret_ok = True
+
+    if not clean_key:
+        key_ok = False
+        errors.append(f"{venue_name}_KEY_MISSING")
+    elif len(clean_key) != CREDENTIAL_EXPECTED_LENGTH:
+        key_ok = False
+        errors.append(f"{venue_name}_KEY_INVALID_LENGTH_{len(clean_key)}_EXPECTED_64")
+    elif not clean_key.isalnum():
+        key_ok = False
+        errors.append(f"{venue_name}_KEY_INVALID_CHARSET_ALNUM_REQUIRED")
+
+    if not clean_secret:
+        secret_ok = False
+        errors.append(f"{venue_name}_SECRET_MISSING")
+    elif len(clean_secret) != CREDENTIAL_EXPECTED_LENGTH:
+        secret_ok = False
+        errors.append(
+            f"{venue_name}_SECRET_INVALID_LENGTH_{len(clean_secret)}_EXPECTED_64"
+        )
+    elif not clean_secret.isalnum():
+        secret_ok = False
+        errors.append(f"{venue_name}_SECRET_INVALID_CHARSET_ALNUM_REQUIRED")
+
+    return {
+        "venue": venue_name,
+        "expected_length": CREDENTIAL_EXPECTED_LENGTH,
+        "key_present": bool(clean_key),
+        "secret_present": bool(clean_secret),
+        "key_length": len(clean_key),
+        "secret_length": len(clean_secret),
+        "key_ok": bool(key_ok),
+        "secret_ok": bool(secret_ok),
+        "ok": bool(key_ok and secret_ok),
+        "normalized": bool(
+            clean_key != str(raw_key) or clean_secret != str(raw_secret)
+        ),
+        "diagnostics": errors,
+        # Sprint 20: chuoi chan doan de in ra log/bao cao (an toan, khong co khoa).
+        "message": " | ".join(errors) if errors else f"{venue_name}_CREDENTIAL_FORMAT_OK",
+    }
 
 
 def load_dotenv_testnet(
@@ -321,12 +405,18 @@ class BinanceSignedTestnetClient:
         env_specific: str,
         env_legacy: str,
     ) -> str:
-        """Uu tien: tham so rieng > tham so chung > env rieng > env legacy."""
+        """Uu tien: tham so rieng > tham so chung > env rieng > env legacy.
+
+        Sprint 20: moi gia tri duoc chuan hoa (`_clean_credential`) de loai bo
+        khoang trang/xuong dong/dau nhay thua tu `.env.testnet`.
+        """
         if explicit is not None:
-            return str(explicit)
+            return _clean_credential(explicit)
         if generic is not None:
-            return str(generic)
-        return str(os.environ.get(env_specific) or os.environ.get(env_legacy) or "")
+            return _clean_credential(generic)
+        return _clean_credential(
+            os.environ.get(env_specific) or os.environ.get(env_legacy) or ""
+        )
 
     # -- credentials -----------------------------------------------------
     def has_spot_credentials(self) -> bool:
@@ -349,6 +439,24 @@ class BinanceSignedTestnetClient:
             "futures_credentials": self.has_futures_credentials(),
             "spot_time_offset_ms": self.spot_time_offset_ms,
             "futures_time_offset_ms": self.futures_time_offset_ms,
+        }
+
+    def credential_format_report(self) -> dict[str, Any]:
+        """Sprint 20: chan doan dinh dang 64 ky tu cho ca 2 venue (an toan de log).
+
+        Chay TRUOC moi request mang: neu khoa sai do dai (vd 65 ky tu), tra ngay
+        ma ``<venue>_SECRET_INVALID_LENGTH_<len>_EXPECTED_64`` thay vi de san tra
+        ve -2015/-1022 kho hieu.
+        """
+        spot = validate_credential_format(self.spot_api_key, self.spot_api_secret, VENUE_SPOT)
+        futures = validate_credential_format(
+            self.futures_api_key, self.futures_api_secret, VENUE_FUTURES
+        )
+        return {
+            "spot": spot,
+            "futures": futures,
+            "all_ok": bool(spot.get("ok") and futures.get("ok")),
+            "dual_venue_ok": bool(spot.get("ok") and futures.get("ok")),
         }
 
     def require_credentials(self) -> None:
