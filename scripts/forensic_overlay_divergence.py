@@ -32,6 +32,7 @@ from src.sprint11_eval import (  # noqa: E402
     SPRINT11_HOLDOUT_END,
     SPRINT11_INITIAL_CAPITAL,
     SPRINT11_SPLIT_DATE,
+    CANONICAL_SATURATED_WARMUP_HOURS,
     SPRINT14_WARMUP_HOURS,
     compute_holdout_accounting_bridge,
     compute_sleeve_attribution,
@@ -48,7 +49,7 @@ PAYLOAD_FIXED = _ROOT / "data" / "bridge_fixed" / "sprint11_payload.json"
 
 HOLDOUT_START = pd.Timestamp(SPRINT11_SPLIT_DATE, tz="UTC")
 HOLDOUT_END = pd.Timestamp(SPRINT11_HOLDOUT_END, tz="UTC") + pd.Timedelta(days=1)
-CONVERGED_WARMUP_HOURS = 720
+CONVERGED_WARMUP_HOURS = CANONICAL_SATURATED_WARMUP_HOURS
 
 
 def _fmt(value: float, digits: int = 2) -> str:
@@ -179,10 +180,24 @@ def main() -> int:
         reinvest_profits=False,
         include_raw=True,
     )
-    res_d = run_indicator_warm_cash_start(phase_aligned=False, **base_kwargs)
-    res_dp = run_indicator_warm_cash_start(phase_aligned=True, **base_kwargs)
+    # Sprint 20: D/D' la phep do LICH SU 504h -> truyen tuong minh.
+    res_d = run_indicator_warm_cash_start(
+        phase_aligned=False,
+        warmup_hours=SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=False,
+        **base_kwargs,
+    )
+    res_dp = run_indicator_warm_cash_start(
+        phase_aligned=True,
+        warmup_hours=SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=True,
+        **base_kwargs,
+    )
     res_e = run_indicator_warm_cash_start(
-        phase_aligned=True, warmup_hours=CONVERGED_WARMUP_HOURS, **base_kwargs
+        phase_aligned=True,
+        warmup_hours=CONVERGED_WARMUP_HOURS,
+        align_rebalance_clock=True,
+        **base_kwargs,
     )
     dp = _from_result(res_dp["raw_result"])
     e = _from_result(res_e["raw_result"])

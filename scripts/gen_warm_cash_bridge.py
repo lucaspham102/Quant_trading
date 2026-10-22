@@ -27,6 +27,7 @@ from src.cross_exchange_carry import LIQUID_8_SYMBOLS  # noqa: E402
 from src.sprint11_eval import (  # noqa: E402
     SPRINT11_HOLDOUT_END,
     SPRINT11_INITIAL_CAPITAL,
+    LEGACY_SPRINT14_WARMUP_HOURS,
     SPRINT11_SPLIT_DATE,
     compute_holdout_accounting_bridge,
     run_indicator_warm_cash_start,
@@ -63,12 +64,15 @@ def main() -> int:
         print("Khong nap duoc du lieu. Ket thuc.")
         return 1
 
+    # Sprint 20: D la phep do LICH SU (504h, pha cat lat) -> truyen tuong minh.
     warm_cash = run_indicator_warm_cash_start(
         data=data,
         capital=SPRINT11_INITIAL_CAPITAL,
         split_date=SPRINT11_SPLIT_DATE,
         holdout_end=SPRINT11_HOLDOUT_END,
         reinvest_profits=False,
+        warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=False,
     )
     print(
         f"      D: net={warm_cash['net_pnl_usd']:.2f} USD "

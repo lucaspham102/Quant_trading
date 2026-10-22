@@ -164,7 +164,14 @@ def _slice_data_range(
 # ---------------------------------------------------------------------------
 # 4b. run_indicator_warm_cash_start (Method D, Sprint 14)
 # ---------------------------------------------------------------------------
-SPRINT14_WARMUP_HOURS = 504
+# Sprint 20: nang chuan bao hoa warmup len 720h (~30 ngay) va neo dong ho tai can
+# bang 48h theo moc UTC tuyet doi. Day la "canonical" dung cho moi lan chay moi.
+CANONICAL_SATURATED_WARMUP_HOURS: int = 720
+# Gia tri lich su Sprint 14 (504h, pha cat lat) chi con dung de DOI CHIEU bang
+# so sanh A/B/C/D/D'/E - phai truyen TUONG MINH, khong con la mac dinh.
+LEGACY_SPRINT14_WARMUP_HOURS: int = 504
+# Alias tuong thich nguoc (cac script/test cu import ten nay).
+SPRINT14_WARMUP_HOURS = LEGACY_SPRINT14_WARMUP_HOURS
 
 
 def compute_sleeve_attribution(
@@ -435,8 +442,9 @@ def run_indicator_warm_cash_start(
     reinvest_profits: bool = False,
     carry_variant: str = "tier1b",
     gating_mode: str = "smooth_conviction",
-    warmup_hours: int = SPRINT14_WARMUP_HOURS,
-    phase_aligned: bool = False,
+    warmup_hours: int = CANONICAL_SATURATED_WARMUP_HOURS,
+    align_rebalance_clock: bool = True,
+    phase_aligned: bool | None = None,
     include_raw: bool = False,
 ) -> dict[str, Any]:
     """Method D: chỉ báo đã ấm (nhìn được lịch sử trước holdout) nhưng tồn kho bằng tiền mặt.
@@ -447,9 +455,19 @@ def run_indicator_warm_cash_start(
     TRƯỚC ``split_date`` (để chỉ báo có đủ lịch sử) nhưng khoá mọi giao dịch trước
     ``split_date`` (``trade_start_idx``), nên equity giữ nguyên ``capital`` cho tới mốc đó
     và mọi vị thế mở sau mốc đều trả đủ phí + làm tròn lô.
+
+    Sprint 20 (canonical defaults): ``warmup_hours=720`` (bão hoà chỉ báo) và
+    ``align_rebalance_clock=True`` (neo pha đồng hồ 48h theo UTC tuyệt đối).
+    Các phép đo LỊCH SỬ (D = 504h cắt lát, D' = 504h aligned) phải truyền tường minh
+    ``warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS``. ``phase_aligned`` (Sprint 15) được
+    giữ làm alias ghi đè để tương thích ngược; nếu ``None`` thì dùng
+    ``align_rebalance_clock``.
     """
     from src.barbell_portfolio import BarbellConfig, run_barbell_portfolio
 
+    aligned = bool(
+        align_rebalance_clock if phase_aligned is None else bool(phase_aligned)
+    )
     holdout_start = pd.Timestamp(split_date, tz="UTC")
     ext_start = holdout_start - pd.Timedelta(hours=int(warmup_hours))
     ext_data = _slice_data_range(data, ext_start.isoformat(), holdout_end)
@@ -473,9 +491,9 @@ def run_indicator_warm_cash_start(
     )
     # Sprint 15: đồng hồ tái cân bằng overlay là mốc tuyệt đối 48h neo từ nến đầu chuỗi.
     # Method D cắt chuỗi tại split + warmup nên lệch pha so với backtest đầy đủ (B/C);
-    # phase_aligned=True neo lại offset theo vị trí tuyệt đối của split_date.
+    # align_rebalance_clock=True neo lại offset theo vị trí tuyệt đối của split_date.
     phase_offset = 0
-    if phase_aligned:
+    if aligned:
         idx_full = None
         for df in data.values():
             if isinstance(df, pd.DataFrame) and not df.empty and isinstance(df.index, pd.DatetimeIndex):
@@ -513,7 +531,8 @@ def run_indicator_warm_cash_start(
         "reinvest_profits": bool(reinvest_profits),
         "capital": float(capital),
         "warmup_hours": int(warmup_hours),
-        "phase_aligned": bool(phase_aligned),
+        "phase_aligned": bool(aligned),
+        "align_rebalance_clock": bool(aligned),
         "rebalance_phase_offset": int(phase_offset),
         "trade_start_idx": int(trade_start_idx),
         "trade_start_bars_available": int(len(idx_ref)) if idx_ref is not None else 0,
@@ -1234,6 +1253,12 @@ def compute_holdout_accounting_bridge(
 
     Dang thuc bao toan (sai so < 1e-6):
     ``A.net_pnl = C.net_pnl + compounding_scale_effect + cold_start_total_drag``.
+
+    Sprint 20: ``warm_cash`` (D) va ``warm_cash_aligned`` (D') la cac phep do LICH SU
+    (504h) va phai duoc tao bang cach truyen TUONG MINH
+    ``warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS`` (kem ``align_rebalance_clock``
+    False/True). ``warm_cash_converged`` (E) la chuan moi:
+    ``CANONICAL_SATURATED_WARMUP_HOURS`` (720h) + clock aligned.
     """
     row_a = _find_primary_row(payload_compound if isinstance(payload_compound, dict) else {})
     if row_a is None:

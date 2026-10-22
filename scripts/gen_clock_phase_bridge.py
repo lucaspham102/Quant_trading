@@ -27,6 +27,7 @@ from src.cross_exchange_carry import LIQUID_8_SYMBOLS  # noqa: E402
 from src.sprint11_eval import (  # noqa: E402
     SPRINT11_HOLDOUT_END,
     SPRINT11_INITIAL_CAPITAL,
+    LEGACY_SPRINT14_WARMUP_HOURS,
     SPRINT11_SPLIT_DATE,
     compute_holdout_accounting_bridge,
     run_indicator_warm_cash_start,
@@ -70,14 +71,23 @@ def main() -> int:
         reinvest_profits=False,
     )
     print("[2/3] Mo phong Method D (unaligned clock)...")
-    warm_cash = run_indicator_warm_cash_start(**kwargs)
+    # Sprint 20: D la phep do LICH SU (504h, pha cat lat) -> truyen tuong minh.
+    warm_cash = run_indicator_warm_cash_start(
+        warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=False,
+        **kwargs,
+    )
     print(
         f"      D  : net={warm_cash['net_pnl_usd']:.2f} USD "
         f"offset=0 trade_start_idx={warm_cash['trade_start_idx']}"
     )
 
     print("[2/3] Mo phong Method D (clock-aligned)...")
-    warm_cash_aligned = run_indicator_warm_cash_start(phase_aligned=True, **kwargs)
+    warm_cash_aligned = run_indicator_warm_cash_start(
+        warmup_hours=LEGACY_SPRINT14_WARMUP_HOURS,
+        align_rebalance_clock=True,
+        **kwargs,
+    )
     print(
         f"      D' : net={warm_cash_aligned['net_pnl_usd']:.2f} USD "
         f"offset={warm_cash_aligned['rebalance_phase_offset']}"
