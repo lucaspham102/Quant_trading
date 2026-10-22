@@ -1,7 +1,10 @@
 data/
 .env
+.env.*
+*.env
 __pycache__/
 .pytest_cache/
 .agy/
+*.pyc
 
 logs/
