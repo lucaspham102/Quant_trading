@@ -3,6 +3,40 @@
 | Timestamp (UTC) | Symbol | Verdict | Entry Order ID | Exit Order ID | Exec Qty | Fill Price | Entry Rec | Exit Rec | Spot Offset (ms) | Perp Offset (ms) |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 2026-10-22T08:05:51.220611+00:00 | BTC/USDT:USDT | PASS | 5746860 | 5746861 | 0.001 | 82244.46 | SYNCED | SYNCED | 1099 | 971 |
+| 2026-10-22T16:09:06.662192+00:00 | BTC/USDT:USDT | PASS | 5876038 | 5876042 | 0.001 | 81698.15 | SYNCED | SYNCED | 2004 | 1875 |
+| 2026-10-22T16:23:25.799031+00:00 | BTC/USDT:USDT | PASS | 5879923 | 5879924 | 0.001 | 81649.99 | SYNCED | SYNCED | 1882 | 1824 |
+
+### Run Detail (2026-10-22T16:23:25.799031+00:00)
+- **Symbol**: `BTC/USDT:USDT`
+- **Verdict**: `PASS`
+- **Spot Auth**: `True` (loaded=True (len=64, prefix=q0Gm***))
+- **Futures Auth**: `True` (loaded=True (len=64, prefix=v6ew***))
+- **Entry Order**: `5879923` (Qty: 0.001, Price: 81649.99)
+- **Exit Order**: `5879924` (Qty: 0.001)
+- **Spot Entry Order ID**: `5879923`
+- **Perp Entry Order ID**: `28646231502`
+- **Spot Exit Order ID**: `5879924`
+- **Perp Exit Order ID**: `28646231517`
+- **Dual-Venue SYNCED**: `True`
+- **Entry Reconcile Status**: `SYNCED`
+- **Exit Reconcile Status**: `SYNCED`
+
+
+### Run Detail (2026-10-22T16:09:06.662192+00:00)
+- **Symbol**: `BTC/USDT:USDT`
+- **Verdict**: `PASS`
+- **Spot Auth**: `True` (loaded=True (len=64, prefix=q0Gm***))
+- **Futures Auth**: `True` (loaded=True (len=64, prefix=v6ew***))
+- **Entry Order**: `5876038` (Qty: 0.001, Price: 81698.15)
+- **Exit Order**: `5876042` (Qty: 0.001)
+- **Spot Entry Order ID**: `5876038`
+- **Perp Entry Order ID**: `28646216652`
+- **Spot Exit Order ID**: `5876042`
+- **Perp Exit Order ID**: `28646216675`
+- **Dual-Venue SYNCED**: `True`
+- **Entry Reconcile Status**: `SYNCED`
+- **Exit Reconcile Status**: `SYNCED`
+
 
 ### Run Detail (2026-10-22T08:05:51.220611+00:00)
 - **Symbol**: `BTC/USDT:USDT`

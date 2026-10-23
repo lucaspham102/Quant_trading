@@ -392,26 +392,80 @@ def enforce_overlay_dollar_neutrality(
     return {s: q for s, q in qty.items()}
 
 
+_EPOCH_UTC = pd.Timestamp("1970-01-01")
+
+
+def _utc_epoch_hours(timestamps: Any) -> np.ndarray:
+    """Sprint 21: doi timestamps sang so gio tuyet doi tinh tu goc UTC epoch 1970.
+
+    Timestamp naive duoc coi la UTC (khong bao gio dung gio dia phuong). Gia tri
+    tra ve la float de ho tro nen 1h (moi nen = 1.0 gio) va cac khung <= 1h van
+    dung duoc cong thuc bucket floor.
+    """
+    if isinstance(timestamps, pd.DatetimeIndex):
+        ts_index = timestamps
+    else:
+        ts_index = pd.DatetimeIndex(pd.to_datetime(timestamps))
+    if ts_index.tz is not None:
+        ts_index = ts_index.tz_convert("UTC").tz_localize(None)
+    return ((ts_index - _EPOCH_UTC) / pd.Timedelta(hours=1)).to_numpy(dtype=float)
+
+
 def build_rebalance_mask(
     n_bars: int,
     rebalance_hours: int,
     phase_offset: int = 0,
     weights_changed: Optional[pd.Series] = None,
     index: Optional[pd.Index] = None,
+    timestamps: Any = None,
+    use_utc_epoch_schedule: bool = False,
 ) -> pd.Series:
     """Sprint 15: mask tai can bang overlay, neo theo moc tuyet doi + phase offset.
 
     ``phase_offset`` cho phep neo lai dong ho 48h khi chuoi du lieu bi cat ngan
     (Method D bat dau tu ``split_date - warmup``), nho do moc tai can bang trung
     voi backtest chay tren chuoi day du.
+
+    Sprint 21: khi ``use_utc_epoch_schedule=True`` va co ``timestamps``, mask duoc
+    suy ra bang co che **UTC Epoch Boundary-Crossing**: moi nen duoc gan vao bucket
+    ``bucket_i = floor((ts_utc_hours - phase_offset) / rebalance_hours)`` va mask
+    bat tai nen dau tien cua chuoi cung moi lan bucket tang. Nho vay lich tai can
+    bang bat bien tuyet doi theo gio UTC va khong bao gio bo lo ky rebalance ke ca
+    khi du lieu khuyet dung cay nen tai moc giao gio (nen ke tiep se kich hoat).
+    Mac dinh ``use_utc_epoch_schedule=False`` de giu tuong thich nguoc 100%.
     """
     hours = max(1, int(rebalance_hours))
-    local = np.arange(int(n_bars))
-    base = ((local + int(phase_offset)) % hours == 0)
-    mask = pd.Series(base, index=index if index is not None else pd.RangeIndex(int(n_bars)))
+    total = int(n_bars)
+    mask_index = index if index is not None else pd.RangeIndex(total)
+    base = np.zeros(max(total, 0), dtype=bool)
+    if total > 0:
+        ts_values: Optional[np.ndarray] = None
+        if use_utc_epoch_schedule and timestamps is not None:
+            try:
+                ts_values = _utc_epoch_hours(timestamps)
+            except (TypeError, ValueError):
+                ts_values = None
+        if ts_values is not None and len(ts_values) > 0:
+            usable = min(total, len(ts_values))
+            buckets = np.floor((ts_values[:usable] - float(phase_offset)) / float(hours))
+            crossing = np.zeros(usable, dtype=bool)
+            if usable > 0:
+                crossing[0] = True
+                if usable > 1:
+                    crossing[1:] = buckets[1:] > buckets[:-1]
+            base[:usable] = crossing
+            # Neu chuoi timestamp ngan hon n_bars, phan duoi khong the neo epoch
+            # -> lui ve lich modulo local de khong bo trong ky tai can bang.
+            if usable < total:
+                local = np.arange(usable, total)
+                base[usable:] = ((local + int(phase_offset)) % hours == 0)
+        else:
+            local = np.arange(total)
+            base = ((local + int(phase_offset)) % hours == 0)
+    mask = pd.Series(base, index=mask_index)
     if weights_changed is not None:
         mask = mask | weights_changed.reindex(mask.index).fillna(False).astype(bool)
-    if n_bars > 0:
+    if total > 0:
         mask.iloc[0] = True
     return mask.astype(bool)
 
