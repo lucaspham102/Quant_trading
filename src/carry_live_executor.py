@@ -1214,6 +1214,11 @@ class CarryLiveExecutor:
         overlay_allocations: list[dict[str, Any]] = []
         overlay_active = False
         raw_snr_dispersion = 0.0
+        self.last_overlay_delta = {
+            "long_usd": 0.0,
+            "short_usd": 0.0,
+            "net_delta_usd": 0.0,
+        }
 
         if self.overlay_config is not None and self.tier1b_gate:
             # Sprint 15: overlay parity - dung dung cong thuc smooth_conviction Sprint 11.
@@ -1260,13 +1265,6 @@ class CarryLiveExecutor:
                 max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
                 min_viable_leg_usd=_min_leg_usd,
             )
-            self.last_overlay_neutrality = {
-                "target_notional_by_symbol": dict(target_notional_signed),
-                "neutral_qty": dict(neutral_qty),
-                "min_viable_leg_usd": float(_min_leg_usd),
-                "adaptive": _min_leg_override is None,
-            }
-
             overlay_long_usd = 0.0
             overlay_short_usd = 0.0
             for sym, q in neutral_qty.items():
@@ -1289,6 +1287,14 @@ class CarryLiveExecutor:
                     if equity_now > 0.0
                     else 0.0,
                 })
+            self.last_overlay_neutrality = {
+                "target_notional_by_symbol": dict(target_notional_signed),
+                "neutral_qty": dict(neutral_qty),
+                "long_usd": float(overlay_long_usd),
+                "short_usd": float(overlay_short_usd),
+                "min_viable_leg_usd": float(_min_leg_usd),
+                "adaptive": _min_leg_override is None,
+            }
             self.last_overlay_delta = {
                 "long_usd": float(overlay_long_usd),
                 "short_usd": float(overlay_short_usd),
@@ -3217,8 +3223,13 @@ class CarryLiveExecutor:
                         else:
                             ov_long += _q * _px
                     if self.testnet_dry_state and ov_long == 0.0 and ov_short == 0.0:
-                        ov_long = float((getattr(self, "last_overlay_neutrality", {}) or {}).get("long_usd", 0.0))
-                        ov_short = float((getattr(self, "last_overlay_neutrality", {}) or {}).get("short_usd", 0.0))
+                        delta_rec = getattr(self, "last_overlay_delta", {}) or {}
+                        ov_long = float(delta_rec.get("long_usd", 0.0))
+                        ov_short = float(delta_rec.get("short_usd", 0.0))
+                        if ov_long == 0.0 and ov_short == 0.0:
+                            neut_rec = getattr(self, "last_overlay_neutrality", {}) or {}
+                            ov_long = float(neut_rec.get("long_usd", 0.0))
+                            ov_short = float(neut_rec.get("short_usd", 0.0))
                     logger.info(
                         "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s | Reconcile=%s",
                         iterations,

@@ -115,6 +115,10 @@ def test_multi_cycle_burnin_passes_offline_with_mock_transport(tmp_path: Path) -
 
     cycle1, cycle2, cycle3 = result["cycles"]
     assert cycle1["detail"]["all_8_symbols_synced"] is True
+    # Sprint 22 Phase 10: pure_cash_and_margin_usd strictly stablecoins + margin
+    assert cycle1["detail"]["pure_cash_and_margin_usd"] == pytest.approx(10000.0)
+    assert cycle1["detail"]["reconcile_equity_usd"] == pytest.approx(10000.0)
+    assert cycle1["detail"]["pure_cash_and_margin_usd"] < 100000.0
     assert cycle3["detail"]["equity_gap_usd"] == pytest.approx(0.0)
     assert cycle3["detail"]["zero_residual"] is True
 
@@ -200,3 +204,53 @@ def test_scrub_secrets_ignores_too_short_values() -> None:
     short = "abc123"
     text = f"value={short}"
     assert _scrub_secrets(text, [short]) == text
+
+
+def test_cycle1_pure_cash_and_margin_ignores_faucet_coin_mtm() -> None:
+    """Sprint 22 Phase 10: pure_cash_and_margin_usd khong bi phong dai 486M USD boi Faucet coin."""
+    from scripts.run_testnet_multi_cycle_burnin import _cycle1_bootstrap
+
+    class FakeClient:
+        def sync_server_time(self, venue="both"):
+            return {"spot": 100, "futures": 100}
+
+        def fetch_book_ticker(self, symbol, venue):
+            return {"symbol": symbol, "bid": "80000.0", "ask": "80000.0", "mid": 80000.0}
+
+        def fetch_exchange_reconcile_snapshot(self, symbols, prices, universe_symbols=None):
+            return {
+                "snapshot_healthy": True,
+                "spot_balances_raw": {
+                    "USDT": 9999.98,
+                    "FDUSD": 10000.0,
+                    "TUSD": 10000.0,
+                    "USDC": 10000.0,
+                    "USD": 10000.0,
+                    "DOGE": 5501.0,
+                    "XRP": 341.0,
+                    "BTC": 1.0,
+                },
+                "spot_balances": {"BTC": 1.0, "DOGE": 5501.0, "XRP": 341.0},
+                "spot_cash_usd": 486000000.0,  # Faucet coin evaluation at mid_price
+                "pure_cash_usd": 49999.98,
+                "perp_wallet_balance_usd": 4999.14,
+                "perp_unrealized_pnl_usd": 0.0,
+                "exchange_equity_usd": 486004999.14,
+                "perp_positions": {},
+                "perp_positions_detail": [],
+                "untracked_spot_assets": {},
+            }
+
+    fake = FakeClient()
+    fake.spot_api_key = "a" * 64
+    fake.spot_api_secret = "a" * 64
+    fake.futures_api_key = "a" * 64
+    fake.futures_api_secret = "a" * 64
+
+    res = _cycle1_bootstrap(fake, symbol="BTC/USDT:USDT", universe=list(UNIVERSE_SYMBOLS), warmup_hours=720.0)
+    detail = res["detail"]
+    assert detail["bootstrap_equity_usd"] == pytest.approx(486004999.14)
+    # pure_cash_and_margin_usd must strictly be 49999.98 + 4999.14 = 54999.12 USD
+    assert detail["pure_cash_and_margin_usd"] == pytest.approx(54999.12)
+    assert detail["reconcile_equity_usd"] == pytest.approx(54999.12)
+    assert detail["pure_cash_and_margin_usd"] < 100000.0

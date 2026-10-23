@@ -871,6 +871,12 @@ def test_gate1_then_gate2_no_phantom_in_state(
 
     # Mock overlay rebalance targets (simulating OverlayGate PASS: BTC +0.006, AVAX -53.3)
     def mock_build_barbell_allocations(self, aligned_universe, scores_at_t):
+        self.last_overlay_delta = {"long_usd": 360.0, "short_usd": 360.0, "net_delta_usd": 0.0}
+        self.last_overlay_neutrality = {
+            "neutral_qty": {"BTC/USDT:USDT": 0.006, "AVAX/USDT:USDT": -53.3},
+            "long_usd": 360.0,
+            "short_usd": 360.0,
+        }
         return {
             "momentum_overlay": {
                 "overlay_active": True,
@@ -929,6 +935,10 @@ def test_gate1_then_gate2_no_phantom_in_state(
         cycle_records = [r for r in gate1_records if "cycle" in r]
         assert len(cycle_records) >= 1
         assert cycle_records[0]["mode"] == "testnet"
+        # Sprint 22 Phase 10: overlay telemetry fallback in testnet_dry_state
+        assert cycle_records[0]["overlay_long_usd"] == pytest.approx(360.0)
+        assert cycle_records[0]["overlay_short_usd"] == pytest.approx(360.0)
+        assert cycle_records[0]["overlay_net_delta_usd"] == pytest.approx(0.0)
 
         # --- 2. GATE 2 RUN (chay tren cung state_file va baseline_file) ---
         rc2 = run_live.main([
