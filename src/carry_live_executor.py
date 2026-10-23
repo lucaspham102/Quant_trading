@@ -1703,6 +1703,7 @@ class CarryLiveExecutor:
     def fetch_latest_aligned_universe(self) -> dict[str, pd.DataFrame]:
         """Tải và đồng bộ dữ liệu cho toàn bộ rổ tài sản từ sàn hoặc cache Parquet."""
         universe: dict[str, pd.DataFrame] = {}
+        data_sources: dict[str, str] = {}
         has_exchanges = self.perp_exchange is not None and self.spot_exchange is not None
 
         for sym in self.symbols:
@@ -1710,6 +1711,7 @@ class CarryLiveExecutor:
                 try:
                     aligned = self._fetch_symbol_from_exchange(sym)
                     universe[sym] = aligned
+                    data_sources[sym] = "exchange"
                     continue
                 except Exception as e:
                     logger.warning(
@@ -1721,6 +1723,7 @@ class CarryLiveExecutor:
             try:
                 aligned = self._load_symbol_from_cache(sym)
                 universe[sym] = aligned
+                data_sources[sym] = "parquet"
             except FileNotFoundError:
                 if not has_exchanges:
                     raise FileNotFoundError(
@@ -1731,6 +1734,9 @@ class CarryLiveExecutor:
                         f"Failed live fetch and missing cache file for {sym} in {self.raw_data_dir}."
                     )
 
+        if data_sources:
+            summary_sources = ", ".join(f"{s}:{src}" for s, src in sorted(data_sources.items()))
+            logger.info("Aligned universe data sources: %s", summary_sources)
         return universe
 
     def audit_delta_drift(
