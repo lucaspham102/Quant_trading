@@ -6,8 +6,14 @@ Thiet ke hoan toan deterministic, khong side effects, khong mang/network I/O.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
+
+logger = logging.getLogger(__name__)
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -33,6 +39,28 @@ RECONCILE_STATUSES: tuple[str, ...] = (
     EQUITY_MISMATCH,
     MARGIN_DANGER,
     BLOCKED,
+)
+
+CASH_ASSETS: frozenset[str] = frozenset(
+    {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "USD"}
+)
+
+
+def _is_cash_asset_local(asset: str) -> bool:
+    """Sprint 22: True neu asset nam trong CASH_ASSETS (khop chinh xac, khong dung endswith)."""
+    a = str(asset or "").strip().upper()
+    return a in CASH_ASSETS
+
+
+DEFAULT_TESTNET_BASELINE_PATH = Path("data/state/testnet_baseline.json")
+DEFAULT_DUST_NOTIONAL_USD = 1.0
+REQUIRED_BASELINE_KEYS: tuple[str, ...] = (
+    "credentials_sha256",
+    "initial_recon_equity",
+    "spot_balances",
+    "perp_positions",
+    "prices",
+    "created_at",
 )
 
 # Fallback khi khong import duoc src.cross_exchange_carry (tranh circular import).
@@ -127,6 +155,27 @@ def _lookup_price(prices: Any, sym: str, base: str) -> float:
     return 0.0
 
 
+def _lookup_price_testnet_delta(prices: Any, sym: str, base: str) -> float:
+    """Sprint 22: Tra gia mo rong chi dung cho testnet delta snapshot.
+
+    Ho tro ca base/USDT:USDT va baseUSDT de tra gia ca coin universe lan coin faucet.
+    """
+    if not isinstance(prices, dict):
+        return 0.0
+    concat = sym.replace(":USDT", "").replace("/", "")
+    for k in (sym, concat, f"{base}/USDT:USDT", f"{base}/USDT", f"{base}USDT", base):
+        if k in prices:
+            p = _to_float(prices[k])
+            if p > 0.0:
+                return p
+    for pk, pv in prices.items():
+        if normalize_symbol(str(pk)) in (sym, normalize_symbol(sym), f"{base}/USDT:USDT"):
+            p = _to_float(pv)
+            if p > 0.0:
+                return p
+    return 0.0
+
+
 def _lookup_lot_spec(lot_specs: Any, sym: str, base: str) -> tuple[float, float]:
     if not isinstance(lot_specs, dict):
         return 0.0, 0.0
@@ -154,6 +203,9 @@ def _classify_leg(
     if not loc_nz and not ex_nz:
         return SYNCED, None, 0.0, ""
     if not loc_nz and ex_nz:
+        if side == "spot" and ex_qty < 0:
+            diff = abs(ex_qty)
+            return QTY_DRIFT, "RESYNC_QTY", diff, f"Spot balance dropped below baseline by {diff}"
         is_orphan = (abs(ex_qty) * price >= min_notional) if (price > 0.0 and min_notional > 0.0) else True
         if is_orphan:
             act = "CLOSE_ORPHAN_SPOT" if side == "spot" else "CLOSE_ORPHAN_PERP"
@@ -381,9 +433,13 @@ def analyze_equity_and_margin_health(
         perp_wallet_balance_usd = _to_float(_get_field(exchange_snapshot, "perp_wallet_balance_usd", 0.0))
         perp_unrealized_pnl_usd = _to_float(_get_field(exchange_snapshot, "perp_unrealized_pnl_usd", 0.0))
 
-        exchange_equity_usd = _to_float(_get_field(exchange_snapshot, "exchange_equity_usd", 0.0))
-        if exchange_equity_usd == 0.0 and (spot_cash_usd != 0.0 or perp_wallet_balance_usd != 0.0 or perp_unrealized_pnl_usd != 0.0):
-            exchange_equity_usd = spot_cash_usd + perp_wallet_balance_usd + perp_unrealized_pnl_usd
+        raw_recon_eq = _get_field(exchange_snapshot, "reconcile_equity_usd", None)
+        if raw_recon_eq is not None:
+            exchange_equity_usd = _to_float(raw_recon_eq)
+        else:
+            exchange_equity_usd = _to_float(_get_field(exchange_snapshot, "exchange_equity_usd", 0.0))
+            if exchange_equity_usd == 0.0 and (spot_cash_usd != 0.0 or perp_wallet_balance_usd != 0.0 or perp_unrealized_pnl_usd != 0.0):
+                exchange_equity_usd = spot_cash_usd + perp_wallet_balance_usd + perp_unrealized_pnl_usd
 
         local_expected_equity_usd = _to_float(_get_field(local_state, "current_equity", 0.0))
 
@@ -659,8 +715,13 @@ def reconcile_portfolio_state(
     drifting = [it["symbol"] for it in items if it["status"] == QTY_DRIFT]
 
     loc_eq = _to_float(_get_field(local_state, "current_equity", 0.0))
-    ex_eq = _to_float(_get_field(exchange_snapshot, "exchange_equity_usd", 0.0))
-    eq_gap_usd = ex_eq - loc_eq
+    real_ex_eq = _to_float(_get_field(exchange_snapshot, "exchange_equity_usd", 0.0))
+    raw_recon_eq = _get_field(exchange_snapshot, "reconcile_equity_usd", None)
+    if raw_recon_eq is not None:
+        recon_eq = _to_float(raw_recon_eq)
+    else:
+        recon_eq = real_ex_eq
+    eq_gap_usd = recon_eq - loc_eq
     eq_gap_pct = (abs(eq_gap_usd) / loc_eq * 100.0) if loc_eq > 0.0 else (0.0 if eq_gap_usd == 0.0 else 100.0)
 
     # Phan tich suc khoe ky quy va attribution
@@ -727,6 +788,8 @@ def reconcile_portfolio_state(
         "drifting": drifting,
         "equity_gap_usd": eq_gap_usd,
         "equity_gap_pct": eq_gap_pct,
+        "reconcile_equity_usd": recon_eq,
+        "exchange_equity_usd": real_ex_eq,
         "tolerance_usd": float(tolerance_usd),
         "equity_tolerance_pct": float(equity_tolerance_pct),
         "summary": summary,
@@ -747,3 +810,217 @@ def reconcile_portfolio_state(
         "warnings": warnings,
         "blocked": status == BLOCKED,
     }
+
+
+
+def load_or_create_testnet_baseline(
+    snapshot: dict[str, Any],
+    prices: dict[str, Any],
+    api_key_hash: str,
+    universe_symbols: Sequence[str] | None = None,
+    path: Path | str = DEFAULT_TESTNET_BASELINE_PATH,
+    reset_baseline: bool = False,
+) -> dict[str, Any]:
+    """Sprint 22: Quan ly file baseline testnet ben vung, atomic, fail-closed."""
+    p = Path(path)
+    clean_key_hash = str(api_key_hash or "").strip()
+    if not clean_key_hash:
+        raise RuntimeError("BASELINE_KEY_HASH_EMPTY: api_key_hash khong duoc de trong. Abort fail-closed.")
+
+    if not reset_baseline and p.is_file():
+        try:
+            raw_text = p.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except Exception as exc:
+            raise RuntimeError(f"BASELINE_CORRUPTED: File {p} bi hong ({exc}). Abort fail-closed.") from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError(f"BASELINE_CORRUPTED: File {p} khong phai JSON object hop le. Abort fail-closed.")
+
+        for req_k in REQUIRED_BASELINE_KEYS:
+            if req_k not in data:
+                raise RuntimeError(
+                    f"BASELINE_SCHEMA_INVALID: File {p} thieu truong bat buoc '{req_k}'. Abort fail-closed."
+                )
+
+        saved_hash = str(data.get("credentials_sha256") or "").strip()
+        if not saved_hash:
+            raise RuntimeError(
+                f"BASELINE_SCHEMA_INVALID: File {p} co credentials_sha256 bi rong. Abort fail-closed."
+            )
+
+        if saved_hash != clean_key_hash:
+            raise RuntimeError(
+                f"BASELINE_KEY_MISMATCH: API key hien tai khong khop baseline cu. "
+                f"Dung co --reset-testnet-baseline de tao lai baseline."
+            )
+        return data
+
+    # Khi tao baseline moi: bat buoc moi vi the perp trong universe phai phang (abs(qty) < 1e-6)
+    symbols_to_check = list(universe_symbols or default_universe_symbols())
+    perp_pos = dict(_get_field(snapshot, "perp_positions", {}) or {})
+    for sym in symbols_to_check:
+        canon = normalize_symbol(str(sym))
+        qty = float(_to_float(perp_pos.get(canon, 0.0)))
+        if abs(qty) >= 1e-6:
+            raise RuntimeError(
+                f"BASELINE_PERP_NOT_FLAT: Khong the tao baseline khi vi the perp {canon} con mo ({qty}). "
+                f"Dong vi the truoc khi tao baseline."
+            )
+
+    # Kiem tra ca perp_positions_detail neu co
+    perp_details = _get_field(snapshot, "perp_positions_detail", []) or []
+    if isinstance(perp_details, list):
+        for item in perp_details:
+            if isinstance(item, dict):
+                canon = normalize_symbol(str(item.get("symbol", "")))
+                if canon in [normalize_symbol(str(s)) for s in symbols_to_check]:
+                    qty = float(_to_float(item.get("qty", item.get("positionAmt", 0.0))))
+                    if abs(qty) >= 1e-6:
+                        raise RuntimeError(
+                            f"BASELINE_PERP_NOT_FLAT: Khong the tao baseline khi vi the perp {canon} con mo ({qty}). "
+                            f"Dong vi the truoc khi tao baseline."
+                        )
+
+    spot_bal = dict(_get_field(snapshot, "spot_balances", {}) or {})
+    pure_cash = float(sum(_to_float(v) for a, v in spot_bal.items() if _is_cash_asset_local(a)))
+    if pure_cash == 0.0 and _get_field(snapshot, "spot_cash_usd", 0.0):
+        pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
+    fut_wallet = float(_to_float(_get_field(snapshot, "perp_wallet_balance_usd", 0.0)))
+    fut_upnl = float(_to_float(_get_field(snapshot, "perp_unrealized_pnl_usd", 0.0)))
+    recon_equity_0 = pure_cash + fut_wallet + fut_upnl
+
+    baseline_data = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "credentials_sha256": str(api_key_hash),
+        "initial_recon_equity": float(recon_equity_0),
+        "spot_balances": {str(k).upper(): float(_to_float(v)) for k, v in spot_bal.items()},
+        "perp_positions": {normalize_symbol(str(k)): float(_to_float(v)) for k, v in perp_pos.items()},
+        "prices": {normalize_symbol(str(k)): float(_to_float(v)) for k, v in (prices or {}).items()},
+    }
+
+    # Ghi atomic qua file tam cung thu muc
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = p.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(baseline_data, indent=2), encoding="utf-8")
+    os.replace(tmp_path, p)
+
+    logger.warning(
+        "\n"
+        "====================================================================\n"
+        "[TESTNET BASELINE INITIALIZED]\n"
+        "Timestamp        : %s\n"
+        "Spot Assets Count: %d\n"
+        "Perp Positions   : ALL FLAT (0.0)\n"
+        "Initial Equity   : %.2f USD\n"
+        "Baseline File    : %s\n"
+        "====================================================================",
+        baseline_data["created_at"],
+        len(baseline_data["spot_balances"]),
+        baseline_data["initial_recon_equity"],
+        str(p),
+    )
+    baseline_data["_is_created"] = True
+    return baseline_data
+
+
+def compute_testnet_delta_snapshot(
+    snapshot: dict[str, Any],
+    baseline: dict[str, Any],
+    prices: dict[str, Any],
+    capital: float,
+    local_equity: float,
+    dust_notional_usd: float = DEFAULT_DUST_NOTIONAL_USD,
+) -> dict[str, Any]:
+    """Sprint 22: Tinh toan delta snapshot co dau va loai bo hoan toan bien dong gia coin faucet."""
+    out = dict(snapshot)
+    base_spot = dict(baseline.get("spot_balances") or {})
+    curr_spot = dict(_get_field(snapshot, "spot_balances", {}) or {})
+    base_perp = dict(baseline.get("perp_positions") or {})
+    curr_perp = dict(_get_field(snapshot, "perp_positions", {}) or {})
+
+    # 1. Delta Spot co dau (khong dung max(0, ...))
+    delta_spot: dict[str, float] = {}
+    delta_spot_market_value = 0.0
+    all_spot_keys = set(curr_spot.keys()) | set(base_spot.keys())
+
+    for asset in all_spot_keys:
+        qt = float(_to_float(curr_spot.get(asset, 0.0)))
+        q0 = float(_to_float(base_spot.get(asset, 0.0)))
+        dq = qt - q0
+
+        if _is_cash_asset_local(asset):
+            delta_spot[asset] = dq
+        else:
+            px = _lookup_price_testnet_delta(prices, asset, asset)
+            notional = abs(dq) * px if px > 0.0 else 0.0
+            if px > 0.0:
+                is_dust = (abs(dq) < 1e-6) or (notional < dust_notional_usd)
+            else:
+                is_dust = abs(dq) < 1e-6
+
+            if is_dust:
+                delta_spot[asset] = 0.0
+            else:
+                delta_spot[asset] = dq
+                if px > 0.0:
+                    delta_spot_market_value += dq * px
+
+    out["spot_balances"] = delta_spot
+
+    # 2. Delta Perp co dau
+    delta_perp: dict[str, float] = {}
+    all_perp_keys = set(curr_perp.keys()) | set(base_perp.keys())
+    for sym in all_perp_keys:
+        pt = float(_to_float(curr_perp.get(sym, 0.0)))
+        p0 = float(_to_float(base_perp.get(sym, 0.0)))
+        delta_perp[sym] = pt - p0
+    out["perp_positions"] = delta_perp
+
+    # Dong bo perp_positions_detail
+    perp_details = out.get("perp_positions_detail")
+    if isinstance(perp_details, list):
+        updated_details = []
+        for item in perp_details:
+            if isinstance(item, dict):
+                c_item = dict(item)
+                sym_canon = normalize_symbol(str(c_item.get("symbol", "")))
+                if sym_canon in delta_perp:
+                    new_q = delta_perp[sym_canon]
+                    c_item["qty"] = new_q
+                    c_item["positionAmt"] = new_q
+                    if abs(new_q) < 1e-6:
+                        c_item["maint_margin_usd"] = 0.0
+                updated_details.append(c_item)
+        out["perp_positions_detail"] = updated_details
+    elif isinstance(perp_details, dict):
+        updated_details_dict = {}
+        for k, item in perp_details.items():
+            if isinstance(item, dict):
+                c_item = dict(item)
+                sym_canon = normalize_symbol(str(k))
+                if sym_canon in delta_perp:
+                    new_q = delta_perp[sym_canon]
+                    c_item["qty"] = new_q
+                    c_item["positionAmt"] = new_q
+                    if abs(new_q) < 1e-6:
+                        c_item["maint_margin_usd"] = 0.0
+                updated_details_dict[k] = c_item
+            else:
+                updated_details_dict[k] = item
+        out["perp_positions_detail"] = updated_details_dict
+
+    # 3. Tinh reconcile_equity_usd loai bo MTM coin faucet ban dau
+    pure_cash = float(sum(_to_float(v) for a, v in curr_spot.items() if _is_cash_asset_local(a)))
+    if pure_cash == 0.0 and _get_field(snapshot, "spot_cash_usd", 0.0):
+        pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
+    fut_wallet = float(_to_float(_get_field(snapshot, "perp_wallet_balance_usd", 0.0)))
+    fut_upnl = float(_to_float(_get_field(snapshot, "perp_unrealized_pnl_usd", 0.0)))
+    actual_recon_equity = pure_cash + fut_wallet + fut_upnl + delta_spot_market_value
+
+    init_recon_equity = float(baseline.get("initial_recon_equity", 0.0))
+    expected_recon_equity = init_recon_equity + (float(local_equity) - float(capital))
+    net_drift = actual_recon_equity - expected_recon_equity
+
+    out["reconcile_equity_usd"] = float(local_equity) + net_drift
+    return out
