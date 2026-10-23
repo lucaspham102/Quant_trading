@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 
 logs/
+*.tmp
+data/state/testnet_baseline.json

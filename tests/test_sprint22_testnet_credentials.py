@@ -114,3 +114,26 @@ def test_testnet_mode_missing_credentials_emits_warning(
 
     warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("thieu API key" in w for w in warnings)
+
+
+def test_preflight_aborts_when_testnet_credentials_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preflight mode testnet bat buoc ca 2 key phai khac rong truoc khi bam; rong thi abort."""
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", "spot_only_key")
+    monkeypatch.delenv("BINANCE_FUTURES_TESTNET_API_KEY", raising=False)
+    monkeypatch.setattr("src.binance_signed_client.load_dotenv_testnet", lambda *a, **kw: {})
+
+    class _MockClient:
+        def sync_server_time(self, *a, **kw):
+            return {}
+        def fetch_exchange_reconcile_snapshot(self, *a, **kw):
+            return {"snapshot_healthy": True, "spot_balances": {}, "perp_positions": {}}
+
+    monkeypatch.setattr("src.binance_signed_client.BinanceSignedTestnetClient", lambda *a, **kw: _MockClient())
+
+    args = run_live.parse_args(["--mode", "testnet"])
+    executor = MagicMock()
+    executor.symbols = ["BTC/USDT:USDT"]
+    executor.state = MagicMock()
+
+    with pytest.raises(RuntimeError, match="CRITICAL_CREDENTIAL_ABORT"):
+        run_live._run_signed_snapshot_preflight(args, executor)
