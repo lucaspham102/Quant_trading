@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from run_backtest import generate_synthetic_ohlcv
 from src.config import TradingConfig
@@ -132,7 +132,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         choices=("directional", "dynamic_carry", "barbell"),
-        default="directional",
+        default="barbell",
         help="Chiến lược vận hành: directional (mặc định), dynamic_carry, hoặc barbell (Sprint 9)",
     )
     parser.add_argument(
@@ -196,6 +196,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Đường dẫn JSON fixture cho shadow-live (không gọi mạng, dùng để test/CI)",
     )
     return parser.parse_args(argv)
+
+
+def check_testnet_dual_credentials(environ: Mapping[str, str] | None = None) -> bool:
+    """Sprint 22: Kiem tra ca spot lan futures testnet deu co du cap API key va secret.
+
+    Yeu cau bat buoc ca 2 venue; thieu 1 trong 2 tra ve False (khong chap nhan chi mot ben).
+    """
+    env = os.environ if environ is None else environ
+    has_spot = bool(
+        env.get("BINANCE_SPOT_TESTNET_API_KEY")
+        and env.get("BINANCE_SPOT_TESTNET_API_SECRET")
+    )
+    has_futures = bool(
+        env.get("BINANCE_FUTURES_TESTNET_API_KEY")
+        and env.get("BINANCE_FUTURES_TESTNET_API_SECRET")
+    )
+    return bool(has_spot and has_futures)
 
 
 def _load_shadow_fixture(fixture_path: Any) -> Any:
@@ -267,7 +284,7 @@ def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str])
     try:
         client = BinanceSignedTestnetClient(
             dry_run=dry_run,
-            recv_window=DEFAULT_RECV_WINDOW_MS if not dry_run else 5000,
+            recv_window=DEFAULT_LIVE_RECV_WINDOW_MS if not dry_run else 5000,
         )
     except BinanceCredentialsMissingError as e:
         logger.error("Testnet: %s", e)
@@ -698,7 +715,14 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Live mode: thieu BINANCE_API_KEY hoac BINANCE_API_SECRET trong env.")
             return 2
     elif args.mode == "testnet":
-        if not has_api_keys:
+        from src.binance_signed_client import load_dotenv_testnet
+
+        try:
+            load_dotenv_testnet()
+        except Exception as exc:
+            logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
+
+        if not check_testnet_dual_credentials():
             logger.warning("Testnet: thieu API key, chay Public Live Feed Paper Mode")
             exec_mode = "paper"
         else:
