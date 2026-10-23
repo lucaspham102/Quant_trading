@@ -784,7 +784,11 @@ def main(argv: list[str] | None = None) -> int:
         "--evidence-doc", default=DEFAULT_EVIDENCE_PATH, help="Duong dan file evidence markdown"
     )
     parser.add_argument(
-        "--log-jsonl", default=DEFAULT_LOG_PATH, help="Duong dan file log JSONL"
+        "--log-jsonl",
+        "--audit-log",
+        dest="log_jsonl",
+        default=DEFAULT_LOG_PATH,
+        help="Duong dan file log JSONL",
     )
     parser.add_argument("--no-write", action="store_true", help="Khong ghi evidence/log")
     parser.add_argument("--json", action="store_true", help="In 1 dong JSON tom tat")
