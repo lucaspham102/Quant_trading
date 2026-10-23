@@ -836,3 +836,182 @@ def test_skip_testnet_baseline_emits_prominent_warning_and_blocks_faucet(
     assert report["status"] == "EQUITY_MISMATCH"
     assert report["trading_allowed"] is False
     assert "[WARNING] TESTNET BASELINE-DELTA IS SKIPPED" in caplog.text
+
+
+
+def test_gate1_then_gate2_no_phantom_in_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Sprint 22 Phase 9 Hotfix: Gate 1 (Overlay pass) roi Gate 2 (testnet-send-orders) khong bi PHANTOM_IN_STATE."""
+    import pandas as pd
+    from unittest.mock import MagicMock
+    from src.carry_live_executor import CarryLiveExecutor
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    key64 = "a" * 64
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", key64)
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_SECRET", key64)
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_KEY", key64)
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_SECRET", key64)
+
+    state_file = tmp_path / "bot_state.json"
+    baseline_file = tmp_path / "testnet_baseline.json"
+    gate1_audit = tmp_path / "gate1_audit.jsonl"
+    gate2_audit = tmp_path / "gate2_audit.jsonl"
+
+    faucet_snap = _make_faucet_snapshot()
+
+    # Mock unauthenticated CCXT exchanges for testnet market data
+    class MockCCXT:
+        def __init__(self, *a, **kw):
+            self.apiKey = None
+            self.secret = None
+            self.urls = {"api": {"public": "https://testnet.binance.vision/api/v3"}}
+
+    # Mock overlay rebalance targets (simulating OverlayGate PASS: BTC +0.006, AVAX -53.3)
+    def mock_build_barbell_allocations(self, aligned_universe, scores_at_t):
+        return {
+            "momentum_overlay": {
+                "overlay_active": True,
+                "allocations": [
+                    {"symbol": "BTC/USDT:USDT", "side": "buy", "qty": 0.006, "weight": 0.12},
+                    {"symbol": "AVAX/USDT:USDT", "side": "sell", "qty": 53.3, "weight": -0.12},
+                ],
+            }
+        }
+
+    # Mock order pair execution
+    order_pair_executed: list[dict[str, Any]] = []
+    def mock_execute_live_testnet_order_pair(*a, **kw):
+        record = {
+            "status": "FILLED",
+            "spot": {"orderId": 6145739},
+            "perp": {"orderId": 28647724834},
+        }
+        order_pair_executed.append(dict(kw))
+        return record
+
+    with patch("ccxt.binance", side_effect=MockCCXT), \
+         patch("ccxt.binanceusdm", side_effect=MockCCXT), \
+         patch("ccxt.bybit", side_effect=MockCCXT), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.sync_server_time"), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.fetch_exchange_reconcile_snapshot", return_value=faucet_snap), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.fetch_book_ticker", return_value={"bid": 60000.0, "ask": 60000.0, "mid": 60000.0}), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.execute_live_testnet_order_pair", side_effect=mock_execute_live_testnet_order_pair), \
+         patch.object(run_live, "_run_testnet_signing_preflight", return_value=True), \
+         patch.object(CarryLiveExecutor, "build_barbell_allocations", mock_build_barbell_allocations), \
+         patch.object(CarryLiveExecutor, "fetch_latest_aligned_universe", return_value={s: pd.DataFrame({"close": [60000.0]}, index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC")) for s in UNIVERSE_SYMBOLS}):
+
+        # --- 1. GATE 1 RUN ---
+        rc1 = run_live.main([
+            "--mode", "testnet",
+            "--capital", "3000",
+            "--cycles", "1",
+            "--reset-testnet-baseline",
+            "--state-file", str(state_file),
+            "--testnet-baseline-file", str(baseline_file),
+            "--audit-log", str(gate1_audit),
+            "--live-snapshot",
+        ])
+        assert rc1 == 0
+
+        # Kiem tra file state sau Gate 1: overlay_positions phai rong (khong bi o nhiem boi paper fill)
+        assert state_file.exists()
+        saved_state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert saved_state.get("overlay_positions") == {}
+        assert saved_state.get("carry_positions") == {}
+        assert baseline_file.exists()
+
+        # Kiem tra audit log Gate 1: mode phai la 'testnet' (khong bi ghi de thanh 'paper')
+        assert gate1_audit.exists()
+        gate1_records = [json.loads(line) for line in gate1_audit.read_text(encoding="utf-8").strip().splitlines()]
+        cycle_records = [r for r in gate1_records if "cycle" in r]
+        assert len(cycle_records) >= 1
+        assert cycle_records[0]["mode"] == "testnet"
+
+        # --- 2. GATE 2 RUN (chay tren cung state_file va baseline_file) ---
+        rc2 = run_live.main([
+            "--mode", "testnet",
+            "--capital", "3000",
+            "--cycles", "1",
+            "--testnet-send-orders",
+            "--state-file", str(state_file),
+            "--testnet-baseline-file", str(baseline_file),
+            "--audit-log", str(gate2_audit),
+            "--live-snapshot",
+        ])
+        assert rc2 == 0
+
+        # Kiem tra audit log Gate 2:
+        # Reconcile dat SYNCED (tuyet doi khong bi PHANTOM_IN_STATE), lenh testnet duoc gui thanh cong (SENT)
+        assert gate2_audit.exists()
+        gate2_records = [json.loads(line) for line in gate2_audit.read_text(encoding="utf-8").strip().splitlines()]
+        order_records = [r for r in gate2_records if str(r.get("event", "")).lower() == "testnet_order_pair"]
+        assert len(order_records) == 1
+        assert order_records[0]["status"] == "SENT"
+        assert order_records[0]["testnet_order_ids"]["spot_entry_order_id"] == 6145739
+        assert order_records[0]["testnet_order_ids"]["perp_entry_order_id"] == 28647724834
+
+
+
+def test_testnet_multi_cycles_preflight_hook_keeps_synced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Sprint 22 Phase 9: Multi-cycle --cycles 2 tren testnet kich hoat cycle_preflight_hook va ca 2 cycle deu dat SYNCED."""
+    import pandas as pd
+    from unittest.mock import MagicMock
+    from src.carry_live_executor import CarryLiveExecutor
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    key64 = "b" * 64
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", key64)
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_SECRET", key64)
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_KEY", key64)
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_SECRET", key64)
+
+    state_file = tmp_path / "bot_state_2c.json"
+    baseline_file = tmp_path / "testnet_baseline_2c.json"
+    audit_file = tmp_path / "audit_2c.jsonl"
+
+    faucet_snap = _make_faucet_snapshot()
+
+    class MockCCXT:
+        def __init__(self, *a, **kw):
+            self.apiKey = None
+            self.secret = None
+            self.urls = {"api": {"public": "https://testnet.binance.vision/api/v3"}}
+
+    with patch("ccxt.binance", side_effect=MockCCXT), \
+         patch("ccxt.binanceusdm", side_effect=MockCCXT), \
+         patch("ccxt.bybit", side_effect=MockCCXT), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.sync_server_time"), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.fetch_exchange_reconcile_snapshot", return_value=faucet_snap), \
+         patch("src.binance_signed_client.BinanceSignedTestnetClient.fetch_book_ticker", return_value={"bid": 60000.0, "ask": 60000.0, "mid": 60000.0}), \
+         patch.object(run_live, "_run_testnet_signing_preflight", return_value=True), \
+         patch.object(CarryLiveExecutor, "fetch_latest_aligned_universe", return_value={s: pd.DataFrame({"close": [60000.0]}, index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC")) for s in UNIVERSE_SYMBOLS}):
+
+        rc = run_live.main([
+            "--mode", "testnet",
+            "--capital", "3000",
+            "--cycles", "2",
+            "--interval-sec", "0.01",
+            "--reset-testnet-baseline",
+            "--state-file", str(state_file),
+            "--testnet-baseline-file", str(baseline_file),
+            "--audit-log", str(audit_file),
+            "--live-snapshot",
+        ])
+        assert rc == 0
+
+    assert audit_file.exists()
+    records = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").strip().splitlines()]
+    cycle_records = [r for r in records if "cycle" in r]
+    assert len(cycle_records) == 2
+    assert cycle_records[0]["cycle"] == 1
+    assert cycle_records[0]["reconcile_status"] == "SYNCED"
+    assert cycle_records[0]["mode"] == "testnet"
+    assert cycle_records[1]["cycle"] == 2
+    assert cycle_records[1]["reconcile_status"] == "SYNCED"
+    assert cycle_records[1]["mode"] == "testnet"

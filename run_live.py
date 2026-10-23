@@ -1048,6 +1048,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 reset_state=bool(args.reset_state),
                 strategy=strat,
                 tier1b_gate=True,
+                runtime_mode=args.mode,
+                testnet_dry_state=(args.mode == "testnet"),
             )
             logger.info(
                 "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
@@ -1068,6 +1070,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
             _run_signed_snapshot_preflight(args, executor)
             # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
             _run_testnet_order_pair(args, executor, barbell_symbols)
+
+            def _barbell_cycle_hook(cycle_idx: int) -> None:
+                if cycle_idx > 1:
+                    _run_reconcile_preflight(args, executor)
+                    _run_signed_snapshot_preflight(args, executor)
+
+            setattr(executor, "cycle_preflight_hook", _barbell_cycle_hook)
+
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
@@ -1099,6 +1109,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             initial_capital=float(args.capital),
             reset_state=bool(args.reset_state),
             strategy=strat,
+            runtime_mode=args.mode,
+            testnet_dry_state=(args.mode == "testnet"),
         )
         logger.info(
             "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
@@ -1119,6 +1131,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
         _run_signed_snapshot_preflight(args, executor)
         # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
         _run_testnet_order_pair(args, executor, [args.symbol])
+
+        def _nonbarbell_cycle_hook(cycle_idx: int) -> None:
+            if cycle_idx > 1:
+                _run_reconcile_preflight(args, executor)
+                _run_signed_snapshot_preflight(args, executor)
+
+        setattr(executor, "cycle_preflight_hook", _nonbarbell_cycle_hook)
+
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,

@@ -328,6 +328,13 @@ def _cycle1_bootstrap(
     detail["untracked_spot_count"] = len(snapshot.get("untracked_spot_assets") or {})
     detail["bootstrap_baseline_symbols"] = len(baseline_state["carry_positions"])
     detail["bootstrap_equity_usd"] = equity
+    spot_cash = float(snapshot.get("spot_cash_usd", 0.0) or 0.0)
+    fut_wallet = float(snapshot.get("perp_wallet_balance_usd", 0.0) or 0.0)
+    fut_upnl = float(snapshot.get("perp_unrealized_pnl_usd", 0.0) or 0.0)
+    detail["pure_cash_and_margin_usd"] = float(spot_cash + fut_wallet + fut_upnl)
+    recon_eq = report.get("reconcile_equity_usd")
+    if recon_eq is not None:
+        detail["reconcile_equity_usd"] = float(recon_eq)
 
     ok = bool(
         credential_ok
