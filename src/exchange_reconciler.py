@@ -198,8 +198,11 @@ def _lookup_lot_spec(lot_specs: Any, sym: str, base: str) -> tuple[float, float]
 def _classify_leg(
     loc_qty: float, ex_qty: float, side: str, price: float, step: float, min_notional: float, tol_usd: float
 ) -> tuple[str, str | None, float, str]:
-    loc_nz = abs(loc_qty) >= step
-    ex_nz = abs(ex_qty) >= step
+    # Sprint 23 FIX: sai so float khi tru baseline (1.001 - 1.0 = 0.0009999999999998899)
+    # tung lam mot vi the THAT bi bao PHANTOM_IN_STATE -> dung epsilon tuong doi theo step.
+    _eps = max(float(step) * 1e-9, 1e-15)
+    loc_nz = abs(loc_qty) + _eps >= step
+    ex_nz = abs(ex_qty) + _eps >= step
     if not loc_nz and not ex_nz:
         return SYNCED, None, 0.0, ""
     if not loc_nz and ex_nz:
@@ -884,8 +887,14 @@ def load_or_create_testnet_baseline(
 
     spot_bal = dict(_get_field(snapshot, "spot_balances", {}) or {})
     pure_cash = float(sum(_to_float(v) for a, v in spot_bal.items() if _is_cash_asset_local(a)))
-    if pure_cash == 0.0 and _get_field(snapshot, "spot_cash_usd", 0.0):
-        pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
+    if pure_cash == 0.0:
+        # Sprint 23: uu tien pure_cash_usd (chi stablecoin) de baseline khong bi lan
+        # bien dong gia coin faucet testnet.
+        _pure_field = float(_to_float(_get_field(snapshot, "pure_cash_usd", 0.0)))
+        if _pure_field > 0.0:
+            pure_cash = _pure_field
+        elif _get_field(snapshot, "spot_cash_usd", 0.0):
+            pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
     fut_wallet = float(_to_float(_get_field(snapshot, "perp_wallet_balance_usd", 0.0)))
     fut_upnl = float(_to_float(_get_field(snapshot, "perp_unrealized_pnl_usd", 0.0)))
     recon_equity_0 = pure_cash + fut_wallet + fut_upnl
@@ -962,7 +971,8 @@ def compute_testnet_delta_snapshot(
             if is_dust:
                 delta_spot[asset] = 0.0
             else:
-                delta_spot[asset] = dq
+                # Sprint 23: lam tron 12 chu so thap phan de khu sai so float cua phep tru.
+                delta_spot[asset] = round(dq, 12)
                 if px > 0.0:
                     delta_spot_market_value += dq * px
 
@@ -1012,11 +1022,24 @@ def compute_testnet_delta_snapshot(
 
     # 3. Tinh reconcile_equity_usd loai bo MTM coin faucet ban dau
     pure_cash = float(sum(_to_float(v) for a, v in curr_spot.items() if _is_cash_asset_local(a)))
-    if pure_cash == 0.0 and _get_field(snapshot, "spot_cash_usd", 0.0):
-        pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
+    cash_is_total_valuation = False
+    if pure_cash == 0.0:
+        # Sprint 23: uu tien pure_cash_usd (chi stablecoin, khong gom coin faucet).
+        _pure_field = float(_to_float(_get_field(snapshot, "pure_cash_usd", 0.0)))
+        if _pure_field > 0.0:
+            pure_cash = _pure_field
+        elif _get_field(snapshot, "spot_cash_usd", 0.0):
+            # Sprint 23 FIX (double-count): spot_cash_usd la TONG dinh gia spot (cash + coin da
+            # priced), khong phai rieng tien mat. Cong them delta_spot_market_value nua se dem
+            # hai lan gia tri coin vua mua -> EQUITY_MISMATCH gia tao khi mo carry that.
+            pure_cash = float(_to_float(_get_field(snapshot, "spot_cash_usd", 0.0)))
+            cash_is_total_valuation = True
     fut_wallet = float(_to_float(_get_field(snapshot, "perp_wallet_balance_usd", 0.0)))
     fut_upnl = float(_to_float(_get_field(snapshot, "perp_unrealized_pnl_usd", 0.0)))
-    actual_recon_equity = pure_cash + fut_wallet + fut_upnl + delta_spot_market_value
+    if cash_is_total_valuation:
+        actual_recon_equity = pure_cash + fut_wallet + fut_upnl
+    else:
+        actual_recon_equity = pure_cash + fut_wallet + fut_upnl + delta_spot_market_value
 
     init_recon_equity = float(baseline.get("initial_recon_equity", 0.0))
     expected_recon_equity = init_recon_equity + (float(local_equity) - float(capital))

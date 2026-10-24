@@ -354,3 +354,90 @@ def verify_lot_neutrality_invariant(
     if not passed and raise_on_fail:
         raise AssertionError(details)
     return res
+
+
+
+def resolve_effective_carry_top_k(
+    capital_usd: float,
+    base_top_k: int = 4,
+    eta: float = 0.80,
+    btc_price: float = 85000.0,
+    btc_min_lot: float = 0.001,
+    min_lots_safety_factor: float = 1.75,
+) -> int:
+    """Sprint 23: top_k hieu dung theo von (>=1500 USDT giu nguyen base_top_k)."""
+    def _num(v: Any, default: float) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return default
+        return f if math.isfinite(f) else default
+
+    capital = _num(capital_usd, 0.0)
+    if capital <= 0.0:
+        return 1
+    try:
+        base_k = int(base_top_k)
+    except (TypeError, ValueError):
+        base_k = 4
+    base_k = max(1, base_k)
+    if capital >= 1500.0:
+        return base_k
+    min_slot_notional_usd = max(
+        120.0,
+        _num(btc_price, 85000.0) * _num(btc_min_lot, 0.001) * _num(min_lots_safety_factor, 1.75),
+    )
+    deployable_usd = capital * max(0.0, _num(eta, 0.80))
+    max_viable_k = max(1, int(deployable_usd // min_slot_notional_usd))
+    return min(base_k, max_viable_k)
+
+
+def filter_canary_lot_unviable_overlay_symbols(
+    target_weights: dict[str, float],
+    overlay_budget_usd: float,
+    prices: dict[str, float],
+    lot_steps: dict[str, float],
+) -> dict[str, float]:
+    """Sprint 23: loai symbol overlay co min lot USD > 45% budget, re-normalize moi phia."""
+    if not isinstance(target_weights, Mapping):
+        return {}
+    prices = prices if isinstance(prices, Mapping) else {}
+    lot_steps = lot_steps if isinstance(lot_steps, Mapping) else {}
+
+    def _num(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f if math.isfinite(f) else 0.0
+
+    threshold = _num(overlay_budget_usd) * 0.45
+    weights: dict[str, float] = {sym: _num(w) for sym, w in target_weights.items()}
+    kept: dict[str, bool] = {}
+    for sym, w in weights.items():
+        keep = True
+        if w != 0.0:
+            px = _num(prices.get(sym))
+            step = _num(lot_steps.get(sym, 0.001))
+            if px > 0.0 and step > 0.0 and px * step > threshold:
+                keep = False
+        kept[sym] = keep
+
+    orig_long = sum(w for w in weights.values() if w > 0.0)
+    orig_short = sum(-w for w in weights.values() if w < 0.0)
+    kept_long = sum(w for s, w in weights.items() if w > 0.0 and kept[s])
+    kept_short = sum(-w for s, w in weights.items() if w < 0.0 and kept[s])
+    long_scale = orig_long / kept_long if kept_long > 0.0 else 0.0
+    short_scale = orig_short / kept_short if kept_short > 0.0 else 0.0
+
+    out: dict[str, float] = {}
+    for sym, w in weights.items():
+        if w == 0.0:
+            out[sym] = w
+        elif not kept[sym]:
+            continue
+        elif w > 0.0:
+            out[sym] = w * long_scale
+        else:
+            out[sym] = w * short_scale
+    return out

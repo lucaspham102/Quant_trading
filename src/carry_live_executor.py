@@ -215,6 +215,9 @@ class CarryLiveExecutor:
         tier1b_gate: bool = False,
         runtime_mode: Optional[str] = None,
         testnet_dry_state: bool = False,
+        signed_client: Any = None,
+        execute_real_orders: bool = False,
+        persistent_positions: bool = False,
     ) -> None:
         if mode not in ("paper", "live", "testnet"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper', 'live' hoac 'testnet'.")
@@ -314,7 +317,21 @@ class CarryLiveExecutor:
             }
 
         self.runtime_mode: str = runtime_mode if runtime_mode is not None else str(mode)
-        self.testnet_dry_state: bool = bool(testnet_dry_state or (self.runtime_mode == "testnet"))
+        # Sprint 23: khi dinh tuyen lenh THAT (signed_client + execute_real_orders) thi
+        # testnet persistent KHONG duoc ep dry-state (phai giu vi the giua cac lan chay).
+        _real_routing = bool(execute_real_orders and signed_client is not None)
+        self.testnet_dry_state: bool = bool(
+            testnet_dry_state or (self.runtime_mode == "testnet" and not _real_routing)
+        )
+        # Sprint 23: dinh tuyen lenh THAT qua BinanceSignedClient (Testnet persistent / Mainnet live).
+        self.signed_client: Any = signed_client
+        self.execute_real_orders: bool = bool(execute_real_orders)
+        self.persistent_positions: bool = bool(persistent_positions)
+        self.top_k: int = max(1, int(getattr(self.carry_config, "top_k", 2)))
+        _eta_raw = getattr(self.carry_config, "eta_override", None)
+        self.eta_override: float = float(0.80 if _eta_raw is None else _eta_raw)
+        # Sprint 23: top_k hieu luc cua chu ky (Canary 400 USDT -> 2 slot).
+        self.effective_top_k: int = int(self.top_k)
 
         if self.testnet_dry_state:
             # Sprint 22 Phase 9: Testnet executor runs with unauthenticated CCXT; positions in state
@@ -387,6 +404,61 @@ class CarryLiveExecutor:
             pos["leg1_filled_qty"] = float(leg1_filled_qty)
             pos["leg2_hedged_qty"] = float(leg2_hedged_qty)
             pos["execution_state"] = execution_state
+
+    def _lot_step_for_symbol(self, symbol: str) -> float:
+        """Sprint 23: step_size cua cap giao dich (fallback 0.001)."""
+        step = LOT_STEP_SIZES.get(symbol)
+        if step is None:
+            spot_like = f"{symbol.split(':')[0]}" if ":" in symbol else f"{symbol}:USDT"
+            step = LOT_STEP_SIZES.get(spot_like)
+        try:
+            val = float(step) if step is not None else 0.001
+        except (TypeError, ValueError):
+            val = 0.001
+        return val if val > 0.0 else 0.001
+
+    def _floor_to_step(self, qty: float, step: float) -> float:
+        """Sprint 23: lam tron xuong theo step_size, tranh gui lenh lech lot."""
+        try:
+            q = float(qty)
+            s = float(step)
+        except (TypeError, ValueError):
+            return 0.0
+        if q <= 0.0 or s <= 0.0:
+            return 0.0
+        n_steps = math.floor((q + 1e-12) / s)
+        if n_steps <= 0:
+            return 0.0
+        precision = 8 if s < 0.001 else 6
+        return float(round(n_steps * s, precision))
+
+    def _resolve_effective_top_k(self, btc_price: float = 0.0) -> int:
+        """Sprint 23: top_k hieu luc theo von (>=1500 USDT giu nguyen top_k cau hinh)."""
+        from src.quant_invariants import resolve_effective_carry_top_k
+
+        capital_usd = float(getattr(self, "capital", 0.0) or 0.0)
+        px = float(btc_price or 0.0)
+        if px <= 0.0:
+            px = 85000.0
+        try:
+            eff = int(resolve_effective_carry_top_k(
+                capital_usd,
+                base_top_k=int(getattr(self, "top_k", 4)),
+                eta=float(getattr(self, "eta_override", 0.80)),
+                btc_price=px,
+            ))
+        except Exception as exc:  # noqa: BLE001 - khong duoc lam sap chu ky
+            logger.warning("resolve_effective_carry_top_k failed: %s", exc)
+            eff = int(getattr(self, "top_k", 4))
+        self.effective_top_k = max(1, eff)
+        return self.effective_top_k
+
+    def _persist_state_now(self) -> None:
+        """Sprint 23: ghi state ngay sau moi lenh that (atomic qua StateStore)."""
+        try:
+            self.state_store.save(self.state)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Could not persist state after real fill: %s", exc)
 
     def quantize_leg(self, symbol: str, notional_usd: float, price: float) -> tuple[float, float]:
         """Lượng hóa khối lượng theo lot-size và min-notional của sàn tương ứng."""
@@ -1186,7 +1258,16 @@ class CarryLiveExecutor:
                     scores_at_t[sym] = 0.0
 
         # 1. Nhánh carry_sleeve: lấy top-k theo scores_at_t
-        top_k = max(1, int(getattr(self.carry_config, "top_k", 2)))
+        # Sprint 23: top_k hieu luc theo von (Canary 400 USDT -> 2 slot, >= 1500 USDT giu 4).
+        _btc_price = 0.0
+        _btc_df = aligned_universe.get("BTC/USDT:USDT")
+        if _btc_df is not None and not _btc_df.empty:
+            _btc_col = "perp_close" if "perp_close" in _btc_df.columns else ("close" if "close" in _btc_df.columns else None)
+            if _btc_col is not None:
+                _btc_val = _btc_df[_btc_col].iloc[-1]
+                if pd.notna(_btc_val) and np.isfinite(_btc_val) and float(_btc_val) > 0.0:
+                    _btc_price = float(_btc_val)
+        top_k = self._resolve_effective_top_k(_btc_price)
         carry_allocations: list[dict[str, Any]] = []
 
         valid_syms = [s for s in scores_at_t.keys() if s in aligned_universe and aligned_universe[s] is not None and not aligned_universe[s].empty]
@@ -1264,6 +1345,24 @@ class CarryLiveExecutor:
                 _min_leg_usd = compute_adaptive_min_viable_leg_usd(equity_now)
             else:
                 _min_leg_usd = float(_min_leg_override)
+            # Sprint 23: loai symbol co 1 lot > 45% ngan sach overlay (BTC o von 400 USDT)
+            # de sau lam tron lot van giu |Long - Short| <= 10 USD.
+            from src.quant_invariants import filter_canary_lot_unviable_overlay_symbols
+
+            _overlay_gross_budget = float(sum(abs(float(v)) for v in target_notional_signed.values()))
+            if _overlay_gross_budget > 0.0:
+                _filtered_weights = filter_canary_lot_unviable_overlay_symbols(
+                    {s: float(w) for s, w in target_weights.items()},
+                    _overlay_gross_budget,
+                    prices,
+                    {s: float(EXCHANGE_LOT_SPECS.get(s, {}).get("step_size", 0.001)) for s in prices},
+                )
+                for _s in list(target_notional_signed.keys()):
+                    if _s not in _filtered_weights and _s in prices:
+                        target_notional_signed.pop(_s, None)
+                for _s, _w in _filtered_weights.items():
+                    if _s in prices and _s in target_notional_signed:
+                        target_notional_signed[_s] = float(_w) * equity_now
             neutral_qty = enforce_overlay_dollar_neutrality(
                 target_notional_signed,
                 prices,
@@ -1521,6 +1620,18 @@ class CarryLiveExecutor:
         orders: list[dict[str, Any]] = []
         skipped = 0
         turnover_notional = 0.0
+        # Sprint 23: dinh tuyen lenh THAT qua BinanceSignedClient khi execute_real_orders=True.
+        if self.execute_real_orders and self.signed_client is not None and targets:
+            _px_map: dict[str, float] = {}
+            for _sym in set(targets.keys()) | set(current.keys()):
+                _df = aligned_universe.get(_sym) if aligned_universe else None
+                if _df is not None and not _df.empty:
+                    _col = "perp_close" if "perp_close" in _df.columns else ("close" if "close" in _df.columns else None)
+                    if _col is not None:
+                        _v = _df[_col].iloc[-1]
+                        if pd.notna(_v) and np.isfinite(_v) and float(_v) > 0.0:
+                            _px_map[_sym] = float(_v)
+            return self._execute_overlay_deltas_real(targets, current, _px_map, timestamp)
         all_symbols = sorted(set(targets.keys()) | set(current.keys()))
 
         for symbol in all_symbols:
@@ -1639,6 +1750,403 @@ class CarryLiveExecutor:
             "turnover_notional": float(turnover_notional),
             "functional": bool(self.executor_functional),
         }
+
+    def _execute_atomic_carry_delta(
+        self,
+        symbol: str,
+        spot_delta_qty: float,
+        perp_delta_qty: float,
+        ref_price: float,
+    ) -> dict[str, Any]:
+        """Sprint 23: thuc thi 2 chan Spot/Perp that voi rollback chan tran."""
+        if self.signed_client is None:
+            raise RuntimeError("execute_real_orders requires signed_client")
+        client = self.signed_client
+        spot_d = float(spot_delta_qty)
+        perp_d = float(perp_delta_qty)
+        common_step = max(self._lot_step_for_symbol(symbol), self._lot_step_for_symbol(symbol))
+        result: dict[str, Any] = {
+            "symbol": symbol,
+            "ok": False,
+            "spot_filled_qty": 0.0,
+            "perp_filled_qty": 0.0,
+            "spot_avg_price": 0.0,
+            "perp_avg_price": 0.0,
+            "spot_order_id": None,
+            "perp_order_id": None,
+            "rollback": None,
+            "event": "ATOMIC_CARRY_DELTA_SKIPPED",
+            "reason": "",
+        }
+
+        def _filled(resp: Any) -> float:
+            if not isinstance(resp, dict):
+                return 0.0
+            return float(resp.get("executedQty", 0.0) or 0.0)
+
+        def _avg(resp: Any) -> float:
+            if not isinstance(resp, dict):
+                return 0.0
+            return float(resp.get("avgPrice", 0.0) or 0.0)
+
+        def _oid(resp: Any) -> Any:
+            return resp.get("orderId") if isinstance(resp, dict) else None
+
+        def _perp_qty_now() -> Optional[float]:
+            """Sprint 23: doc lai vi the perp hien tai de biet lenh loi da khop hay chua."""
+            fn = getattr(client, "fetch_exchange_reconcile_snapshot", None)
+            if not callable(fn):
+                return None
+            try:
+                snap = fn([symbol], {})
+            except Exception:  # noqa: BLE001
+                return None
+            if not isinstance(snap, dict) or not bool(snap.get("snapshot_healthy", False)):
+                return None
+            try:
+                return float((snap.get("perp_positions") or {}).get(symbol, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return None
+
+        def _await_fill(venue: str, resp: Any, attempts: int = 6, delay: float = 0.4) -> float:
+            """Sprint 23: MARKET tren testnet co the tra executedQty=0 luc dau -> poll query_order."""
+            filled = _filled(resp)
+            if filled > 1e-12:
+                return filled
+            order_id = _oid(resp)
+            query_fn = getattr(client, "query_order", None)
+            if order_id is None or not callable(query_fn):
+                return filled
+            for _ in range(int(attempts)):
+                time.sleep(float(delay))
+                try:
+                    polled = query_fn(venue, symbol, order_id)
+                except Exception:  # noqa: BLE001 - loi tam thoi -> thu lai vong sau
+                    continue
+                got = _filled(polled)
+                if got > 1e-12:
+                    return got
+            return filled
+
+
+        if spot_d > 0.0 and perp_d < 0.0:
+            qty = self._floor_to_step(min(spot_d, abs(perp_d)), common_step)
+            if qty <= 0.0:
+                result["reason"] = "QTY_BELOW_LOT_STEP"
+                return result
+            try:
+                spot_resp = client.place_spot_market_order(symbol, "BUY", qty)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("event=ATOMIC_OPEN_ABORTED symbol=%s spot_error=%s", symbol, exc)
+                result["event"] = "ATOMIC_OPEN_ABORTED"
+                result["reason"] = f"SPOT_LEG_ERROR:{exc}"
+                return result
+            spot_filled = _await_fill("spot", spot_resp)
+            if spot_filled <= 1e-12:
+                result["event"] = "ATOMIC_OPEN_ABORTED"
+                result["reason"] = "SPOT_ZERO_FILL"
+                return result
+            result["spot_filled_qty"] = spot_filled
+            result["spot_avg_price"] = _avg(spot_resp)
+            result["spot_order_id"] = _oid(spot_resp)
+
+            perp_qty = self._floor_to_step(spot_filled, common_step)
+            perp_resp: Any = None
+            perp_err: Any = None
+            perp_filled_final = 0.0
+            if perp_qty > 0.0:
+                _can_poll = callable(getattr(client, "query_order", None))
+                for _attempt in range(2):
+                    try:
+                        perp_resp = client.place_futures_market_order(symbol, "SELL", perp_qty)
+                        perp_err = None
+                        perp_filled_final = _await_fill("futures", perp_resp)
+                        if perp_filled_final > 1e-12:
+                            break
+                        perp_err = "PERP_ZERO_FILL"
+                        if _can_poll:
+                            break  # da poll xac nhan 0 khop -> KHONG retry (tranh short doi)
+                    except Exception as exc:  # noqa: BLE001
+                        perp_resp = None
+                        perp_err = exc
+                        # Sprint 23 FIX (audit HIGH): timeout/HTTP loi -> KHONG retry mu
+                        # (co the da khop -> short doi). Do lai vi the that de quyet dinh.
+                        _q_now = _perp_qty_now()
+                        if _q_now is not None:
+                            if abs(_q_now) + 1e-9 >= perp_qty * 0.999:
+                                perp_filled_final = abs(_q_now)
+                                perp_err = None
+                                logger.warning(
+                                    "event=ATOMIC_LEG_VERIFIED_FILLED symbol=%s perp_pos=%s err=%s",
+                                    symbol, _q_now, exc,
+                                )
+                            break
+            else:
+                perp_err = "PERP_QTY_BELOW_STEP"
+            if perp_err is not None:
+                logger.error(
+                    "event=NAKED_LEG_AUTO_ROLLBACK symbol=%s spot_order_id=%s spot_filled=%s perp_error=%s",
+                    symbol, result["spot_order_id"], spot_filled, perp_err,
+                )
+                try:
+                    client.place_spot_market_order(symbol, "SELL", spot_filled)
+                except Exception as rb_exc:  # noqa: BLE001
+                    logger.critical(
+                        "event=NAKED_LEG_ROLLBACK_FAILED symbol=%s spot_filled=%s error=%s",
+                        symbol, spot_filled, rb_exc,
+                    )
+                raise RuntimeError("Naked leg rollback triggered")
+            result["ok"] = True
+            result["perp_filled_qty"] = float(perp_filled_final)
+            result["perp_avg_price"] = _avg(perp_resp)
+            result["perp_order_id"] = _oid(perp_resp)
+            result["event"] = "ATOMIC_CARRY_OPEN_FILLED"
+            result["reason"] = "OK"
+            return result
+
+        if spot_d < 0.0 and perp_d > 0.0:
+            qty = self._floor_to_step(min(abs(spot_d), perp_d), common_step)
+            if qty <= 0.0:
+                result["reason"] = "QTY_BELOW_LOT_STEP"
+                return result
+            try:
+                perp_resp = client.place_futures_market_order(symbol, "BUY", qty, reduce_only=True)
+                perp_filled = _await_fill("futures", perp_resp)
+            except Exception as exc:  # noqa: BLE001
+                # Sprint 23 FIX (audit HIGH): loi mang nhung lenh co the da khop ->
+                # neu vi the perp da ve 0 thi coi nhu leg 1 thanh cong, KHONG gui lai.
+                _q_now = _perp_qty_now()
+                if _q_now is not None and abs(_q_now) <= 1e-9:
+                    perp_filled = qty
+                    perp_resp = {"executedQty": qty, "avgPrice": 0.0, "orderId": None}
+                    logger.warning(
+                        "event=ATOMIC_CLOSE_LEG_VERIFIED_FILLED symbol=%s err=%s", symbol, exc,
+                    )
+                else:
+                    logger.error("event=ATOMIC_CLOSE_ABORTED symbol=%s perp_error=%s", symbol, exc)
+                    result["event"] = "ATOMIC_CLOSE_ABORTED"
+                    result["reason"] = f"PERP_REDUCE_ERROR:{exc}"
+                    return result
+            if perp_filled <= 1e-12:
+                result["event"] = "ATOMIC_CLOSE_ABORTED"
+                result["reason"] = "PERP_REDUCE_ERROR"
+                return result
+            result["perp_filled_qty"] = perp_filled
+            result["perp_avg_price"] = _avg(perp_resp)
+            result["perp_order_id"] = _oid(perp_resp)
+            spot_qty = self._floor_to_step(perp_filled, common_step)
+            if spot_qty <= 0.0:
+                result["event"] = "ATOMIC_CLOSE_ABORTED"
+                result["reason"] = "SPOT_QTY_BELOW_STEP"
+                return result
+
+            spot_resp: Any = None
+            spot_err: Any = None
+            spot_filled_final = 0.0
+            _can_poll_close = callable(getattr(client, "query_order", None))
+            for _attempt in range(2):
+                try:
+                    spot_resp = client.place_spot_market_order(symbol, "SELL", spot_qty)
+                    spot_err = None
+                    spot_filled_final = _await_fill("spot", spot_resp)
+                    if spot_filled_final > 1e-12:
+                        break
+                    spot_err = "SPOT_ZERO_FILL"
+                    if _can_poll_close:
+                        break  # da poll xac nhan 0 khop -> KHONG retry (tranh ban doi)
+                except Exception as exc:  # noqa: BLE001
+                    spot_resp = None
+                    spot_err = exc
+                    # Sprint 23 FIX (audit HIGH): khong retry mu khi ket qua khong ro.
+                    if callable(getattr(client, "query_order", None)):
+                        break
+            if spot_err is not None:
+                if not isinstance(spot_err, str):
+                    # Sprint 23 FIX (audit HIGH): ket qua chan Spot KHONG ro (timeout/HTTP loi).
+                    # KHONG rehedge mu (co the da ban duoc -> tao naked short). Fail-safe:
+                    # dung lai, de reconcile phat hien ORPHAN/PHANTOM va tu sua chu ky sau.
+                    logger.critical(
+                        "event=ATOMIC_CLOSE_LEG2_UNKNOWN symbol=%s perp_filled=%s error=%s",
+                        symbol, perp_filled, spot_err,
+                    )
+                    result["event"] = "ATOMIC_CLOSE_LEG2_UNKNOWN"
+                    result["reason"] = f"SPOT_LEG_UNKNOWN:{spot_err}"
+                    return result
+                logger.error(
+                    "event=NAKED_LEG_CLOSE_ROLLBACK symbol=%s perp_order_id=%s perp_filled=%s spot_error=%s",
+                    symbol, result["perp_order_id"], perp_filled, spot_err,
+                )
+                try:
+                    # Sprint 23 FIX (audit HIGH): perp da flat sau leg 1 nen day la lenh MO
+                    # vi the Short moi -> KHONG duoc reduceOnly (se bi -2022 reject).
+                    rehedge = client.place_futures_market_order(symbol, "SELL", spot_qty, reduce_only=False)
+                except Exception as rb_exc:  # noqa: BLE001
+                    logger.critical("event=CLOSE_ROLLBACK_FAILED symbol=%s error=%s", symbol, rb_exc)
+                    raise RuntimeError(f"Close leg 2 rollback failed for {symbol}") from rb_exc
+                result["event"] = "NAKED_LEG_CLOSE_ROLLBACK"
+                result["reason"] = "CLOSE_ROLLBACK_REHEDGED"
+                result["rollback"] = rehedge if isinstance(rehedge, dict) else {"response": rehedge}
+                return result
+            result["ok"] = True
+            result["spot_filled_qty"] = float(spot_filled_final)
+            result["spot_avg_price"] = _avg(spot_resp)
+            result["spot_order_id"] = _oid(spot_resp)
+            result["event"] = "ATOMIC_CARRY_CLOSE_FILLED"
+            result["reason"] = "OK"
+            return result
+
+        result["reason"] = "INVALID_DELTA_DIRECTION"
+        return result
+
+    def _execute_overlay_deltas_real(
+        self,
+        targets: dict[str, float],
+        current: dict[str, float],
+        prices: dict[str, float],
+        timestamp: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Sprint 23: gui lenh overlay perp that, rollback neu |Long - Short| vuot nguong."""
+        try:
+            client = self.signed_client
+            planned: list[tuple[str, float, float, float]] = []
+            skipped = 0
+            for symbol in sorted(set(targets.keys()) | set(current.keys())):
+                target = float(targets.get(symbol, 0.0))
+                cur = float(current.get(symbol, 0.0))
+                delta = target - cur
+                price = float(prices.get(symbol, 0.0) or 0.0)
+                if abs(delta) < 1e-12 or price <= 0.0:
+                    continue
+                qty_q, _ = self.quantize_leg(symbol, abs(delta) * price, price)
+                if qty_q <= 0.0:
+                    skipped += 1
+                    continue
+                planned.append((symbol, target, cur, float(qty_q)))
+            planned.sort(key=lambda t: 0 if abs(t[1]) <= 1e-12 else 1)
+
+            orders: list[dict[str, Any]] = []
+            new_positions: dict[str, float] = {s: float(q) for s, q in current.items()}
+            entry_px: dict[str, float] = {}
+            fills: list[tuple[str, str, float]] = []
+            turnover = 0.0
+            for symbol, target, cur, qty_q in planned:
+                side = "BUY" if target > cur else "SELL"
+                sign = 1.0 if side == "BUY" else -1.0
+                reduce_only = abs(target) <= 1e-12
+                try:
+                    resp = client.place_futures_market_order(symbol, side, qty_q, reduce_only=reduce_only)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Overlay real order failed for %s: %s", symbol, exc)
+                    orders.append({"symbol": symbol, "side": side, "qty": qty_q, "status": "error", "error": str(exc)})
+                    continue
+                resp = resp if isinstance(resp, dict) else {}
+                filled = float(resp.get("executedQty", 0.0) or 0.0)
+                if filled <= 0.0:
+                    # Sprint 23 FIX (audit MEDIUM): testnet tra executedQty=0 luc dau ->
+                    # poll query_order de khong bo sot fill that (tranh orphan state).
+                    _oid = resp.get("orderId")
+                    _qfn = getattr(client, "query_order", None)
+                    if _oid is not None and callable(_qfn):
+                        for _ in range(6):
+                            time.sleep(0.4)
+                            try:
+                                _q = _qfn("futures", symbol, _oid)
+                            except Exception:  # noqa: BLE001
+                                continue
+                            filled = float((_q or {}).get("executedQty", 0.0) or 0.0)
+                            if filled > 0.0:
+                                avg_px_poll = float((_q or {}).get("avgPrice", 0.0) or 0.0)
+                                if avg_px_poll > 0.0:
+                                    resp = dict(resp)
+                                    resp["avgPrice"] = avg_px_poll
+                                break
+                avg_px = float(resp.get("avgPrice", 0.0) or 0.0)
+                orders.append({
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty_q,
+                    "filled_qty": filled,
+                    "avg_price": avg_px,
+                    "order_id": resp.get("orderId"),
+                    "status": "filled" if filled > 0.0 else "unfilled",
+                })
+                if filled <= 0.0:
+                    continue
+                new_positions[symbol] = float(new_positions.get(symbol, 0.0)) + sign * filled
+                if avg_px > 0.0:
+                    entry_px[symbol] = avg_px
+                fills.append((symbol, side, filled))
+                turnover += filled * (avg_px if avg_px > 0.0 else float(prices.get(symbol, 0.0)))
+
+            long_usd = 0.0
+            short_usd = 0.0
+            for symbol, q in new_positions.items():
+                notional = abs(float(q)) * float(prices.get(symbol, 0.0) or 0.0)
+                if q > 1e-12:
+                    long_usd += notional
+                elif q < -1e-12:
+                    short_usd += notional
+            net_delta = long_usd - short_usd
+            max_imb = float(getattr(self, "overlay_max_imbalance_usd", 10.0))
+            if abs(net_delta) > max_imb:
+                logger.error(
+                    "event=OVERLAY_LEG_ROLLBACK net_delta_usd=%.4f max_imbalance_usd=%.4f n_fills=%d",
+                    net_delta, max_imb, len(fills),
+                )
+                for symbol, side, filled in fills:
+                    opposite = "SELL" if side == "BUY" else "BUY"
+                    try:
+                        client.place_futures_market_order(symbol, opposite, filled, reduce_only=True)
+                    except Exception as rb_exc:  # noqa: BLE001
+                        logger.critical("event=OVERLAY_ROLLBACK_FAILED symbol=%s error=%s", symbol, rb_exc)
+                return {
+                    "orders": orders,
+                    "n_orders": int(len(orders)),
+                    "skipped": int(skipped),
+                    "turnover_notional": float(turnover),
+                    "functional": bool(self.executor_functional),
+                    "net_delta_usd": float(net_delta),
+                    "status": "ROLLED_BACK",
+                }
+
+            if fills:
+                for symbol, q in new_positions.items():
+                    if abs(q) <= 1e-12:
+                        self.state.overlay_positions.pop(symbol, None)
+                        continue
+                    prev = self.state.overlay_positions.get(symbol)
+                    prev_px = float(prev.get("entry_price", 0.0)) if isinstance(prev, dict) else 0.0
+                    self.state.overlay_positions[symbol] = {
+                        "qty": abs(float(q)),
+                        "side": "long" if q > 0 else "short",
+                        "entry_price": float(entry_px.get(symbol, prev_px or float(prices.get(symbol, 0.0)))),
+                    }
+                for o in orders:
+                    if o.get("status") == "filled":
+                        self.state.overlay_orders.append({**o, "timestamp": timestamp})
+                self.executor_functional = True
+                self.state.executor_functional = True
+                self._persist_state_now()
+            return {
+                "orders": orders,
+                "n_orders": int(len(orders)),
+                "skipped": int(skipped),
+                "turnover_notional": float(turnover),
+                "functional": bool(self.executor_functional),
+                "net_delta_usd": float(net_delta),
+                "status": "OK",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Overlay real execution error: %s", exc)
+            return {
+                "orders": [],
+                "n_orders": 0,
+                "skipped": 0,
+                "turnover_notional": 0.0,
+                "functional": bool(self.executor_functional),
+                "status": "ERROR",
+                "error": str(exc),
+            }
 
     def _load_symbol_from_cache(self, symbol: str) -> pd.DataFrame:
         """Đọc và ghép dữ liệu Spot, Perp và Funding từ Parquet cache cục bộ."""
@@ -2431,7 +2939,23 @@ class CarryLiveExecutor:
         # 4. Lựa chọn danh mục qua select_portfolio
         current_holdings = set(self.state.carry_positions.keys())
         periods_held_map = {sym: int(pos.get("periods_held", 0)) for sym, pos in self.state.carry_positions.items()}
-        decision = select_portfolio(
+        _btc_px_live = 0.0
+        _btc_live_df = aligned_universe.get("BTC/USDT:USDT")
+        if _btc_live_df is not None and not _btc_live_df.empty:
+            _btc_live_col = "perp_close" if "perp_close" in _btc_live_df.columns else ("close" if "close" in _btc_live_df.columns else None)
+            if _btc_live_col is not None:
+                _btc_live_val = _btc_live_df[_btc_live_col].iloc[-1]
+                if pd.notna(_btc_live_val) and np.isfinite(_btc_live_val) and float(_btc_live_val) > 0.0:
+                    _btc_px_live = float(_btc_live_val)
+        effective_top_k = self._resolve_effective_top_k(_btc_px_live)
+        _selection_cfg = self.carry_config
+        if int(effective_top_k) != int(getattr(self, "top_k", effective_top_k)):
+            _selection_cfg = dataclasses.replace(self.carry_config, top_k=int(effective_top_k))
+
+        def _select_portfolio_eff(_scores: Any, _holdings: Any, _periods: Any, _cfg: Any, switch_rule: Any = None) -> Any:
+            return select_portfolio(_scores, _holdings, _periods, _selection_cfg, switch_rule=switch_rule)
+
+        decision = _select_portfolio_eff(
             selection_scores,
             current_holdings,
             periods_held_map,
@@ -2511,6 +3035,43 @@ class CarryLiveExecutor:
             logger.warning("audit_delta_drift/repair_delta_drift failed: %s", _drift_err)
 
         # 5. Thực thi và Cập nhật trạng thái
+        # Sprint 23: dong vi the bang lenh THAT (Perp reduceOnly BUY -> Spot SELL) truoc vong dong cu.
+        if self.execute_real_orders and self.signed_client is not None:
+            for sym in self.symbols:
+                if resolved_actions.get(sym) != "CLOSE_DELTA_NEUTRAL" or sym not in self.state.carry_positions:
+                    continue
+                pos = self.state.carry_positions[sym]
+                udf = aligned_universe.get(sym)
+                sp_curr = float(udf["spot_close"].iloc[-1] if "spot_close" in udf.columns else udf["close"].iloc[-1])
+                pe_curr = float(udf["perp_close"].iloc[-1] if "perp_close" in udf.columns else udf["close"].iloc[-1])
+                qty = float(pos.get("qty", 0.0))
+                if qty <= 1e-12:
+                    self.state.carry_positions.pop(sym, None)
+                    self._persist_state_now()
+                    continue
+                _atomic_close = self._execute_atomic_carry_delta(sym, -float(qty), float(qty), float(pe_curr))
+                _closed_qty = float(_atomic_close.get("perp_filled_qty", 0.0) or 0.0)
+                if bool(_atomic_close.get("ok", False)) and _closed_qty > 0.0:
+                    _close_px = float(_atomic_close.get("spot_avg_price", 0.0) or 0.0) or float(sp_curr)
+                    _entry_spot = float(pos.get("entry_spot_price", sp_curr))
+                    _entry_perp = float(pos.get("entry_perp_price", pe_curr))
+                    _mtm = _closed_qty * (sp_curr - _entry_spot) - _closed_qty * (pe_curr - _entry_perp)
+                    _close_fee = (_closed_qty * _close_px) * self.get_one_way_fee_rate()
+                    self.state.current_equity += _mtm - _close_fee
+                    if _closed_qty >= qty - 1e-12:
+                        self.state.carry_positions.pop(sym, None)
+                    else:
+                        _rem = max(0.0, qty - _closed_qty)
+                        pos["qty"] = float(_rem)
+                        pos["notional_usdt"] = float(_rem * sp_curr)
+                        pos["execution_state"] = "PARTIAL_CLOSE"
+                        resolved_actions[sym] = "HOLD"
+                    self._update_leg_state(sym, "CLOSED", _closed_qty, _closed_qty, "CLOSED")
+                    self._persist_state_now()
+                    continue
+                logger.error("Atomic carry close NOT filled for %s: %s", sym, _atomic_close.get("reason"))
+                self.state.kill_switch_pending_close = True
+                resolved_actions[sym] = "HOLD"
         # a) Đóng vị thế CLOSE_DELTA_NEUTRAL trước
         for sym in self.symbols:
             if resolved_actions.get(sym) == "CLOSE_DELTA_NEUTRAL" and sym in self.state.carry_positions:
@@ -2679,7 +3240,52 @@ class CarryLiveExecutor:
                 sp_curr = float(udf["spot_close"].iloc[-1] if "spot_close" in udf.columns else udf["close"].iloc[-1])
                 pe_curr = float(udf["perp_close"].iloc[-1] if "perp_close" in udf.columns else udf["close"].iloc[-1])
 
-                allocated_capital = (1.0 / float(self.carry_config.top_k)) * self.state.current_equity
+                _eff_k_open = max(1, int(getattr(self, "effective_top_k", self.top_k)))
+                allocated_capital = (1.0 / float(_eff_k_open)) * self.state.current_equity
+                # Sprint 23: dinh tuyen lenh THAT atomic 2-leg (Testnet persistent / Mainnet live).
+                if self.execute_real_orders and self.signed_client is not None:
+                    spot_qty = (allocated_capital * self.carry_config.notional_eta()) / sp_curr if sp_curr > 0 else 0.0
+                    perp_qty = spot_qty
+                    spot_sym = sym.split(":")[0]
+                    if spot_qty <= 0.0 or pe_curr <= 0.0:
+                        continue
+                    _atomic = self._execute_atomic_carry_delta(sym, float(spot_qty), -float(perp_qty), float(pe_curr))
+                    if not bool(_atomic.get("ok", False)):
+                        logger.warning("Atomic carry open NOT filled for %s: %s", sym, _atomic.get("reason"))
+                        continue
+                    _real_qty = float(_atomic.get("spot_filled_qty", 0.0) or 0.0)
+                    _real_perp_qty = float(_atomic.get("perp_filled_qty", 0.0) or 0.0)
+                    _fill_spot_px = float(_atomic.get("spot_avg_price", 0.0) or 0.0) or float(sp_curr)
+                    _fill_perp_px = float(_atomic.get("perp_avg_price", 0.0) or 0.0) or float(pe_curr)
+                    _real_notional = _real_qty * _fill_spot_px
+                    _fee = _real_notional * self.get_one_way_fee_rate()
+                    _real_allocated = _real_notional / self.carry_config.notional_eta() if self.carry_config.notional_eta() > 0 else _real_notional
+                    self.state.carry_positions[sym] = {
+                        "symbol": sym,
+                        "spot_symbol": spot_sym,
+                        "qty": float(_real_qty),
+                        "entry_spot_price": float(_fill_spot_px),
+                        "entry_perp_price": float(_fill_perp_px),
+                        "notional_usdt": float(_real_notional),
+                        "margin_allocated_usdt": float(max(0.0, (_real_allocated - _real_notional) - _fee)),
+                        "entry_time": timestamp_str,
+                        "periods_held": 0,
+                        "funding_collected_usdt": 0.0,
+                        "score_at_entry": float(metrics_at_t[sym]["score"]),
+                        "leg1_status": "FILLED",
+                        "leg1_order_id": _atomic.get("spot_order_id"),
+                        "leg1_filled_qty": float(_real_qty),
+                        "leg2_hedged_qty": float(_real_perp_qty),
+                        "exchange_long": "binance_spot",
+                        "exchange_short": "binance",
+                        "capital": float(self.capital),
+                        "execution_state": "HEDGED",
+                        "perp_order_id": _atomic.get("perp_order_id"),
+                    }
+                    self.state.current_equity -= _fee
+                    self._persist_state_now()
+                    self._update_leg_state(sym, "FILLED", _real_qty, _real_perp_qty, "HEDGED")
+                    continue
                 target_notional = allocated_capital * self.carry_config.notional_eta()
                 spot_qty = target_notional / sp_curr if sp_curr > 0 else 0.0
                 perp_qty = spot_qty
@@ -3061,6 +3667,8 @@ class CarryLiveExecutor:
             "carry_ema_threshold_bps": carry_ema_threshold_bps,
             "carry_gate_pass": carry_gate_pass,
             "carry_selected_count": carry_selected_count,
+            "effective_top_k": int(getattr(self, "effective_top_k", getattr(self, "top_k", 4))),
+            "base_top_k": int(getattr(self, "top_k", 4)),
             "symbols_above_carry_threshold": symbols_above_carry_threshold,
             "max_overlay_delta": max_overlay_delta,
             "overlay_delta_threshold": overlay_delta_threshold,
@@ -3101,6 +3709,67 @@ class CarryLiveExecutor:
             f"TradesExecuted: carryTrades={c_cnt}, overlayTrades={o_cnt} | "
             f"Invariants: {'OK' if bool(diag.get('invariants_passed', True)) else 'FAIL'}"
         )
+
+    def close_all_persistent_positions(self, ref_prices: dict[str, float] | None = None) -> dict[str, Any]:
+        """Sprint 23: dong TOAN BO vi the carry + overlay bang lenh that, tra audit dict."""
+        closed_carry: list[str] = []
+        closed_overlay: list[str] = []
+        errors: list[str] = []
+        if not self.execute_real_orders or self.signed_client is None:
+            self.state.carry_positions = {}
+            self.state.overlay_positions = {}
+            self.state_store.save(self.state)
+            return {"closed_carry": [], "closed_overlay": [], "errors": ["DRY_STATE_CLEARED"], "zero_residual": True}
+
+        prices = ref_prices or {}
+        for sym, pos in list((self.state.carry_positions or {}).items()):
+            try:
+                qty = float(pos.get("qty", 0.0)) if isinstance(pos, dict) else 0.0
+                if qty <= 0.0:
+                    self.state.carry_positions.pop(sym, None)
+                    self._persist_state_now()
+                    continue
+                price = float(prices.get(sym, 0.0) or 0.0)
+                if price <= 0.0:
+                    price = float(pos.get("entry_spot_price", 0.0) or 0.0) or float(pos.get("entry_perp_price", 0.0) or 0.0)
+                res = self._execute_atomic_carry_delta(sym, -qty, qty, price)
+                if bool(res.get("ok", False)):
+                    self.state.carry_positions.pop(sym, None)
+                    closed_carry.append(sym)
+                    self._persist_state_now()
+                else:
+                    errors.append(f"CARRY_CLOSE_FAILED:{sym}:{res.get('reason')}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("close_all carry %s failed: %s", sym, exc)
+                errors.append(f"CARRY_CLOSE_ERROR:{sym}:{exc}")
+
+        for sym, pos in list((getattr(self.state, "overlay_positions", {}) or {}).items()):
+            try:
+                if isinstance(pos, dict):
+                    q = abs(float(pos.get("qty", 0.0)))
+                    is_short = str(pos.get("side", "")).lower() in ("short", "sell")
+                else:
+                    q = abs(float(pos))
+                    is_short = float(pos) < 0.0
+                if q <= 0.0:
+                    self.state.overlay_positions.pop(sym, None)
+                    continue
+                self.signed_client.place_futures_market_order(sym, "BUY" if is_short else "SELL", q, reduce_only=True)
+                self.state.overlay_positions.pop(sym, None)
+                closed_overlay.append(sym)
+                self._persist_state_now()
+            except Exception as exc:  # noqa: BLE001
+                logger.error("close_all overlay %s failed: %s", sym, exc)
+                errors.append(f"OVERLAY_CLOSE_ERROR:{sym}:{exc}")
+
+        zero_residual = len(self.state.carry_positions) == 0 and len(self.state.overlay_positions) == 0
+        self._persist_state_now()
+        return {
+            "closed_carry": closed_carry,
+            "closed_overlay": closed_overlay,
+            "errors": errors,
+            "zero_residual": bool(zero_residual),
+        }
 
     def format_status_table(self, plan: dict[str, Any]) -> str:
         """Định dạng bảng trạng thái đối soát thuần ASCII (mọi ord(ch) < 128, không emoji)."""

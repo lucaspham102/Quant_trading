@@ -79,6 +79,10 @@ class BinanceHttpError(RuntimeError):
 CREDENTIAL_EXPECTED_LENGTH: int = 64
 
 
+class SpotValuationPriceMissingError(RuntimeError):
+    """Khong the dinh gia tai san Spot dang nam giu vi thieu gia thi truong hop le."""
+
+
 def _mask_secret(value: str | None) -> str:
     """Mo ta trang thai khoa an danh: KHONG BAO GIO lo gia tri that."""
     if not value:
@@ -1817,7 +1821,124 @@ class BinanceSignedTestnetClient:
             "events": events,
         }
 
+    def place_spot_market_order(self, symbol: str, side: str, quantity: float, timeout_sec: float = 10.0) -> dict[str, Any]:
+        """Sprint 23: dat lenh MARKET tren Spot (ky HMAC, khong dry-run khi client dry_run=False)."""
+        req = self.build_order_request(VENUE_SPOT, symbol, str(side).upper(), float(quantity), order_type="MARKET")
+        result = self.submit_signed_order(VENUE_SPOT, req, timeout_sec=timeout_sec)
+        result.setdefault("executedQty", 0.0)
+        result.setdefault("avgPrice", 0.0)
+        return result
+
+    def place_futures_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False, timeout_sec: float = 10.0) -> dict[str, Any]:
+        """Sprint 23: dat lenh MARKET tren USDS-M Futures (ho tro reduceOnly khi dong vi the)."""
+        req = self.build_order_request(VENUE_FUTURES, symbol, str(side).upper(), float(quantity), order_type="MARKET", reduce_only=bool(reduce_only))
+        result = self.submit_signed_order(VENUE_FUTURES, req, timeout_sec=timeout_sec)
+        result.setdefault("executedQty", 0.0)
+        result.setdefault("avgPrice", 0.0)
+        return result
+
     def fetch_exchange_reconcile_snapshot(
+        self,
+        symbols: list[str],
+        prices: dict[str, float] | None = None,
+        mock_responses: dict | None = None,
+        timeout_sec: float = 5.0,
+        universe_symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Sprint 23: snapshot doi soat kem Self-Healing Spot Valuation Guard (backfill gia thieu)."""
+        prices = dict(prices or {})
+        snap = self._fetch_exchange_reconcile_snapshot_raw(
+            symbols, prices, mock_responses, timeout_sec, universe_symbols
+        )
+        if not isinstance(snap, dict) or not snap.get("snapshot_healthy"):
+            return snap
+
+        # Sprint 23: Self-Healing Spot Valuation Guard.
+        # Neu gia thieu/khong hop le cho symbol dang co so du Spot hoac vi the Perp,
+        # tu dong backfill bang bookTicker (bid+ask)/2, fallback mark price cua Perp.
+        spot_balances_raw: dict[str, float] = dict(snap.get("spot_balances_raw") or {})
+        perp_positions_detail: list[dict[str, Any]] = list(snap.get("perp_positions_detail") or [])
+        universe_bases = {
+            str(s).split("/")[0].upper() for s in (snap.get("universe_symbols") or []) if "/" in str(s)
+        }
+        backfilled_price_symbols: list[str] = []
+        mark_price_by_base: dict[str, float] = {}
+        perp_qty_by_base: dict[str, float] = {}
+        for _item in perp_positions_detail:
+            _base = str(_item.get("symbol", "")).split("/")[0].upper()
+            if not _base:
+                continue
+            perp_qty_by_base[_base] = perp_qty_by_base.get(_base, 0.0) + abs(float(_item.get("qty", 0.0) or 0.0))
+            _mk = float(_item.get("mark_price", 0.0) or 0.0)
+            if _mk > 0.0:
+                mark_price_by_base[_base] = _mk
+
+        tracked_bases: set[str] = set(universe_bases)
+        for _raw in list(symbols or []):
+            _canon = normalize_symbol(str(_raw))
+            if "/" in _canon:
+                tracked_bases.add(_canon.split("/")[0].upper())
+        tracked_bases.update(perp_qty_by_base.keys())
+
+        for _base in sorted(tracked_bases):
+            _spot_qty = float(spot_balances_raw.get(_base, 0.0) or 0.0)
+            _perp_qty = float(perp_qty_by_base.get(_base, 0.0) or 0.0)
+            if abs(_spot_qty) <= 1e-12 and abs(_perp_qty) <= 1e-12:
+                continue
+            _canon_sym = f"{_base}/USDT:USDT"
+            _px = _lookup_price(prices, _canon_sym, _base)
+            if _px > 0.0:
+                prices[_canon_sym] = _px
+                continue
+            _resolved = 0.0
+            _ticker_fn = getattr(self, "fetch_book_ticker", None)
+            if callable(_ticker_fn) and not self.dry_run:
+                for _venue in (VENUE_SPOT, VENUE_FUTURES):
+                    try:
+                        _tk = _ticker_fn(f"{_base}USDT", venue=_venue)
+                    except Exception:  # noqa: BLE001 - fallback xuong mark price
+                        continue
+                    if not isinstance(_tk, dict):
+                        continue
+                    _bid = _safe_float(_tk.get("bid"))
+                    _ask = _safe_float(_tk.get("ask"))
+                    if _bid > 0.0 and _ask > 0.0:
+                        _resolved = (_bid + _ask) / 2.0
+                    elif _safe_float(_tk.get("mid")) > 0.0:
+                        _resolved = _safe_float(_tk.get("mid"))
+                    if _resolved > 0.0:
+                        break
+            if _resolved <= 0.0:
+                _resolved = float(mark_price_by_base.get(_base, 0.0) or 0.0)
+            if _resolved > 0.0:
+                prices[_canon_sym] = _resolved
+                backfilled_price_symbols.append(_canon_sym)
+            elif abs(_spot_qty) > 1e-8:
+                raise SpotValuationPriceMissingError(
+                    f"Missing valid market price to value non-zero Spot holding for {_canon_sym} (qty={_spot_qty})"
+                )
+
+        # Sprint 23: tinh lai spot_cash_usd SAU backfill de khong bao RECONCILE_EQUITY_MISMATCH gia tao.
+        _recomputed_spot_cash_usd = 0.0
+        for _asset, _free_val in spot_balances_raw.items():
+            if _free_val <= 0.0:
+                continue
+            if _is_cash_asset(_asset):
+                _recomputed_spot_cash_usd += _free_val
+                continue
+            _px_asset = _lookup_price(prices, normalize_symbol(_asset), _asset)
+            if _px_asset > 0.0:
+                _recomputed_spot_cash_usd += _free_val * _px_asset
+        snap["spot_cash_usd"] = float(_recomputed_spot_cash_usd)
+        snap["exchange_equity_usd"] = float(
+            snap["spot_cash_usd"]
+            + float(snap.get("perp_wallet_balance_usd", 0.0) or 0.0)
+            + float(snap.get("perp_unrealized_pnl_usd", 0.0) or 0.0)
+        )
+        snap["backfilled_price_symbols"] = list(backfilled_price_symbols)
+        return snap
+
+    def _fetch_exchange_reconcile_snapshot_raw(
         self,
         symbols: list[str],
         prices: dict[str, float],
