@@ -113,7 +113,9 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         overlay_target_vol_ann=0.075,
         overlay_gross_pct=0.15,
         max_futures_leverage=3.0,
-        enable_yield_stacking=False,
+        # Sprint 25.1: yield stacking is tracked but never folded into `pure_trading_*`,
+        # so reporting it costs nothing and gives the operator full visibility.
+        enable_yield_stacking=True,
     ),
     "canary_400": StrategyProfileConfig(
         name="canary_400",
@@ -151,7 +153,7 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         overlay_target_vol_ann=0.075,
         overlay_gross_pct=0.15,
         max_futures_leverage=2.8,
-        enable_yield_stacking=False,
+        enable_yield_stacking=True,
     ),
     "alpha_boost_1k": StrategyProfileConfig(
         name="alpha_boost_1k",
