@@ -25,6 +25,8 @@ import time
 from typing import Any, Mapping, Sequence
 import urllib.request
 
+import pandas as pd
+
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -39,6 +41,14 @@ from src.binance_signed_client import (
 from src.carry_live_executor import CarryLiveExecutor
 from src.config import TradingConfig
 from src.cross_exchange_carry import LIQUID_8_SYMBOLS
+from src.directional_trend_sleeve import (
+    DrawdownCircuitBreakerConfig,
+    TrendSleeveConfig,
+    TrendSleeveState,
+    compute_triple_confirmed_trend_weights,
+    evaluate_drawdown_circuit_breaker,
+    trend_weights_to_target_qty,
+)
 from src.dynamic_carry_basis import DynamicCarryConfig
 from src.exchange_reconciler import (
     compute_testnet_delta_snapshot,
@@ -53,6 +63,21 @@ from src.strategy_profiles import (
 
 CARRY_FEE_RATE = (7.5 + 5.0) / 10000.0
 OVERLAY_FEE_RATE = 5.0 / 10000.0
+
+#: Perp taker fee applied to every Trend sleeve delta (same 5.0 bps as the overlay leg).
+TREND_FEE_RATE = 5.0 / 10000.0
+
+#: Lot step per symbol for quantity quantization (Binance USD-M / Spot filters).
+DEMO_LOT_STEPS: dict[str, float] = {
+    "BTC/USDT:USDT": 0.001,
+    "ETH/USDT:USDT": 0.001,
+    "SOL/USDT:USDT": 0.01,
+    "BNB/USDT:USDT": 0.001,
+    "LINK/USDT:USDT": 0.01,
+    "AVAX/USDT:USDT": 0.01,
+    "XRP/USDT:USDT": 1.0,
+    "DOGE/USDT:USDT": 1.0,
+}
 
 #: Binance Spot bookTicker endpoint (public, read-only). The USDT-M feed lives in
 #: ``src.binance_public_feed`` and only covers Perp, hence this second leg.
@@ -192,6 +217,7 @@ def _default_ledger(profile: str | StrategyProfileConfig) -> dict[str, Any]:
         "fees_paid_usd": 0.0,
         "funding_pnl_usd": 0.0,
         "overlay_pnl_usd": 0.0,
+        "trend_pnl_usd": 0.0,
         "basis_pnl_usd": 0.0,
         "spot_unrealized_pnl_usd": 0.0,
         "perp_unrealized_pnl_usd": 0.0,
@@ -207,8 +233,16 @@ def _default_ledger(profile: str | StrategyProfileConfig) -> dict[str, Any]:
         "carry_slots": 0,
         "overlay_long_usd": 0.0,
         "overlay_short_usd": 0.0,
+        "trend_long_usd": 0.0,
+        "trend_gross_usd": 0.0,
         "futures_leverage": 0.0,
         "status": "INIT",
+        "circuit_breaker_state": "DISABLED",
+        "circuit_breaker_risk_scale": 1.0,
+        "circuit_breaker_triggers": 0,
+        "trend_hard_lock_bars": None,
+        "trend_sleeve_state": {"peak_close": {}, "active": {}},
+        "last_trend_rebalance_ts": None,
         "note": "",
     }
 
@@ -219,6 +253,7 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         "fees_paid_usd",
         "funding_pnl_usd",
         "overlay_pnl_usd",
+        "trend_pnl_usd",
         "basis_pnl_usd",
         "spot_unrealized_pnl_usd",
         "perp_unrealized_pnl_usd",
@@ -229,7 +264,10 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         "max_dd_pct",
         "overlay_long_usd",
         "overlay_short_usd",
+        "trend_long_usd",
+        "trend_gross_usd",
         "futures_leverage",
+        "circuit_breaker_risk_scale",
     )
     for k in float_keys:
         fallback = default_capital if k in (
@@ -245,12 +283,29 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         ledger[k] = None if raw is None else _num(raw, 0.0)
     ledger["reconcile_status"] = str(ledger.get("reconcile_status", "NOT_APPLICABLE"))
 
+    # The hard-stop cooldown counter is also tri-state: None when no hard stop is in effect.
+    _lock_raw = ledger.get("trend_hard_lock_bars", None)
+    ledger["trend_hard_lock_bars"] = None if _lock_raw is None else int(_num(_lock_raw, 0.0))
+
     ledger["cycle"] = int(_num(ledger.get("cycle"), 0.0))
     ledger["carry_slots"] = int(_num(ledger.get("carry_slots"), 0.0))
     ledger["profile"] = str(ledger.get("profile", ""))
     ledger["mode"] = str(ledger.get("mode", "SHADOW_LIVE"))
     ledger["status"] = str(ledger.get("status", "INIT"))
     ledger["note"] = str(ledger.get("note", ""))
+    ledger["circuit_breaker_state"] = str(ledger.get("circuit_breaker_state", "DISABLED"))
+    ledger["circuit_breaker_triggers"] = int(_num(ledger.get("circuit_breaker_triggers"), 0.0))
+    ledger["last_trend_rebalance_ts"] = (
+        None
+        if ledger.get("last_trend_rebalance_ts") is None
+        else str(ledger.get("last_trend_rebalance_ts"))
+    )
+    raw_trend_state = ledger.get("trend_sleeve_state")
+    ledger["trend_sleeve_state"] = (
+        raw_trend_state
+        if isinstance(raw_trend_state, dict)
+        else {"peak_close": {}, "active": {}}
+    )
 
     raw_prices = ledger.get("last_prices")
     if isinstance(raw_prices, dict):
@@ -568,6 +623,7 @@ def accrue_cycle_accounting(
     elif latest_funding_dt > prev_funding_dt:
         funding_delta = 0.0
         overlay_funding_delta = 0.0
+        trend_funding_delta = 0.0
         for key, pos in pos_map.items():
             if not isinstance(pos, dict):
                 continue
@@ -590,9 +646,17 @@ def accrue_cycle_accounting(
                 ov_f = -signed_usd * rate
                 funding_delta += ov_f
                 overlay_funding_delta += ov_f
+            elif kind == "trend":
+                # Long perp leg PAYS funding when the rate is positive. Use mark notional
+                # (qty * mid) so the number matches the backtest convention exactly, even
+                # though the stored signed_usd is a cost basis.
+                trend_f = -qty * mid * rate
+                funding_delta += trend_f
+                trend_funding_delta += trend_f
         ledger["funding_pnl_usd"] = _num(ledger.get("funding_pnl_usd"), 0.0) + funding_delta
         ledger["realized_pnl_usd"] = _num(ledger.get("realized_pnl_usd"), 0.0) + funding_delta
         ledger["overlay_pnl_usd"] = _num(ledger.get("overlay_pnl_usd"), 0.0) + overlay_funding_delta
+        ledger["trend_pnl_usd"] = _num(ledger.get("trend_pnl_usd"), 0.0) + trend_funding_delta
         ledger["last_funding_ts"] = latest_funding_iso
 
     prev_updated_dt = _parse_iso_utc(ledger.get("updated_at"))
@@ -604,6 +668,7 @@ def accrue_cycle_accounting(
 
     unrealized_carry = 0.0
     unrealized_overlay = 0.0
+    unrealized_trend = 0.0
     basis_total = 0.0
     spot_unreal_total = 0.0
     perp_unreal_total = 0.0
@@ -633,6 +698,9 @@ def accrue_cycle_accounting(
         elif kind == "overlay":
             if entry > 0.0 and mid > 0.0:
                 unrealized_overlay += signed_usd * (mid / entry - 1.0)
+        elif kind == "trend":
+            if entry > 0.0 and mid > 0.0:
+                unrealized_trend += signed_usd * (mid / entry - 1.0)
 
     ledger["basis_pnl_usd"] = basis_total
     ledger["spot_unrealized_pnl_usd"] = spot_unreal_total
@@ -645,7 +713,7 @@ def accrue_cycle_accounting(
     )
 
     realized = _num(ledger.get("realized_pnl_usd"), 0.0)
-    unrealized_total = unrealized_carry + unrealized_overlay
+    unrealized_total = unrealized_carry + unrealized_overlay + unrealized_trend
     pure_eq = _num(profile.capital_usd, 1000.0) + realized + unrealized_total
     yield_eq = pure_eq + _num(ledger.get("cumulative_passive_yield_usd"), 0.0)
 
@@ -661,12 +729,15 @@ def accrue_cycle_accounting(
 
 
 def _snapshot_key(sym: str, kind: str) -> str:
-    """Ledger key for one leg: carry keeps the plain symbol, overlay is namespaced.
+    """Ledger key for one leg: carry keeps the plain symbol, the others are namespaced.
 
-    A symbol can be held by both sleeves at once (e.g. BTC carry + BTC overlay short),
-    so the two legs must never share one ledger slot.
+    Carry, overlay and trend can each hold the SAME symbol at the same time
+    (e.g. BTC carry + BTC overlay short + BTC trend long), so no two sleeves may
+    ever share one ledger slot.
     """
-    return str(sym) if kind == "carry" else f"{sym}|overlay"
+    if kind == "carry":
+        return str(sym)
+    return f"{sym}|{kind}"
 
 
 def _pos_symbol(key: str, pos: dict[str, Any]) -> str:
@@ -833,6 +904,12 @@ def refresh_position_ledger(
                 "perp_entry": _num(perp_entry, 0.0),
             }
 
+    # ---- Sprint 26: trend legs are owned by apply_trend_sleeve (not by the executor), so
+    # they must survive the executor-driven rebuild of the snapshot.
+    for key, pos in prev.items():
+        if isinstance(pos, dict) and str(pos.get("kind", "carry")) == "trend":
+            new_snapshot[str(key)] = dict(pos)
+
     ledger["positions_snapshot"] = new_snapshot
     if charge_fees:
         ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
@@ -847,8 +924,8 @@ def _unrealized_from_snapshot(
     sym_map: dict[str, Any],
     last_prices: dict[str, float],
     snapshot: dict[str, Any] | None = None,
-) -> tuple[float, float]:
-    """Mark-to-market PnL split into (carry, overlay).
+) -> tuple[float, float, float]:
+    """Mark-to-market PnL split into (carry, overlay, trend).
 
     Carry marks the Spot leg against the Spot mid and the Perp leg against the Perp mark,
     so the residual is the real basis (0.0 only when Spot and Perp move identically).
@@ -856,8 +933,9 @@ def _unrealized_from_snapshot(
     spot_prices, perp_prices = dual_price_maps(snapshot)
     unreal_carry = 0.0
     unreal_overlay = 0.0
+    unreal_trend = 0.0
     if not isinstance(positions, dict):
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     for key, pos in positions.items():
         if not isinstance(pos, dict):
             continue
@@ -869,14 +947,18 @@ def _unrealized_from_snapshot(
         mid = _extract_mid_price(sym, sym_map, last_prices, entry)
         if mid <= 0.0:
             continue
-        if kind == "overlay":
+        if kind in ("overlay", "trend"):
             if entry <= 0.0:
                 continue
-            unreal_overlay += signed_usd * (mid / entry - 1.0)
+            marked = signed_usd * (mid / entry - 1.0)
+            if kind == "trend":
+                unreal_trend += marked
+            else:
+                unreal_overlay += marked
         elif kind == "carry":
             basis, _spot_u, _perp_u = carry_basis_pnl(pos, spot_prices, perp_prices, mid)
             unreal_carry += basis
-    return unreal_carry, unreal_overlay
+    return unreal_carry, unreal_overlay, unreal_trend
 
 
 def _mark_to_market(
@@ -888,7 +970,7 @@ def _mark_to_market(
 ) -> None:
     spot_prices, perp_prices = dual_price_maps(snapshot)
     positions = ledger.get("positions_snapshot", {}) or {}
-    unreal_carry, unreal_overlay = _unrealized_from_snapshot(
+    unreal_carry, unreal_overlay, unreal_trend = _unrealized_from_snapshot(
         positions, sym_map, last_prices, snapshot
     )
     basis_total = 0.0
@@ -914,6 +996,7 @@ def _mark_to_market(
         + _num(ledger.get("realized_pnl_usd"), 0.0)
         + unreal_carry
         + unreal_overlay
+        + unreal_trend
     )
     ledger["pure_trading_equity_usd"] = pure_eq
     ledger["yield_stacked_equity_usd"] = pure_eq + _num(
@@ -950,6 +1033,7 @@ def _update_exposure_metrics(
     carry_perp_notional = 0.0
     overlay_long_usd = 0.0
     overlay_short_usd = 0.0
+    trend_gross = 0.0
 
     if isinstance(pos_map, dict):
         for pos in pos_map.values():
@@ -969,16 +1053,278 @@ def _update_exposure_metrics(
                     overlay_long_usd += signed_usd
                 elif signed_usd < 0.0:
                     overlay_short_usd += abs(signed_usd)
+            elif kind == "trend":
+                trend_gross += abs(signed_usd)
 
     overlay_gross = overlay_long_usd + overlay_short_usd
     fut_wallet = _num(profile.futures_wallet_usd, 0.0)
     fut_lev = (
-        (carry_perp_notional + overlay_gross) / fut_wallet if fut_wallet > 0.0 else 0.0
+        (carry_perp_notional + overlay_gross + trend_gross) / fut_wallet
+        if fut_wallet > 0.0
+        else 0.0
     )
     ledger["carry_slots"] = int(carry_slots)
     ledger["overlay_long_usd"] = _num(overlay_long_usd, 0.0)
     ledger["overlay_short_usd"] = _num(overlay_short_usd, 0.0)
+    ledger["trend_gross_usd"] = _num(trend_gross, 0.0)
     ledger["futures_leverage"] = _num(fut_lev, 0.0)
+
+
+def apply_trend_sleeve(
+    ledger: dict[str, Any],
+    profile: StrategyProfileConfig,
+    aligned_universe: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+    *,
+    now_utc: datetime | None = None,
+    charge_fees: bool = True,
+) -> dict[str, Any]:
+    """Mark and rebalance the directional Trend sleeve (long Perp) on isolated keys.
+
+    Every Trend leg lives under ``"SYM|trend"`` inside ``positions_snapshot`` so a symbol can
+    be held by carry, overlay and trend simultaneously without any collision. Sizing is
+    inverse-volatility with a hard gross cap, then multiplied by the 2-tier drawdown circuit
+    breaker ``risk_scale`` (0.5 at -6%, 0.0 at -10% until the cooldown expires).
+    """
+    disabled = {
+        "state": "DISABLED",
+        "risk_scale": 1.0,
+        "n_orders": 0,
+        "turnover_notional": 0.0,
+        "fees_usd": 0.0,
+        "targets": {},
+        "positions": [],
+    }
+    if not bool(getattr(profile, "enable_trend_sleeve", False)):
+        ledger["circuit_breaker_state"] = "DISABLED"
+        ledger["trend_gross_usd"] = 0.0
+        return disabled
+    if not isinstance(aligned_universe, dict) or not aligned_universe:
+        return disabled
+
+    now = now_utc or datetime.now(timezone.utc)
+    capital = _num(profile.capital_usd, 1000.0)
+
+    # ---- 1) 2-tier drawdown circuit breaker on live mark-to-market equity
+    break_cfg = DrawdownCircuitBreakerConfig(
+        soft_dd_threshold_pct=float(profile.soft_dd_threshold_pct),
+        hard_dd_threshold_pct=float(profile.hard_dd_threshold_pct),
+    )
+    cur_eq = _num(ledger.get("pure_trading_equity_usd"), capital)
+    peak_eq = max(_num(ledger.get("peak_equity_usd"), capital), cur_eq)
+    ledger["peak_equity_usd"] = peak_eq
+    lock_bars = ledger.get("trend_hard_lock_bars")
+    lock_bars = None if lock_bars is None else int(_num(lock_bars, 0.0))
+    pending_bars = None if lock_bars is None else lock_bars + 1
+    cb = evaluate_drawdown_circuit_breaker(cur_eq, peak_eq, pending_bars, break_cfg)
+    if cb["state"] == "HARD_STOP_LOCKED":
+        if lock_bars is None:
+            ledger["circuit_breaker_triggers"] = (
+                int(_num(ledger.get("circuit_breaker_triggers"), 0.0)) + 1
+            )
+            ledger["trend_hard_lock_bars"] = 0
+        else:
+            ledger["trend_hard_lock_bars"] = int(pending_bars or 0)
+    else:
+        ledger["trend_hard_lock_bars"] = None
+    ledger["circuit_breaker_state"] = str(cb["state"])
+    ledger["circuit_breaker_risk_scale"] = _num(cb["risk_scale"], 1.0)
+
+    # ---- 2) Strictly causal signal: only bars up to the last one in the frame are read.
+    price_frame = pd.DataFrame()
+    for sym in sorted(aligned_universe):
+        df = aligned_universe[sym]
+        if df is None or getattr(df, "empty", True):
+            continue
+        col = "perp_close" if "perp_close" in df.columns else ("close" if "close" in df.columns else None)
+        if col is None:
+            continue
+        price_frame[str(sym)] = df[col].astype("float64")
+    if price_frame.empty:
+        return disabled
+    price_frame = price_frame.sort_index().ffill()
+
+    trend_cfg = TrendSleeveConfig(
+        capital_usd=capital,
+        target_vol_ann=float(profile.trend_target_vol_ann),
+        max_gross_pct=float(profile.trend_max_gross_pct),
+        rebalance_every_hours=int(profile.trend_rebalance_hours),
+        z_entry=float(profile.trend_z_entry),
+    )
+    state = TrendSleeveState.from_snapshot(ledger.get("trend_sleeve_state"))
+
+    last_reb = _parse_iso_utc(ledger.get("last_trend_rebalance_ts"))
+    rebalance_due = last_reb is None or (
+        (now - last_reb).total_seconds()
+        >= 3600.0 * int(trend_cfg.rebalance_every_hours)
+    )
+    weights = compute_triple_confirmed_trend_weights(
+        price_frame,
+        bar_index=len(price_frame) - 1,
+        config=trend_cfg,
+        state=state,
+        circuit_breaker=cb,
+        allow_new_entries=bool(rebalance_due),
+    )
+
+    # ---- 3) Execution price: snapshot Perp mark when available, else last close.
+    spot_prices, perp_prices = dual_price_maps(snapshot)
+    prices_now: dict[str, float] = {}
+    for sym in price_frame.columns:
+        px = _mark_from_map(perp_prices, sym, 0.0)
+        if px <= 0.0:
+            px = float(price_frame[sym].iloc[-1])
+        if math.isfinite(px) and px > 0.0:
+            prices_now[sym] = px
+
+    # ---- 4) Hard risk cap: trend notional may never exceed the free futures capacity.
+    pos_map = ledger.get("positions_snapshot", {}) or {}
+    used_notional = 0.0
+    has_trend_positions = False
+    for _key, pos in (pos_map.items() if isinstance(pos_map, dict) else []):
+        if not isinstance(pos, dict):
+            continue
+        _kind = str(pos.get("kind", "carry"))
+        if _kind in ("carry", "overlay"):
+            used_notional += abs(_num(pos.get("signed_usd"), 0.0))
+        elif _kind == "trend" and abs(_num(pos.get("qty"), 0.0)) > 0.0:
+            has_trend_positions = True
+    fut_capacity = max(
+        0.0,
+        _num(profile.futures_wallet_usd, 0.0) * _num(profile.max_futures_leverage, 1.0)
+        - used_notional,
+    )
+    desired_gross = float(sum(weights.values())) * capital
+    if desired_gross > 0.0 and desired_gross > fut_capacity:
+        shrink = fut_capacity / desired_gross
+        weights = {s: float(w) * shrink for s, w in weights.items()}
+
+    targets = (
+        trend_weights_to_target_qty(
+            weights, prices_now, capital, DEMO_LOT_STEPS, min_notional_usd=10.0
+        )
+        if weights
+        else {}
+    )
+    # The backtest only trades on rebalance bars, and the sleeve must not bleed 5 bps of
+    # taker fee every hour while inverse-vol sizing wobbles. So deltas are applied only
+    # when the rebalance clock fires, or immediately when the breaker / trailing stop
+    # demands a flat book.
+    risk_scale_now = _num(cb.get("risk_scale"), 1.0)
+    live_weights = any(float(w) > 0.0 for w in weights.values())
+    # Emergency flatten must never wait for the 24h clock: a hard-stopped breaker
+    # (risk_scale == 0) or an empty target set with positions still open both qualify.
+    force_flat = has_trend_positions and (risk_scale_now <= 0.0 or not live_weights)
+    if not rebalance_due and not force_flat:
+        ledger["trend_sleeve_state"] = state.snapshot()
+        ledger["trend_active_symbols"] = sorted(
+            s for s, is_on in (state.active or {}).items() if bool(is_on)
+        )
+        held = sorted(
+            _pos_symbol(str(k), v)
+            for k, v in (pos_map.items() if isinstance(pos_map, dict) else [])
+            if isinstance(v, dict) and str(v.get("kind", "carry")) == "trend"
+        )
+        return {
+            "state": str(cb["state"]),
+            "risk_scale": _num(cb["risk_scale"], 1.0),
+            "n_orders": 0,
+            "turnover_notional": 0.0,
+            "fees_usd": 0.0,
+            "targets": {},
+            "positions": held,
+            "held": True,
+        }
+
+    # ---- 5) Apply deltas on "SYM|trend" keys.
+    new_positions = dict(pos_map) if isinstance(pos_map, dict) else {}
+    existing_trend_syms = {
+        _pos_symbol(str(k), v)
+        for k, v in new_positions.items()
+        if isinstance(v, dict) and str(v.get("kind", "carry")) == "trend"
+    }
+    for sym in sorted(existing_trend_syms):
+        targets.setdefault(sym, 0.0)
+
+    fees = 0.0
+    turnover = 0.0
+    n_orders = 0
+    trend_realized = 0.0
+    realized = _num(ledger.get("realized_pnl_usd"), 0.0)
+    for sym in sorted(targets):
+        px = float(prices_now.get(sym, 0.0))
+        if px <= 0.0:
+            continue
+        key = _snapshot_key(sym, "trend")
+        old_pos = new_positions.get(key) if isinstance(new_positions.get(key), dict) else {}
+        old_qty = _num(old_pos.get("qty"), 0.0)
+        old_entry = _num(old_pos.get("entry_price"), 0.0)
+        new_qty = float(targets.get(sym, 0.0))
+        delta = new_qty - old_qty
+        if abs(delta) <= 1e-12:
+            continue
+        notional = abs(delta) * px
+        fee = notional * TREND_FEE_RATE if charge_fees else 0.0
+        fees += fee
+        turnover += notional
+        n_orders += 1
+        if charge_fees:
+            realized -= fee
+        if new_qty <= 0.0:
+            if old_qty > 0.0 and old_entry > 0.0:
+                closed_pnl = old_qty * (px - old_entry)
+                trend_realized += closed_pnl
+                realized += closed_pnl
+            new_positions.pop(key, None)
+            continue
+        if old_qty > 0.0 and old_entry > 0.0 and new_qty > old_qty:
+            entry_px = _vwap_entry(old_qty, old_entry, new_qty, px)
+        elif old_qty > 0.0 and old_entry > 0.0 and new_qty < old_qty:
+            closed_pnl = (old_qty - new_qty) * (px - old_entry)
+            trend_realized += closed_pnl
+            realized += closed_pnl
+            entry_px = old_entry
+        else:
+            entry_px = px
+        new_positions[key] = {
+            "symbol": sym,
+            "qty": float(new_qty),
+            "entry_price": float(entry_px),
+            "kind": "trend",
+            # Cost basis (qty * entry) so the unrealized mark qty*entry*(mid/entry - 1)
+            # is exactly qty*(mid - entry); using the live price here would mis-scale PnL.
+            "signed_usd": float(new_qty * entry_px),
+        }
+
+    ledger["positions_snapshot"] = new_positions
+    ledger["realized_pnl_usd"] = realized
+    if charge_fees:
+        ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
+    # Attribution: trend_pnl_usd must carry its own realised closes and its own fees,
+    # otherwise the scoreboard column silently under-reports the sleeve.
+    ledger["trend_pnl_usd"] = (
+        _num(ledger.get("trend_pnl_usd"), 0.0) + trend_realized - (fees if charge_fees else 0.0)
+    )
+    ledger["trend_sleeve_state"] = state.snapshot()
+    ledger["trend_active_symbols"] = sorted(
+        s for s, is_on in (state.active or {}).items() if bool(is_on)
+    )
+    if rebalance_due:
+        ledger["last_trend_rebalance_ts"] = now.isoformat()
+    held = sorted(
+        _pos_symbol(str(k), v)
+        for k, v in new_positions.items()
+        if isinstance(v, dict) and str(v.get("kind", "carry")) == "trend"
+    )
+    return {
+        "state": str(cb["state"]),
+        "risk_scale": _num(cb["risk_scale"], 1.0),
+        "n_orders": int(n_orders),
+        "turnover_notional": float(turnover),
+        "fees_usd": float(fees),
+        "targets": {str(k): float(v) for k, v in targets.items()},
+        "positions": held,
+    }
 
 
 def run_profile_cycle(
@@ -1030,6 +1376,16 @@ def run_profile_cycle(
                 ledger["note"] = (ledger.get("note") or "")[:120] + " fees_estimated"
             _mark_to_market(ledger, profile, sym_map, last_prices, snapshot)
 
+    # ---- Sprint 26: trend sleeve (long Perp on isolated "SYM|trend" ledger keys)
+    trend_result = apply_trend_sleeve(
+        ledger, profile, aligned_universe, snapshot, now_utc=now_utc, charge_fees=True
+    )
+    if trend_result.get("n_orders", 0) > 0 and not reconcile_failed:
+        sym_map_t = snapshot.get("symbols", {}) if isinstance(snapshot, dict) else {}
+        _mark_to_market(
+            ledger, profile, sym_map_t, ledger.setdefault("last_prices", {}), snapshot
+        )
+
     _update_exposure_metrics(ledger, profile)
 
     # ---- Sprint 25.1: real exchange-balance reconciliation (TESTNET_REAL only)
@@ -1067,6 +1423,12 @@ def run_profile_cycle(
         "realized_pnl_usd": _num(ledger["realized_pnl_usd"], 0.0),
         "funding_pnl_usd": _num(ledger["funding_pnl_usd"], 0.0),
         "overlay_pnl_usd": _num(ledger["overlay_pnl_usd"], 0.0),
+        "trend_pnl_usd": _num(ledger.get("trend_pnl_usd"), 0.0),
+        "trend_gross_usd": _num(ledger.get("trend_gross_usd"), 0.0),
+        "trend_active_symbols": ledger.get("trend_active_symbols", []),
+        "circuit_breaker_state": str(ledger.get("circuit_breaker_state", "DISABLED")),
+        "circuit_breaker_risk_scale": _num(ledger.get("circuit_breaker_risk_scale"), 1.0),
+        "circuit_breaker_triggers": int(_num(ledger.get("circuit_breaker_triggers"), 0.0)),
         "basis_pnl_usd": _num(ledger.get("basis_pnl_usd"), 0.0),
         "spot_unrealized_pnl_usd": _num(ledger.get("spot_unrealized_pnl_usd"), 0.0),
         "perp_unrealized_pnl_usd": _num(ledger.get("perp_unrealized_pnl_usd"), 0.0),
@@ -1096,12 +1458,14 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
         "Net PnL ($)",
         "Funding ($)",
         "Overlay PnL ($)",
+        "Trend PnL ($)",
         "Basis PnL ($)",
         "Fees ($)",
         "MaxDD (%)",
         "Carry Slots",
         "Overlay L/S ($)",
         "Fut Lev (x)",
+        "CB State",
         "Recon Eq ($)",
         "Drift ($)",
         "Recon",
@@ -1143,12 +1507,16 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
                 f"{net_pnl:+.2f}",
                 f"{funding:+.2f}",
                 f"{overlay_pnl:+.2f}",
+                f"{_num(r.get('trend_pnl_usd'), 0.0):+.2f}",
                 f"{basis_pnl:+.2f}",
                 f"{fees:.2f}",
                 f"{max_dd:.2f}",
                 f"{slots}",
                 f"+{ov_long:.0f}/-{ov_short:.0f}",
                 f"{fut_lev:.2f}x",
+                str(r.get("circuit_breaker_state", "DISABLED"))
+                .encode("ascii", errors="replace")
+                .decode("ascii")[:16],
                 recon_eq,
                 drift,
                 recon_status,
@@ -1595,6 +1963,13 @@ def main(argv: list[str] | None = None) -> int:
                         "realized_pnl_usd": _num(ledger.get("realized_pnl_usd"), 0.0),
                         "funding_pnl_usd": _num(ledger.get("funding_pnl_usd"), 0.0),
                         "overlay_pnl_usd": _num(ledger.get("overlay_pnl_usd"), 0.0),
+                        "trend_pnl_usd": _num(ledger.get("trend_pnl_usd"), 0.0),
+                        "circuit_breaker_state": str(
+                            ledger.get("circuit_breaker_state", "DISABLED")
+                        ),
+                        "circuit_breaker_triggers": int(
+                            _num(ledger.get("circuit_breaker_triggers"), 0.0)
+                        ),
                         "basis_pnl_usd": _num(ledger.get("basis_pnl_usd"), 0.0),
                         "spot_unrealized_pnl_usd": _num(
                             ledger.get("spot_unrealized_pnl_usd"), 0.0

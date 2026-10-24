@@ -32,6 +32,14 @@ from src.barbell_portfolio import (  # noqa: E402
 from src.cross_exchange_carry import LIQUID_8_SYMBOLS  # noqa: E402
 from src.dynamic_carry_basis import DynamicCarryConfig, build_carry_basis_scores  # noqa: E402
 from src.sprint7_eval import segment_metrics  # noqa: E402
+from src.directional_trend_sleeve import (  # noqa: E402
+    DrawdownCircuitBreakerConfig,
+    TrendSleeveConfig,
+    TrendSleeveState,
+    compute_triple_confirmed_trend_weights,
+    evaluate_drawdown_circuit_breaker,
+    trend_weights_to_target_qty,
+)
 from src.strategy_profiles import (  # noqa: E402
     PROFILE_REGISTRY,
     StrategyProfileConfig,
@@ -43,9 +51,19 @@ from src.strategy_profiles import (  # noqa: E402
 LOGGER = logging.getLogger("sprint25_tournament")
 
 DEFAULT_PROFILES = (
-    "default,baseline_1k,alpha_boost_1k,turbo_neutral_1k,alpha_boost_1k_pure_equal"
+    "baseline_1k,carry_max_eta_1k,hybrid_trend_conservative_1k,"
+    "hybrid_trend_balanced_1k,alpha_boost_1k,turbo_neutral_1k"
 )
 DEFAULT_SENSITIVITY_PROFILES = "baseline_1k,default"
+PROFILE_ORDER: tuple[str, ...] = (
+    "default",
+    "baseline_1k",
+    "carry_max_eta_1k",
+    "hybrid_trend_conservative_1k",
+    "hybrid_trend_balanced_1k",
+    "alpha_boost_1k",
+    "turbo_neutral_1k",
+)
 
 TOURNAMENT_LOT_STEPS: dict[str, float] = {
     "BTC/USDT:USDT": 0.001,
@@ -71,7 +89,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--start", type=str, default="2023-04-01")
     p.add_argument("--end", type=str, default="2026-10-19")
     p.add_argument("--raw-dir", type=str, default="data/raw")
-    p.add_argument("--out-json", type=str, default="logs/sprint25_1k_tournament_backtest.json")
+    p.add_argument("--out-json", type=str, default="logs/sprint26_high_return_evidence.json")
     p.add_argument("--holdout-days", type=int, default=181)
     p.add_argument("--warmup-hours", type=int, default=720)
     p.add_argument("--carry-cost-bps", type=float, default=12.5)
@@ -95,8 +113,7 @@ def _floor_to_step(qty: float, step: float) -> float:
 
 def build_tournament_profiles() -> dict[str, StrategyProfileConfig]:
     out: dict[str, StrategyProfileConfig] = {
-        n: PROFILE_REGISTRY[n]
-        for n in ("default", "baseline_1k", "alpha_boost_1k", "turbo_neutral_1k")
+        n: PROFILE_REGISTRY[n] for n in PROFILE_ORDER if n in PROFILE_REGISTRY
     }
     out["alpha_boost_1k_pure_equal"] = dataclasses.replace(
         PROFILE_REGISTRY["alpha_boost_1k"],
@@ -231,6 +248,39 @@ def simulate_profile(
     carry: dict[str, dict[str, float]] = {}
     overlay: dict[str, dict[str, float]] = {}
     carry_scale = 1.0
+    # ---- Sprint 26: directional trend sleeve + 2-tier drawdown circuit breaker
+    trend_enabled = bool(getattr(profile, "enable_trend_sleeve", False))
+    trend_cfg: TrendSleeveConfig | None = None
+    breaker_cfg = DrawdownCircuitBreakerConfig()
+    if trend_enabled:
+        trend_cfg = TrendSleeveConfig(
+            capital_usd=cap_usd,
+            target_vol_ann=float(profile.trend_target_vol_ann),
+            max_gross_pct=float(profile.trend_max_gross_pct),
+            rebalance_every_hours=int(profile.trend_rebalance_hours),
+            z_entry=float(profile.trend_z_entry),
+        )
+        breaker_cfg = DrawdownCircuitBreakerConfig(
+            soft_dd_threshold_pct=float(profile.soft_dd_threshold_pct),
+            hard_dd_threshold_pct=float(profile.hard_dd_threshold_pct),
+        )
+    trend_state = TrendSleeveState()
+    trend: dict[str, dict[str, float]] = {}
+    trend_pnl = 0.0
+    trend_peak_equity = cap_usd
+    trend_hard_lock_bars: int | None = None
+    trend_cb_state = "DISABLED"
+    trend_cb_triggers = 0
+    trend_cb_soft_activations = 0
+    trend_bars_soft = 0
+    trend_bars_hard = 0
+    trend_gross_sum = 0.0
+    trend_gross_n = 0
+    trend_rebalance_bars = max(1, int(getattr(profile, "trend_rebalance_hours", 24) or 24))
+    # Rolling window: 3x slow EMA la du de EMA(1440) hoi tu, dong thoi giu chi phi tinh toan
+    # trong tam kiem soat (moi lan tai can bang chi doc ~4,320 bar gan nhat).
+    trend_window = 3 * int(TrendSleeveConfig().ema_slow_hours)
+    perp_frame = market["perp_close"]
     funding_pnl = basis_pnl = overlay_pnl = fees = cum_yield = 0.0
     max_lev = 0.0
     cap_binds = 0
@@ -254,6 +304,10 @@ def simulate_profile(
                 d_pp = perp[t, sidx[s]] - perp[t - 1, sidx[s]]
                 if np.isfinite(d_pp):
                     overlay_pnl += pos["qty"] * d_pp
+            for s, pos in trend.items():
+                d_pp = perp[t, sidx[s]] - perp[t - 1, sidx[s]]
+                if np.isfinite(d_pp):
+                    trend_pnl += pos["qty"] * d_pp
 
         # Sprint 25 fix: harvest funding for positions held during the period ENDING at t
         # BEFORE any rebalance at t, otherwise a leg opened at close t would instantly collect
@@ -267,6 +321,14 @@ def simulate_profile(
                 f = fund[t, sidx[s]]
                 if np.isfinite(f):
                     overlay_pnl += -pos["usd"] * f
+            # Sprint 26 fix: a long Perp trend leg PAYS funding when the rate is positive,
+            # mirroring the overlay convention (-signed_usd * rate). Omitting it would hand
+            # the trend sleeve ~11%/yr of notional in fake alpha.
+            for s, pos in trend.items():
+                i = sidx[s]
+                f = fund[t, i]
+                if np.isfinite(f) and np.isfinite(perp[t, i]):
+                    trend_pnl += -pos["qty"] * perp[t, i] * f
 
         if traded and is_fund[t]:
             valid = [s for s in syms if _ok(perp[t, sidx[s]]) and _ok(spot[t, sidx[s]])]
@@ -402,9 +464,117 @@ def simulate_profile(
                 else:
                     overlay[s] = {"qty": new_q, "entry": px, "usd": new_q * px}
 
+        # ---- Sprint 26: 2-tier circuit breaker tren equity mark-to-market, roi moi tai can bang trend
+        if trend_enabled:
+            eq_now = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl - fees
+            trend_peak_equity = max(trend_peak_equity, eq_now)
+            pending_bars = None if trend_hard_lock_bars is None else trend_hard_lock_bars + 1
+            cb = evaluate_drawdown_circuit_breaker(
+                current_equity=eq_now,
+                peak_equity=trend_peak_equity,
+                bars_since_hard_stop=pending_bars,
+                cfg=breaker_cfg,
+            )
+            if cb["state"] == "HARD_STOP_LOCKED":
+                if trend_hard_lock_bars is None:
+                    trend_hard_lock_bars = 0
+                    trend_cb_triggers += 1
+                    # A hard stop is an emergency: flatten on the trigger bar itself instead
+                    # of waiting up to 24h for the next rebalance. Trend PnL already accrued
+                    # bar-by-bar, so only the exit fee is missing here.
+                    for s in sorted(trend):
+                        i = sidx[s]
+                        px = float(perp[t, i]) if np.isfinite(perp[t, i]) else 0.0
+                        if px > 0.0:
+                            fees += abs(trend[s]["qty"]) * px * cost_perp
+                        trend.pop(s, None)
+                    trend_state = TrendSleeveState()
+                else:
+                    trend_hard_lock_bars = pending_bars
+                trend_bars_hard += 1
+            else:
+                trend_hard_lock_bars = None
+                if cb["state"] == "SOFT_THROTTLE":
+                    if trend_cb_state != "SOFT_THROTTLE":
+                        trend_cb_soft_activations += 1
+                    trend_bars_soft += 1
+            trend_cb_state = str(cb["state"])
+        else:
+            cb = {"risk_scale": 1.0, "state": "DISABLED", "current_dd_pct": 0.0}
+            trend_cb_state = "DISABLED"
+
+        if trend_enabled and traded and trend_cfg is not None:
+            # Trend chi tai can bang moi `trend_rebalance_bars` bar (trailing stop duoc kiem tra
+            # cung nhip tai can bang nay de tranh O(n^2) tren 30k bar).
+            if (t - tstart) % trend_rebalance_bars == 0:
+                lo = max(0, t - trend_window)
+                window = perp_frame.iloc[lo : t + 1]
+                weights = compute_triple_confirmed_trend_weights(
+                    window,
+                    bar_index=len(window) - 1,
+                    config=trend_cfg,
+                    state=trend_state,
+                    circuit_breaker=cb,
+                    allow_new_entries=True,
+                )
+                prices_now = {
+                    s: float(perp[t, sidx[s]]) for s in syms if np.isfinite(perp[t, sidx[s]])
+                }
+                # Hard risk cap: trend notional khong duoc vuot cong suat futures con trong
+                # sau khi da tru carry perp + overlay gross (ton trong max_futures_leverage).
+                carry_notional_now = sum(
+                    p["qty"] * perp[t, sidx[s]]
+                    for s, p in carry.items()
+                    if np.isfinite(perp[t, sidx[s]])
+                )
+                overlay_gross_now = sum(abs(float(p.get("usd", 0.0))) for p in overlay.values())
+                fut_capacity = max(
+                    0.0,
+                    float(profile.futures_wallet_usd) * float(profile.max_futures_leverage)
+                    - carry_notional_now
+                    - overlay_gross_now,
+                )
+                desired_gross = float(sum(weights.values())) * cap_usd
+                if desired_gross > 0.0 and desired_gross > fut_capacity:
+                    scale = fut_capacity / desired_gross
+                    weights = {s: float(w) * scale for s, w in weights.items()}
+                targets = trend_weights_to_target_qty(
+                    weights, prices_now, cap_usd, TOURNAMENT_LOT_STEPS, min_notional_usd=10.0
+                )
+                for s in sorted(set(trend) | set(targets)):
+                    i = sidx[s]
+                    px = float(perp[t, i]) if np.isfinite(perp[t, i]) else 0.0
+                    if px <= 0.0:
+                        continue
+                    old_q = trend[s]["qty"] if s in trend else 0.0
+                    new_q = float(targets.get(s, 0.0))
+                    if new_q == old_q:
+                        continue
+                    fees += abs(new_q - old_q) * px * cost_perp
+                    if new_q <= 0.0:
+                        trend.pop(s, None)
+                    else:
+                        trend[s] = {"qty": new_q, "entry": px, "bar": float(t)}
+                if trend:
+                    gross_now = sum(
+                        p["qty"] * float(perp[t, sidx[s]])
+                        for s, p in trend.items()
+                        if np.isfinite(perp[t, sidx[s]])
+                    )
+                    trend_gross_sum += gross_now
+                    trend_gross_n += 1
+                    # Honest leverage telemetry: trend notional also sits on the futures
+                    # wallet, so the peak-leverage report must include it.
+                    fut_equity = float(profile.futures_wallet_usd)
+                    if fut_equity > 0.0:
+                        max_lev = max(
+                            max_lev,
+                            (carry_notional_now + overlay_gross_now + gross_now) / fut_equity,
+                        )
+
         k = t - start
         if traded:
-            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl - fees
+            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl - fees
             deployed = {
                 s: p["qty"] * spot[t, sidx[s]] for s, p in carry.items() if np.isfinite(spot[t, sidx[s]])
             }
@@ -423,6 +593,14 @@ def simulate_profile(
         "funding_pnl_usd": float(funding_pnl),
         "basis_pnl_usd": float(basis_pnl),
         "overlay_pnl_usd": float(overlay_pnl),
+        "trend_pnl_usd": float(trend_pnl),
+        "trend_enabled": bool(trend_enabled),
+        "circuit_breaker_triggers": int(trend_cb_triggers),
+        "circuit_breaker_soft_activations": int(trend_cb_soft_activations),
+        "circuit_breaker_bars_soft": int(trend_bars_soft),
+        "circuit_breaker_bars_hard": int(trend_bars_hard),
+        "final_circuit_breaker_state": str(trend_cb_state),
+        "avg_trend_gross_usd": float(trend_gross_sum / trend_gross_n) if trend_gross_n else 0.0,
         "fees_usd": float(fees),
         "net_pnl_usd": float(eq[-1] - cap_usd),
         "max_observed_futures_leverage": float(max_lev),
@@ -436,6 +614,7 @@ def simulate_profile(
             "n_overlay_rebalances": n_ov_rebal,
             "open_carry_symbols": sorted(carry),
             "open_overlay_symbols": sorted(overlay),
+            "open_trend_symbols": sorted(trend),
         },
     }
 
@@ -443,10 +622,19 @@ def simulate_profile(
 def _metrics(equity: pd.Series, capital: float) -> dict[str, float]:
     returns = equity.pct_change().fillna(0.0)
     seg = segment_metrics(returns, periods_per_year=8760, initial_capital=capital)
+    apr = float(seg["annualized_return_pct"])
+    maxdd = float(seg["maxdd_pct"])
+    downside = returns[returns < 0.0]
+    downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+    mean_ret = float(returns.mean()) if len(returns) else 0.0
+    sortino = float(mean_ret / downside_std * math.sqrt(8760.0)) if downside_std > 0.0 else 0.0
+    calmar = float(apr / maxdd) if maxdd > 0.0 else 0.0
     return {
-        "apr": float(seg["annualized_return_pct"]),
+        "apr": apr,
         "sharpe": float(seg["sharpe"]),
-        "maxdd": float(seg["maxdd_pct"]),
+        "sortino": float(sortino),
+        "calmar": float(calmar),
+        "maxdd": maxdd,
         "ret": float(seg["net_return_pct"]),
         "pnl": float(equity.iloc[-1] - capital),
     }
@@ -473,11 +661,15 @@ def evaluate_window(
     return {
         "pure_trading_net_apr_pct": pm["apr"],
         "pure_trading_sharpe": pm["sharpe"],
+        "pure_trading_sortino": pm["sortino"],
+        "pure_trading_calmar": pm["calmar"],
         "pure_trading_max_dd_pct": pm["maxdd"],
         "pure_trading_net_pnl_usd": pm["pnl"],
         "pure_trading_net_return_pct": pm["ret"],
         "yield_stacked_net_apr_pct": ym["apr"],
         "yield_stacked_sharpe": ym["sharpe"],
+        "yield_stacked_sortino": ym["sortino"],
+        "yield_stacked_calmar": ym["calmar"],
         "yield_stacked_max_dd_pct": ym["maxdd"],
         "yield_stacked_net_pnl_usd": ym["pnl"],
         "yield_stacked_net_return_pct": ym["ret"],
@@ -485,6 +677,13 @@ def evaluate_window(
         "funding_pnl_usd": sim["funding_pnl_usd"],
         "basis_pnl_usd": sim["basis_pnl_usd"],
         "overlay_pnl_usd": sim["overlay_pnl_usd"],
+        "trend_pnl_usd": sim["trend_pnl_usd"],
+        "circuit_breaker_triggers": sim["circuit_breaker_triggers"],
+        "circuit_breaker_soft_activations": sim["circuit_breaker_soft_activations"],
+        "circuit_breaker_bars_soft": sim["circuit_breaker_bars_soft"],
+        "circuit_breaker_bars_hard": sim["circuit_breaker_bars_hard"],
+        "final_circuit_breaker_state": sim["final_circuit_breaker_state"],
+        "avg_trend_gross_usd": sim["avg_trend_gross_usd"],
         "fees_usd": sim["fees_usd"],
         "max_observed_futures_leverage": sim["max_observed_futures_leverage"],
         "cap_bind_count": sim["cap_bind_count"],
@@ -522,7 +721,20 @@ def run_tournament(
         for sl in slices:
             s0, e0 = int(sl[0]), int(sl[-1]) + 1
             semi.append(evaluate_window(prof, market, max(0, s0 - warmup_hours), e0, s0))
-        out[name] = {"full": full, "holdout": hold, "semi_annual": semi}
+        positive_periods = sum(1 for w in semi if w["pure_trading_net_return_pct"] > 0.0)
+        n_periods = len(semi)
+        worst_period = min((w["pure_trading_net_return_pct"] for w in semi), default=0.0)
+        out[name] = {
+            "full": full,
+            "holdout": hold,
+            "semi_annual": semi,
+            "semi_annual_consistency": {
+                "positive_periods": int(positive_periods),
+                "n_periods": int(n_periods),
+                "win_rate_pct": float(positive_periods / n_periods * 100.0) if n_periods else 0.0,
+                "worst_period_pct": float(worst_period),
+            },
+        }
 
     names = list(out)
     best_pure = max(names, key=lambda k: out[k]["full"]["pure_trading_net_apr_pct"]) if names else None
@@ -535,16 +747,25 @@ def run_tournament(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "best_profile_by_pure_apr": best_pure,
         "best_profile_by_yield_stacked_apr": best_yield,
+        "evidence_schema_version": "sprint26",
+        "circuit_breaker_policy": {
+            "soft_dd_threshold_pct": 0.06,
+            "soft_dd_scale": 0.50,
+            "hard_dd_threshold_pct": 0.10,
+            "hard_dd_cooldown_bars": 168,
+            "applies_to": "trend_sleeve_and_overlay (carry market-neutral khong bi cat)",
+        },
     }
 
 
 def format_tournament_table(payload: dict[str, Any]) -> str:
     cols = [
         ("Profile", 26), ("Window", 8), ("Pure APR %", 11), ("Pure Sharpe", 11),
-        ("Pure MaxDD %", 12), ("Pure Net PnL $", 14), ("Yield APR %", 11),
+        ("Pure MaxDD %", 12), ("Pure Calmar", 11), ("Pure Sortino", 12),
+        ("Pure Net PnL $", 14), ("Yield APR %", 11),
         ("Yield Sharpe", 12), ("Yield MaxDD %", 13), ("Yield Net PnL $", 15),
         ("Funding $", 10), ("Overlay $", 10), ("Fees $", 9), ("Peak Fut Lev x", 14),
-        ("Cap Binds", 9),
+        ("Cap Binds", 9), ("Trend $", 9), ("CB H/S", 7),
     ]
     sep = "+" + "+".join("-" * (w + 2) for _, w in cols) + "+"
 
@@ -559,11 +780,17 @@ def format_tournament_table(payload: dict[str, Any]) -> str:
             rows.append(line([
                 name, label,
                 f"{r['pure_trading_net_apr_pct']:.2f}", f"{r['pure_trading_sharpe']:.2f}",
-                f"{r['pure_trading_max_dd_pct']:.2f}", f"{r['pure_trading_net_pnl_usd']:.2f}",
+                f"{r['pure_trading_max_dd_pct']:.2f}",
+                f"{r.get('pure_trading_calmar', 0.0):.2f}", f"{r.get('pure_trading_sortino', 0.0):.2f}",
+                f"{r['pure_trading_net_pnl_usd']:.2f}",
                 f"{r['yield_stacked_net_apr_pct']:.2f}", f"{r['yield_stacked_sharpe']:.2f}",
                 f"{r['yield_stacked_max_dd_pct']:.2f}", f"{r['yield_stacked_net_pnl_usd']:.2f}",
                 f"{r['funding_pnl_usd']:.2f}", f"{r['overlay_pnl_usd']:.2f}", f"{r['fees_usd']:.2f}",
                 f"{r['max_observed_futures_leverage']:.2f}", str(int(r["cap_bind_count"])),
+                f"{r.get('trend_pnl_usd', 0.0):.2f}",
+                # "hard triggers / soft activations" so a throttled run can never be
+                # misread as "the breaker never fired".
+                f"{int(r.get('circuit_breaker_triggers', 0))}/{int(r.get('circuit_breaker_soft_activations', 0))}",
             ]))
         rows.append(sep)
     rows.append("")
@@ -571,6 +798,15 @@ def format_tournament_table(payload: dict[str, Any]) -> str:
     for name, res in payload["profiles"].items():
         strip = " ".join(f"{w['pure_trading_net_return_pct']:8.2f}" for w in res["semi_annual"])
         rows.append(f"  {name:<26} {strip}")
+    rows.append("")
+    rows.append("Semi-annual consistency (pure):")
+    for name, res in payload["profiles"].items():
+        c = res.get("semi_annual_consistency", {})
+        rows.append(
+            f"  {name:<26} positive {int(c.get('positive_periods', 0))}/{int(c.get('n_periods', 0))}"
+            f"  win_rate {c.get('win_rate_pct', 0.0):6.2f}%"
+            f"  worst_6m {c.get('worst_period_pct', 0.0):8.2f}%"
+        )
     rows.append("")
     rows.append(f"Best by pure APR: {payload['best_profile_by_pure_apr']}")
     rows.append(f"Best by yield-stacked APR: {payload['best_profile_by_yield_stacked_apr']}")
