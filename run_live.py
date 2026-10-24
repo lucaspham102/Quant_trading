@@ -17,6 +17,7 @@ from src.notifier import TelegramNotifier
 from src.risk_manager import RiskManager
 from src.state_store import StateStore
 from src.strategy import Strategy
+from src.strategy_profiles import PROFILE_REGISTRY, get_strategy_profile
 
 
 class _OfflinePaperExchange:
@@ -160,14 +161,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--capital",
         type=float,
-        default=3000.0,
-        help="Mức vốn vận hành cho chiến lược carry (mặc định: 3000.0 USDT)",
+        default=None,
+        help="Mức vốn vận hành cho chiến lược carry (mặc định: 3000.0 USDT, hoặc capital_usd của --profile)",
     )
     parser.add_argument(
         "--execution-style",
         choices=("maker_taker_hedge", "real_taker"),
         default="maker_taker_hedge",
         help="Cơ chế khớp lệnh: maker_taker_hedge (mặc định Sprint 9) hoặc real_taker",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILE_REGISTRY.keys()),
+        default=None,
+        help="Sprint 25: chon profile van hanh (mac dinh None = Frozen Alpha 3.000 USDT)",
     )
     parser.add_argument(
         "--strategy-mode",
@@ -217,8 +224,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Đường dẫn JSON fixture cho shadow-live (không gọi mạng, dùng để test/CI)",
     )
-    return parser.parse_args(argv)
-
+    args = parser.parse_args(argv)
+    # Sprint 25: --capital khong truyen -> lay capital_usd cua profile (hoac 3.000 USDT).
+    if args.capital is None:
+        profile_cfg = get_strategy_profile(args.profile)
+        args.capital = float(profile_cfg.capital_usd)
+    return args
 
 def check_testnet_dual_credentials(environ: Mapping[str, str] | None = None) -> bool:
     """Sprint 22: Kiem tra ca spot lan futures testnet deu co du cap API key va secret.
@@ -1132,6 +1143,34 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 switch_rule="tier1b_buffer_rank",
                 eta_override=0.80,
             )
+            # Sprint 25: --profile != "default" -> ghi de tham so carry/overlay theo profile.
+            _profile_cfg = get_strategy_profile(args.profile)
+            _profile_is_default = args.profile is None or str(args.profile) == "default"
+            if not _profile_is_default:
+                overlay_cfg = dataclasses.replace(
+                    overlay_cfg,
+                    overlay_target_vol_ann=float(_profile_cfg.overlay_target_vol_ann),
+                    overlay_gross_leverage=min(0.50, float(_profile_cfg.overlay_gross_pct)),
+                )
+                carry_config = dataclasses.replace(
+                    carry_config,
+                    top_k=int(_profile_cfg.carry_top_k),
+                    entry_threshold=float(_profile_cfg.carry_entry_bps) * 1e-4,
+                    exit_threshold=float(_profile_cfg.carry_exit_bps) * 1e-4,
+                    min_hold_periods=int(_profile_cfg.carry_min_hold_bars),
+                    expected_hold_periods=int(_profile_cfg.carry_min_hold_bars),
+                    buffer_rank=int(_profile_cfg.carry_buffer_rank),
+                    eta_override=float(_profile_cfg.carry_eta),
+                )
+                logger.info(
+                    "Sprint 25 profile=%s | capital=%.2f | top_k=%d | eta=%.2f | tilt=%s | overlay_gross=%.2f",
+                    _profile_cfg.name,
+                    float(args.capital),
+                    int(_profile_cfg.carry_top_k),
+                    float(_profile_cfg.carry_eta),
+                    str(_profile_cfg.carry_weighting_mode),
+                    float(_profile_cfg.overlay_gross_pct),
+                )
             barbell_symbols = list(LIQUID_8_SYMBOLS)
             # Sprint 23: persistent/live -> dat lenh THAT qua BinanceSignedClient.
             _persistent = bool(getattr(args, "persistent_positions", False))
@@ -1169,6 +1208,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 signed_client=_real_client,
                 execute_real_orders=bool(_execute_real and _real_client is not None),
                 persistent_positions=_persistent,
+                profile=args.profile,
             )
             logger.info(
                 "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
