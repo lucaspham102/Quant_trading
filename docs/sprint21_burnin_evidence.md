@@ -883,3 +883,173 @@ _Log JSONL: `logs/sprint21_multi_cycle_burnin.jsonl`_
 
 _Log JSONL: `logs/sprint22_multi_cycle_burnin.jsonl`_
 
+# Sprint 21 - Multi-Cycle Testnet Burn-In Evidence
+
+- **Timestamp (UTC)**: `2026-10-23T14:03:46.646900+00:00`
+- **Verdict**: `PASS`
+- **Symbol**: `BTC/USDT:USDT`
+- **Universe**: 8 symbols (`BTC/USDT:USDT`, `ETH/USDT:USDT`, `SOL/USDT:USDT`, `BNB/USDT:USDT`, `DOGE/USDT:USDT`, `XRP/USDT:USDT`, `AVAX/USDT:USDT`, `LINK/USDT:USDT`)
+- **Secrets redacted**: `True`
+
+| Cycle | Name | OK | Reconcile | All 8 SYNCED | Equity Gap (USD) |
+|---|---|---|---|---|---|
+| 1 | Bootstrap & Reconcile | True | SYNCED | True | 0.0 |
+| 2 | Live Dual-Leg Execution & Mid-Cycle Audit | True | SYNCED | True | N/A |
+| 3 | Clean Flatten & Zero-Residual Verification | True | SYNCED | True | 0.0 |
+
+## Cycle Details
+
+### Cycle 1: Bootstrap & Reconcile
+
+```json
+{
+  "credential_check": "enforced_64_64",
+  "credentials_ok": true,
+  "credential_format": {
+    "spot": {
+      "ok": true,
+      "key_length": 64,
+      "secret_length": 64
+    },
+    "futures": {
+      "ok": true,
+      "key_length": 64,
+      "secret_length": 64
+    }
+  },
+  "server_time_offsets_ms": {
+    "spot": 2022,
+    "futures": 1893
+  },
+  "warmup_gate": {
+    "gate": "720h",
+    "warmup_hours": 720.0,
+    "required_hours": 720.0,
+    "ok": true
+  },
+  "snapshot_healthy": true,
+  "mid_price": 81982.005,
+  "reconcile_status": "SYNCED",
+  "all_8_symbols_synced": true,
+  "symbol_statuses": {
+    "AVAX/USDT:USDT": "SYNCED",
+    "BNB/USDT:USDT": "SYNCED",
+    "BTC/USDT:USDT": "SYNCED",
+    "DOGE/USDT:USDT": "SYNCED",
+    "ETH/USDT:USDT": "SYNCED",
+    "LINK/USDT:USDT": "SYNCED",
+    "SOL/USDT:USDT": "SYNCED",
+    "XRP/USDT:USDT": "SYNCED"
+  },
+  "equity_gap_usd": 0.0,
+  "untracked_spot_count": 504,
+  "bootstrap_baseline_symbols": 8,
+  "bootstrap_equity_usd": 486126306.2064973,
+  "pure_cash_and_margin_usd": 54998.56149729,
+  "reconcile_equity_usd": 54998.56149729
+}
+```
+
+### Cycle 2: Live Dual-Leg Execution & Mid-Cycle Audit
+
+```json
+{
+  "baseline_spot_qty": 1.0,
+  "baseline_perp_qty": 0.0,
+  "best_bid": 81982.0,
+  "best_ask": 81982.01,
+  "tick_size": 0.01,
+  "maker_pricing": {
+    "side": "BUY",
+    "best_bid": 81982.0,
+    "best_ask": 81982.01,
+    "tick_size": 0.01,
+    "spread_ticks": 1,
+    "improve_inside_spread": true,
+    "improved": false,
+    "mode": "TOUCH_BEST",
+    "price": 81982.0
+  },
+  "maker_buy_enabled": true,
+  "entry_status": "FILLED",
+  "spot_entry_order_id": 6192969,
+  "perp_entry_order_id": 28647898414,
+  "executed_qty": 0.001,
+  "perp_executed_qty": 0.001,
+  "fill_price": 81994.01,
+  "lot_neutrality": {
+    "passed": true,
+    "invariant_name": "LOT_NEUTRALITY",
+    "max_error": 0.0,
+    "imbalance_usd": 0.0,
+    "details": "[PASS] Lot neutrality verified: Leg A=81.99 USD, Leg B=81.99 USD, Imbalance=0.00 USD <= 10.00 USD."
+  },
+  "lot_neutral_ok": true,
+  "mid_reconcile_status": "SYNCED",
+  "mid_all_8_symbols_synced": true,
+  "mid_symbol_statuses": {
+    "AVAX/USDT:USDT": "SYNCED",
+    "BNB/USDT:USDT": "SYNCED",
+    "BTC/USDT:USDT": "SYNCED",
+    "DOGE/USDT:USDT": "SYNCED",
+    "ETH/USDT:USDT": "SYNCED",
+    "LINK/USDT:USDT": "SYNCED",
+    "SOL/USDT:USDT": "SYNCED",
+    "XRP/USDT:USDT": "SYNCED"
+  },
+  "futures_positions_verified": true,
+  "equity_drift_vs_initial_usd": -0.1360374093055725
+}
+```
+
+### Cycle 3: Clean Flatten & Zero-Residual Verification
+
+```json
+{
+  "maker_pricing": {
+    "side": "SELL",
+    "best_bid": 81994.0,
+    "best_ask": 81994.01,
+    "tick_size": 0.01,
+    "spread_ticks": 1,
+    "improve_inside_spread": true,
+    "improved": false,
+    "mode": "TOUCH_BEST",
+    "price": 81994.01
+  },
+  "maker_sell_enabled": true,
+  "exit_status": "FILLED",
+  "spot_exit_order_id": 6192981,
+  "perp_exit_order_id": 28647898498,
+  "exit_executed_qty": 0.001,
+  "exit_perp_executed_qty": 0.001,
+  "post_reconcile_status": "SYNCED",
+  "post_all_8_symbols_synced": true,
+  "post_symbol_statuses": {
+    "AVAX/USDT:USDT": "SYNCED",
+    "BNB/USDT:USDT": "SYNCED",
+    "BTC/USDT:USDT": "SYNCED",
+    "DOGE/USDT:USDT": "SYNCED",
+    "ETH/USDT:USDT": "SYNCED",
+    "LINK/USDT:USDT": "SYNCED",
+    "SOL/USDT:USDT": "SYNCED",
+    "XRP/USDT:USDT": "SYNCED"
+  },
+  "baseline_spot_qty": 1.0,
+  "baseline_perp_qty": 0.0,
+  "spot_qty_after": 1.0,
+  "perp_qty_after": 0.0,
+  "spot_residual_qty": 0.0,
+  "perp_residual_qty": 0.0,
+  "equity_gap_usd": 0.0,
+  "residual_tolerance_qty": 2e-06,
+  "zero_residual": true,
+  "equity_gap_zero": true,
+  "equity_drift_vs_initial_usd": -0.1706169843673706,
+  "drift_tolerance_usd": 2.0,
+  "equity_drift_ok": true
+}
+```
+
+_Log JSONL: `logs/sprint22_multi_cycle_burnin.jsonl`_
+
