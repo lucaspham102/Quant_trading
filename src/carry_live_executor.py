@@ -219,6 +219,7 @@ class CarryLiveExecutor:
         signed_client: Any = None,
         execute_real_orders: bool = False,
         persistent_positions: bool = False,
+        profile: Any = None,
     ) -> None:
         if mode not in ("paper", "live", "testnet"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper', 'live' hoac 'testnet'.")
@@ -239,6 +240,17 @@ class CarryLiveExecutor:
         else:
             self.capital = float(capital if capital is not None else carry_config.initial_capital)
         self.paper_leg1_fill_ratio: float = float(paper_leg1_fill_ratio)
+        # Sprint 25: strategy profile (1.000 USDT multi-profile engine).
+        # profile=None hoac "default" -> Frozen Alpha (3.000 USDT), KHONG doi tham so nao.
+        from src.strategy_profiles import get_strategy_profile
+
+        self.strategy_profile = get_strategy_profile(profile)
+        self.profile_name: str = str(getattr(self.strategy_profile, "name", "default"))
+        self.profile_active: bool = bool(
+            profile is not None and self.profile_name != "default"
+        )
+        if self.profile_active:
+            self.capital = float(self.strategy_profile.capital_usd)
         # Sprint 15: co Tier 1B - gate carry theo pure EMA funding (khop backtest Frozen Alpha).
         self.tier1b_gate: bool = bool(tier1b_gate)
         self.last_overlay_targets: dict[str, Any] = {}
@@ -333,6 +345,30 @@ class CarryLiveExecutor:
         self.eta_override: float = float(0.80 if _eta_raw is None else _eta_raw)
         # Sprint 23: top_k hieu luc cua chu ky (Canary 400 USDT -> 2 slot).
         self.effective_top_k: int = int(self.top_k)
+
+        # Sprint 25: tham so profile (chi khac Frozen Alpha khi profile_active=True).
+        self.carry_weighting_mode: str = "equal"
+        self.carry_tilt_alpha: float = 0.0
+        self.carry_max_single_weight: float = 0.55
+        self.max_futures_leverage: float = 3.0
+        self.futures_wallet_usd: float = float(
+            getattr(self.strategy_profile, "futures_wallet_usd", 0.0) or 0.0
+        )
+        self.spot_wallet_usd: float = float(
+            getattr(self.strategy_profile, "spot_wallet_usd", 0.0) or 0.0
+        )
+        self.overlay_gross_pct: float = float(
+            getattr(self.strategy_profile, "overlay_gross_pct", 0.15) or 0.15
+        )
+        self.overlay_target_vol_ann: float = float(
+            getattr(self.strategy_profile, "overlay_target_vol_ann", 0.075) or 0.075
+        )
+        # Sprint 25: vet ngan sach carry / cap vi Futures cua chu ky gan nhat.
+        self.last_carry_slot_notional: dict[str, float] = {}
+        self.last_split_wallet_cap: dict[str, Any] = {}
+        self.max_observed_futures_leverage: float = 0.0
+        if self.profile_active:
+            self._apply_profile_parameters(self.strategy_profile)
 
         if self.testnet_dry_state:
             # Sprint 22 Phase 9: Testnet executor runs with unauthenticated CCXT; positions in state
@@ -432,6 +468,87 @@ class CarryLiveExecutor:
             return 0.0
         precision = 8 if s < 0.001 else 6
         return float(round(n_steps * s, precision))
+
+    def _apply_profile_parameters(self, profile: Any) -> None:
+        """Sprint 25: ap tham so StrategyProfileConfig vao executor (khong dung cho 'default')."""
+        cfg = profile
+        try:
+            self.top_k = max(1, int(getattr(cfg, "carry_top_k", self.top_k)))
+            self.effective_top_k = int(self.top_k)
+            self.eta_override = float(getattr(cfg, "carry_eta", self.eta_override))
+        except (TypeError, ValueError):
+            logger.warning("Profile carry params khong hop le, giu nguyen cau hinh hien tai.")
+        try:
+            self.carry_config = dataclasses.replace(
+                self.carry_config,
+                top_k=int(getattr(cfg, "carry_top_k", self.top_k)),
+                min_hold_periods=int(getattr(cfg, "carry_min_hold_bars", 63)),
+                expected_hold_periods=int(getattr(cfg, "carry_min_hold_bars", 63)),
+                entry_threshold=float(getattr(cfg, "carry_entry_bps", 0.45)) * 1e-4,
+                exit_threshold=float(getattr(cfg, "carry_exit_bps", 0.0)) * 1e-4,
+                buffer_rank=int(getattr(cfg, "carry_buffer_rank", 3)),
+                eta_override=float(getattr(cfg, "carry_eta", 0.80)),
+                initial_capital=float(getattr(cfg, "capital_usd", self.capital)),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Carry config khong ho tro replace(), giu nguyen cau hinh goc.")
+        self.carry_weighting_mode = str(getattr(cfg, "carry_weighting_mode", "equal"))
+        self.carry_tilt_alpha = float(getattr(cfg, "carry_tilt_alpha", 0.0))
+        self.carry_max_single_weight = float(getattr(cfg, "carry_max_single_weight", 0.55))
+        self.max_futures_leverage = float(getattr(cfg, "max_futures_leverage", 3.0))
+        self.spot_wallet_usd = float(getattr(cfg, "spot_wallet_usd", 0.0))
+        self.futures_wallet_usd = float(getattr(cfg, "futures_wallet_usd", 0.0))
+        self.overlay_gross_pct = float(getattr(cfg, "overlay_gross_pct", 0.15))
+        self.overlay_target_vol_ann = float(getattr(cfg, "overlay_target_vol_ann", 0.075))
+        if self.overlay_config is not None:
+            try:
+                self.overlay_config = dataclasses.replace(
+                    self.overlay_config,
+                    initial_capital=float(getattr(cfg, "capital_usd", self.capital)),
+                    overlay_target_vol_ann=float(
+                        getattr(cfg, "overlay_target_vol_ann", 0.075)
+                    ),
+                    overlay_gross_leverage=min(
+                        0.50, float(getattr(cfg, "overlay_gross_pct", 0.15))
+                    ),
+                )
+            except (TypeError, ValueError):
+                logger.warning("Overlay config khong ho tro replace(), giu nguyen cau hinh goc.")
+
+    def _carry_funding_bps(
+        self,
+        aligned_universe: Optional[Mapping[str, Any]],
+        symbols: Sequence[str],
+    ) -> dict[str, float]:
+        """Sprint 25: funding rate gan nhat (bps/8h) tung symbol de tilt trong so carry."""
+        out: dict[str, float] = {}
+        if not aligned_universe:
+            return out
+        cols = (
+            "last_known_funding_rate",
+            "funding_rate_event",
+            "funding_event_binance",
+            "ewma_funding_binance",
+        )
+        for sym in symbols:
+            df = aligned_universe.get(sym)
+            out[sym] = 0.0
+            if df is None or getattr(df, "empty", True):
+                continue
+            for col in cols:
+                if col not in getattr(df, "columns", []):
+                    continue
+                try:
+                    raw = df[col].iloc[-1]
+                    if raw is None or not pd.notna(raw) or not np.isfinite(raw):
+                        continue
+                    val_bps = float(raw) * 10000.0
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if abs(val_bps) > 0.0:
+                    out[sym] = float(val_bps)
+                    break
+        return out
 
     def _resolve_effective_top_k(self, btc_price: float = 0.0) -> int:
         """Sprint 23: top_k hieu luc theo von (>=1500 USDT giu nguyen top_k cau hinh)."""
@@ -1279,6 +1396,33 @@ class CarryLiveExecutor:
         )
         top_syms = sorted_syms[:top_k]
         target_notional_carry = float(self.capital / float(top_k))
+        slot_notional_by_sym: dict[str, float] = {sym: target_notional_carry for sym in top_syms}
+        if getattr(self, "profile_active", False) and top_syms:
+            # Sprint 25: ngan sach Carry = capital * eta * ti le lap day slot,
+            # chia theo funding-tilted weights (khong slot nao vuot tran profile).
+            from src.strategy_profiles import compute_funding_tilted_weights
+
+            profile_eta = float(getattr(self, "eta_override", 0.80))
+            carry_budget = float(self.capital) * profile_eta * min(
+                len(top_syms) / float(max(1, top_k)), 1.0
+            )
+            funding_bps = self._carry_funding_bps(aligned_universe, top_syms)
+            weights = compute_funding_tilted_weights(
+                list(top_syms),
+                funding_bps,
+                mode=str(getattr(self, "carry_weighting_mode", "equal")),
+                tilt_alpha=float(getattr(self, "carry_tilt_alpha", 0.0)),
+                max_single_weight=float(getattr(self, "carry_max_single_weight", 0.55)),
+            )
+            cap_usd = max(
+                float(target_notional_carry),
+                carry_budget * float(getattr(self, "carry_max_single_weight", 0.55)),
+            )
+            for _sym in top_syms:
+                slot_notional_by_sym[_sym] = min(
+                    carry_budget * float(weights.get(_sym, 0.0)), cap_usd
+                )
+        self.last_carry_slot_notional = dict(slot_notional_by_sym)
 
         for sym in top_syms:
             df = aligned_universe.get(sym)
@@ -1286,7 +1430,9 @@ class CarryLiveExecutor:
                 p = float(df["perp_close"].iloc[-1] if "perp_close" in df.columns else df["close"].iloc[-1])
             else:
                 p = 0.0
-            q_qty, actual_notional = self.quantize_leg(sym, target_notional_carry, p)
+            q_qty, actual_notional = self.quantize_leg(
+                sym, float(slot_notional_by_sym.get(sym, target_notional_carry)), p
+            )
             if q_qty <= 0.0:
                 continue
             carry_allocations.append({
@@ -1336,6 +1482,46 @@ class CarryLiveExecutor:
                     continue
                 prices[sym] = price
                 target_notional_signed[sym] = float(w) * equity_now
+
+            # Sprint 25: tran don bay Futures tach vi (carry perp + overlay gross)
+            # khong duoc vuot futures_wallet_usd * max_futures_leverage.
+            if getattr(self, "profile_active", False):
+                from src.strategy_profiles import enforce_split_wallet_futures_cap
+
+                _carry_perp_notional = float(
+                    sum(float(a.get("notional", 0.0) or 0.0) for a in carry_allocations)
+                )
+                _desired_overlay_gross = float(
+                    sum(abs(float(v)) for v in target_notional_signed.values())
+                )
+                _futures_equity = float(getattr(self, "futures_wallet_usd", 0.0) or 0.0)
+                if _futures_equity > 0.0:
+                    _cap = enforce_split_wallet_futures_cap(
+                        _carry_perp_notional,
+                        _desired_overlay_gross,
+                        _futures_equity,
+                        float(getattr(self, "max_futures_leverage", 3.0)),
+                    )
+                    self.last_split_wallet_cap = dict(_cap)
+                    self.max_observed_futures_leverage = max(
+                        float(getattr(self, "max_observed_futures_leverage", 0.0) or 0.0),
+                        float(_cap.get("effective_futures_leverage", 0.0) or 0.0),
+                    )
+                    if _desired_overlay_gross > 0.0:
+                        _scale = float(
+                            _cap.get("allowed_overlay_gross_usd", _desired_overlay_gross)
+                        ) / _desired_overlay_gross
+                        if _scale < 1.0 - 1e-12:
+                            logger.warning(
+                                "Split-wallet cap: overlay gross %.2f -> %.2f USD (lev %.2fx, carry %.2f USD)",
+                                _desired_overlay_gross,
+                                float(_cap.get("allowed_overlay_gross_usd", 0.0)),
+                                float(_cap.get("effective_futures_leverage", 0.0)),
+                                _carry_perp_notional,
+                            )
+                            target_notional_signed = {
+                                s: float(v) * _scale for s, v in target_notional_signed.items()
+                            }
 
             # Sprint 16: sau khi floor lot-size tung ma, can lai 2 chan theo USD
             # de khong bao gio ro ri delta rong (1 lot BTC ~ 96.5 USD).
