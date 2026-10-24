@@ -9,6 +9,7 @@ Module cung cấp:
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import logging
@@ -1850,7 +1851,34 @@ class CarryLiveExecutor:
             result["spot_avg_price"] = _avg(spot_resp)
             result["spot_order_id"] = _oid(spot_resp)
 
+            try:
+                base_asset = symbol.split("/")[0].upper()
+                base_commission = 0.0
+                for _fill in (spot_resp.get("fills") or []):
+                    if isinstance(_fill, dict) and str(_fill.get("commissionAsset", "")).upper() == base_asset:
+                        base_commission += float(_fill.get("commission", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                base_commission = 0.0
+            net_spot_received = max(spot_filled - base_commission, 0.0)
+            result["net_spot_received_qty"] = float(net_spot_received)
+            if base_commission > 0.0:
+                logger.warning(
+                    "event=SPOT_FEE_DEDUCTED_FROM_BASE_ASSET symbol=%s base_commission=%s net_spot_received=%s",
+                    symbol, base_commission, net_spot_received,
+                )
+
+            # Sprint 24 FIX vong 2 (audit HIGH): hedge theo spot_filled (khong phai net).
+            # Ly do: floor(net_spot_received) co the mat TRON 1 lot step (vd BTC: ho 80 USD
+            # = 20% slot canary) trong khi over-hedge do phi base asset chi <= base_commission
+            # (<= 0.1% notional). Uu tien delta-neutral: hedge = floor(spot_filled).
             perp_qty = self._floor_to_step(spot_filled, common_step)
+            _over_hedge = float(perp_qty) - float(net_spot_received)
+            result["perp_over_hedge_qty"] = float(max(_over_hedge, 0.0))
+            if base_commission > 0.0 and _over_hedge > 1e-12:
+                logger.warning(
+                    "event=PERP_OVER_HEDGE_BY_FEE symbol=%s perp_qty=%s net_spot_received=%s over_hedge_qty=%s",
+                    symbol, perp_qty, net_spot_received, _over_hedge,
+                )
             perp_resp: Any = None
             perp_err: Any = None
             perp_filled_final = 0.0
@@ -1943,6 +1971,36 @@ class CarryLiveExecutor:
             spot_resp: Any = None
             spot_err: Any = None
             spot_filled_final = 0.0
+            requested_sell_qty = float(spot_qty)
+            free_fn = getattr(client, "get_spot_free_balance", None)
+            actual_free_qty: Optional[float] = None
+            if callable(free_fn):
+                try:
+                    _free_raw = free_fn(symbol)
+                    # Sprint 24 FIX (audit HIGH): None = KHONG biet so du (loi API/dry_run)
+                    # -> khong duoc coi la 0.0 (se bo qua vong dong vi the Spot that).
+                    actual_free_qty = None if _free_raw is None else float(_free_raw)
+                except Exception:  # noqa: BLE001
+                    actual_free_qty = None
+            if actual_free_qty is not None and actual_free_qty < requested_sell_qty:
+                clamped = self._floor_to_step(max(actual_free_qty, 0.0), common_step)
+                logger.warning(
+                    "event=SPOT_SELL_CLAMPED_TO_FREE_BALANCE symbol=%s requested_qty=%s actual_free_qty=%s clamped_sell_qty=%s",
+                    symbol, requested_sell_qty, actual_free_qty, clamped,
+                )
+                if clamped <= 0.0:
+                    logger.warning(
+                        "event=SPOT_FEE_DUST_UNSELLABLE_LOT symbol=%s requested_qty=%s actual_free_qty=%s",
+                        symbol, requested_sell_qty, actual_free_qty,
+                    )
+                    result["ok"] = True
+                    result["event"] = "ATOMIC_CLOSE_DUST_UNSELLABLE"
+                    result["reason"] = "SPOT_FEE_DUST_UNSELLABLE_LOT"
+                    result["perp_filled_qty"] = float(perp_filled)
+                    result["spot_filled_qty"] = 0.0
+                    result["dust_qty"] = float(max(actual_free_qty, 0.0))
+                    return result
+                spot_qty = clamped
             _can_poll_close = callable(getattr(client, "query_order", None))
             for _attempt in range(2):
                 try:
@@ -2006,13 +2064,47 @@ class CarryLiveExecutor:
         timestamp: Optional[str] = None,
     ) -> dict[str, Any]:
         """Sprint 23: gui lenh overlay perp that, rollback neu |Long - Short| vuot nguong."""
+        pre_overlay_positions = copy.deepcopy(dict(getattr(self.state, "overlay_positions", {}) or {}))
+        had_error = False
+        rollback_qty = 0.0
         try:
             client = self.signed_client
+
+            def _cur_signed(val: Any) -> float:
+                """Sprint 24 FIX (audit HIGH): state luu dict {qty, side} -> phai chuan hoa.
+
+                Truoc day float(current.get(...)) nem TypeError khi rebalance vi the co san.
+                """
+                if isinstance(val, dict):
+                    _q = abs(float(val.get("qty", 0.0) or 0.0))
+                    _side = str(val.get("side", "")).lower()
+                    return -_q if _side in ("short", "sell") else _q
+                try:
+                    return float(val or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            def _pos_now(sym: str) -> Optional[float]:
+                """Sprint 24: doc lai vi the perp that de biet lenh loi da khop chua."""
+                fn = getattr(client, "fetch_exchange_reconcile_snapshot", None)
+                if not callable(fn):
+                    return None
+                try:
+                    snap = fn([sym], {})
+                except Exception:  # noqa: BLE001
+                    return None
+                if not isinstance(snap, dict) or not bool(snap.get("snapshot_healthy", False)):
+                    return None
+                try:
+                    return float((snap.get("perp_positions") or {}).get(sym, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    return None
+
             planned: list[tuple[str, float, float, float]] = []
             skipped = 0
             for symbol in sorted(set(targets.keys()) | set(current.keys())):
                 target = float(targets.get(symbol, 0.0))
-                cur = float(current.get(symbol, 0.0))
+                cur = _cur_signed(current.get(symbol, 0.0))
                 delta = target - cur
                 price = float(prices.get(symbol, 0.0) or 0.0)
                 if abs(delta) < 1e-12 or price <= 0.0:
@@ -2025,9 +2117,11 @@ class CarryLiveExecutor:
             planned.sort(key=lambda t: 0 if abs(t[1]) <= 1e-12 else 1)
 
             orders: list[dict[str, Any]] = []
-            new_positions: dict[str, float] = {s: float(q) for s, q in current.items()}
+            unverified_symbols: list[str] = []
+            new_positions: dict[str, float] = {_s: _cur_signed(_q) for _s, _q in current.items()}
             entry_px: dict[str, float] = {}
-            fills: list[tuple[str, str, float]] = []
+            # (symbol, side, filled, mo_tu_flat?) - co flat moi duoc rollback reduce_only.
+            fills: list[tuple[str, str, float, bool]] = []
             turnover = 0.0
             for symbol, target, cur, qty_q in planned:
                 side = "BUY" if target > cur else "SELL"
@@ -2038,6 +2132,28 @@ class CarryLiveExecutor:
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Overlay real order failed for %s: %s", symbol, exc)
                     orders.append({"symbol": symbol, "side": side, "qty": qty_q, "status": "error", "error": str(exc)})
+                    had_error = True
+                    # Sprint 24 FIX (audit MEDIUM): timeout co the DA khop. Doc lai vi the
+                    # that; neu lech so voi truoc khi dat thi coi nhu da fill de rollback
+                    # phu du (tranh gui lai lenh trung o chu ky sau).
+                    _actual = _pos_now(symbol)
+                    if _actual is not None and abs(_actual - cur) > 1e-12:
+                        _delta = abs(_actual - cur)
+                        fills.append((symbol, side, _delta, abs(cur) <= 1e-12))
+                        new_positions[symbol] = float(_actual)
+                        turnover += _delta * float(prices.get(symbol, 0.0) or 0.0)
+                        logger.warning(
+                            "event=OVERLAY_LEG_VERIFIED_FILLED symbol=%s expected_cur=%s actual_pos=%s",
+                            symbol, cur, _actual,
+                        )
+                    elif _actual is None:
+                        # Sprint 24 FIX vong 2 (audit HIGH): khong doc duoc vi the that ->
+                        # KHONG duoc coi la rollback an toan (co the da khop -> orphan).
+                        unverified_symbols.append(symbol)
+                        logger.critical(
+                            "event=OVERLAY_LEG_UNVERIFIED symbol=%s side=%s qty=%s error=%s",
+                            symbol, side, qty_q, exc,
+                        )
                     continue
                 resp = resp if isinstance(resp, dict) else {}
                 filled = float(resp.get("executedQty", 0.0) or 0.0)
@@ -2071,11 +2187,28 @@ class CarryLiveExecutor:
                     "status": "filled" if filled > 0.0 else "unfilled",
                 })
                 if filled <= 0.0:
+                    # Sprint 24 FIX vong 2 (audit MEDIUM): lenh treo chua khop sau khi poll
+                    # -> huy de khong khop le sau do, va coi nhu loi (kich hoat rollback).
+                    _cancel = getattr(client, "cancel_order", None)
+                    if resp.get("orderId") is not None and callable(_cancel):
+                        try:
+                            _cancel("futures", symbol, resp.get("orderId"))
+                            logger.warning(
+                                "event=OVERLAY_PENDING_ORDER_CANCELED symbol=%s order_id=%s",
+                                symbol, resp.get("orderId"),
+                            )
+                        except Exception as cexc:  # noqa: BLE001
+                            logger.critical(
+                                "event=OVERLAY_CANCEL_FAILED symbol=%s order_id=%s error=%s",
+                                symbol, resp.get("orderId"), cexc,
+                            )
+                            unverified_symbols.append(symbol)
+                    had_error = True
                     continue
                 new_positions[symbol] = float(new_positions.get(symbol, 0.0)) + sign * filled
                 if avg_px > 0.0:
                     entry_px[symbol] = avg_px
-                fills.append((symbol, side, filled))
+                fills.append((symbol, side, filled, abs(cur) <= 1e-12))
                 turnover += filled * (avg_px if avg_px > 0.0 else float(prices.get(symbol, 0.0)))
 
             long_usd = 0.0
@@ -2088,17 +2221,52 @@ class CarryLiveExecutor:
                     short_usd += notional
             net_delta = long_usd - short_usd
             max_imb = float(getattr(self, "overlay_max_imbalance_usd", 10.0))
-            if abs(net_delta) > max_imb:
+            if had_error or (fills and abs(net_delta) > max_imb):
                 logger.error(
-                    "event=OVERLAY_LEG_ROLLBACK net_delta_usd=%.4f max_imbalance_usd=%.4f n_fills=%d",
+                    "event=OVERLAY_IMBALANCE_AUTO_ROLLBACK net_delta_usd=%.4f max_imbalance_usd=%.4f n_fills=%d",
                     net_delta, max_imb, len(fills),
                 )
-                for symbol, side, filled in fills:
+                # Sprint 24: rollback NGUOC thu tu truoc, roi moi khoi phuc state.
+                # Sprint 24 FIX (audit HIGH): reduce_only CHI dung khi leg mo tu flat.
+                # Leg giam/dong vi the cu ma rollback reduce_only=True se bi -2022 reject.
+                rollback_failures: list[str] = []
+                post_positions = dict(new_positions)
+                for symbol, side, filled, opened_from_flat in reversed(fills):
                     opposite = "SELL" if side == "BUY" else "BUY"
+                    sign = 1.0 if side == "BUY" else -1.0
                     try:
-                        client.place_futures_market_order(symbol, opposite, filled, reduce_only=True)
+                        client.place_futures_market_order(
+                            symbol, opposite, filled, reduce_only=bool(opened_from_flat)
+                        )
+                        rollback_qty += float(filled)
+                        post_positions[symbol] = float(post_positions.get(symbol, 0.0)) - sign * float(filled)
                     except Exception as rb_exc:  # noqa: BLE001
                         logger.critical("event=OVERLAY_ROLLBACK_FAILED symbol=%s error=%s", symbol, rb_exc)
+                        rollback_failures.append(symbol)
+                # Sprint 24 FIX (audit HIGH): chi khoi phuc snapshot khi rollback thanh cong HET.
+                # Neu rollback that bai, state phai phan anh vi the THAT (post_positions),
+                # neu khong se tao Phantom/Orphan (state cu nhung san da o vi the moi).
+                if not rollback_failures and not unverified_symbols:
+                    self.state.overlay_positions = copy.deepcopy(pre_overlay_positions)
+                else:
+                    if unverified_symbols:
+                        logger.critical(
+                            "event=OVERLAY_UNVERIFIED_POSITION symbols=%s", ",".join(unverified_symbols)
+                        )
+                    _restored: dict[str, Any] = {}
+                    for _sym, _q in post_positions.items():
+                        if abs(float(_q)) <= 1e-12:
+                            continue
+                        _restored[_sym] = {
+                            "qty": abs(float(_q)),
+                            "side": "long" if float(_q) > 0 else "short",
+                            "entry_price": float(entry_px.get(_sym, float(prices.get(_sym, 0.0) or 0.0))),
+                        }
+                    self.state.overlay_positions = _restored
+                    logger.critical(
+                        "event=OVERLAY_ROLLBACK_PARTIAL failed_symbols=%s", ",".join(rollback_failures)
+                    )
+                self._persist_state_now()
                 return {
                     "orders": orders,
                     "n_orders": int(len(orders)),
@@ -2106,7 +2274,15 @@ class CarryLiveExecutor:
                     "turnover_notional": float(turnover),
                     "functional": bool(self.executor_functional),
                     "net_delta_usd": float(net_delta),
-                    "status": "ROLLED_BACK",
+                    "status": (
+                        "UNVERIFIED_POSITION"
+                        if unverified_symbols
+                        else ("ROLLED_BACK" if not rollback_failures else "ROLLBACK_PARTIAL")
+                    ),
+                    "rollback_qty": float(rollback_qty),
+                    "rollback_failures": list(rollback_failures),
+                    "unverified_symbols": list(unverified_symbols),
+                    "restored_state": (not rollback_failures) and (not unverified_symbols),
                 }
 
             if fills:
@@ -2135,6 +2311,8 @@ class CarryLiveExecutor:
                 "functional": bool(self.executor_functional),
                 "net_delta_usd": float(net_delta),
                 "status": "OK",
+                "rollback_qty": 0.0,
+                "restored_state": False,
             }
         except Exception as exc:  # noqa: BLE001
             logger.error("Overlay real execution error: %s", exc)
@@ -3710,6 +3888,69 @@ class CarryLiveExecutor:
             f"Invariants: {'OK' if bool(diag.get('invariants_passed', True)) else 'FAIL'}"
         )
 
+    def close_all_persistent_overlay_positions(self, ref_prices: dict[str, float] | None = None) -> dict[str, Any]:
+        """Sprint 24: dong TOAN BO vi the overlay bang lenh reduce-only, xac nhan fill."""
+        closed_overlay: list[str] = []
+        errors: list[str] = []
+        if not self.execute_real_orders or self.signed_client is None:
+            self.state.overlay_positions = {}
+            self._persist_state_now()
+            return {"closed_overlay": [], "errors": ["DRY_STATE_CLEARED"], "zero_residual": True}
+
+        client = self.signed_client
+        for sym, pos in list((getattr(self.state, "overlay_positions", {}) or {}).items()):
+            try:
+                if isinstance(pos, dict):
+                    q = abs(float(pos.get("qty", 0.0)))
+                    is_short = str(pos.get("side", "")).lower() in ("short", "sell")
+                else:
+                    q = abs(float(pos))
+                    is_short = float(pos) < 0.0
+                if q <= 0.0:
+                    continue
+                resp = client.place_futures_market_order(sym, "BUY" if is_short else "SELL", q, reduce_only=True)
+                resp = resp if isinstance(resp, dict) else {}
+                filled = float(resp.get("executedQty", 0.0) or 0.0)
+                oid = resp.get("orderId")
+                qfn = getattr(client, "query_order", None)
+                if filled <= 0.0 and oid is not None and callable(qfn):
+                    for _ in range(6):
+                        time.sleep(0.4)
+                        try:
+                            polled = qfn("futures", sym, oid)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        filled = float((polled or {}).get("executedQty", 0.0) or 0.0)
+                        if filled > 0.0:
+                            break
+                # Sprint 24 FIX (audit HIGH): chi pop khi fill DU, neu khong se tao orphan.
+                if filled >= q - 1e-9:
+                    self.state.overlay_positions.pop(sym, None)
+                    closed_overlay.append(sym)
+                elif filled > 0.0:
+                    _remain = max(q - filled, 0.0)
+                    self.state.overlay_positions[sym] = {
+                        "qty": float(_remain),
+                        "side": "short" if is_short else "long",
+                        "entry_price": float(pos.get("entry_price", 0.0)) if isinstance(pos, dict) else 0.0,
+                    }
+                    logger.critical(
+                        "event=OVERLAY_CLOSE_PARTIAL symbol=%s requested=%s filled=%s remaining=%s",
+                        sym, q, filled, _remain,
+                    )
+                    errors.append(f"OVERLAY_CLOSE_PARTIAL:{sym}:remaining={_remain}")
+                else:
+                    errors.append(f"OVERLAY_CLOSE_UNCONFIRMED:{sym}")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("close_all overlay %s failed: %s", sym, exc)
+                errors.append(f"OVERLAY_CLOSE_ERROR:{sym}:{exc}")
+        self._persist_state_now()
+        return {
+            "closed_overlay": closed_overlay,
+            "errors": errors,
+            "zero_residual": len(self.state.overlay_positions) == 0,
+        }
+
     def close_all_persistent_positions(self, ref_prices: dict[str, float] | None = None) -> dict[str, Any]:
         """Sprint 23: dong TOAN BO vi the carry + overlay bang lenh that, tra audit dict."""
         closed_carry: list[str] = []
@@ -3736,6 +3977,13 @@ class CarryLiveExecutor:
                 if bool(res.get("ok", False)):
                     self.state.carry_positions.pop(sym, None)
                     closed_carry.append(sym)
+                    if str(res.get("event")) == "ATOMIC_CLOSE_DUST_UNSELLABLE":
+                        # Sprint 24: perp da flat nhung Spot con dust < 1 lot step (khong the
+                        # ban). Ghi evidence ro rang thay vi im lang.
+                        logger.warning(
+                            "event=SPOT_DUST_RETAINED symbol=%s dust_qty=%s", sym, res.get("dust_qty"),
+                        )
+                        errors.append(f"SPOT_DUST_UNSELLABLE:{sym}:{res.get('dust_qty')}")
                     self._persist_state_now()
                 else:
                     errors.append(f"CARRY_CLOSE_FAILED:{sym}:{res.get('reason')}")
@@ -3743,25 +3991,9 @@ class CarryLiveExecutor:
                 logger.error("close_all carry %s failed: %s", sym, exc)
                 errors.append(f"CARRY_CLOSE_ERROR:{sym}:{exc}")
 
-        for sym, pos in list((getattr(self.state, "overlay_positions", {}) or {}).items()):
-            try:
-                if isinstance(pos, dict):
-                    q = abs(float(pos.get("qty", 0.0)))
-                    is_short = str(pos.get("side", "")).lower() in ("short", "sell")
-                else:
-                    q = abs(float(pos))
-                    is_short = float(pos) < 0.0
-                if q <= 0.0:
-                    self.state.overlay_positions.pop(sym, None)
-                    continue
-                self.signed_client.place_futures_market_order(sym, "BUY" if is_short else "SELL", q, reduce_only=True)
-                self.state.overlay_positions.pop(sym, None)
-                closed_overlay.append(sym)
-                self._persist_state_now()
-            except Exception as exc:  # noqa: BLE001
-                logger.error("close_all overlay %s failed: %s", sym, exc)
-                errors.append(f"OVERLAY_CLOSE_ERROR:{sym}:{exc}")
-
+        _ov = self.close_all_persistent_overlay_positions(prices)
+        closed_overlay = list(_ov.get("closed_overlay") or [])
+        errors.extend(list(_ov.get("errors") or []))
         zero_residual = len(self.state.carry_positions) == 0 and len(self.state.overlay_positions) == 0
         self._persist_state_now()
         return {
