@@ -120,6 +120,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(/api/v3/account + /fapi/v2/account + /fapi/v2/positionRisk) roi doi soat truoc khi mo lenh.",
     )
     parser.add_argument(
+        "--persistent-positions",
+        action="store_true",
+        default=False,
+        help="Sprint 23: mode testnet giu vi the that giua cac lan chay (testnet_dry_state=False), "
+        "dinh tuyen lenh that qua BinanceSignedClient. Khong truyen = giu nguyen hanh vi Sprint 22.",
+    )
+    parser.add_argument(
         "--skip-testnet-baseline",
         action="store_true",
         help="Sprint 22: Bo qua baseline-delta tren testnet, doi soat truc tiep tren raw snapshot",
@@ -472,6 +479,59 @@ def _run_reconcile_preflight(
     return report
 
 
+def _build_real_signed_client(args: argparse.Namespace) -> object:
+    """Sprint 23: dung BinanceSignedTestnetClient de dat lenh THAT (testnet persistent hoac mainnet live)."""
+    from src.binance_signed_client import (
+        DEFAULT_LIVE_RECV_WINDOW_MS,
+        BinanceSignedTestnetClient,
+        load_dotenv_testnet,
+    )
+
+    dry = bool(getattr(args, "dry_run_sign", False))
+    if str(getattr(args, "mode", "")) == "testnet":
+        try:
+            load_dotenv_testnet()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
+        client = BinanceSignedTestnetClient(dry_run=dry, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS)
+        try:
+            client.sync_server_time("both")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Testnet: sync_server_time loi (%s).", exc)
+        return client
+
+    # Mainnet live: chi dung khoa MAINNET rieng, khong bao gio nap .env.testnet.
+    # Sprint 23: thieu khoa mainnet -> KHONG dat lenh (fail-closed, khong crash daemon).
+    _sp_k = str(os.environ.get("BINANCE_SPOT_API_KEY", "") or "").strip()
+    _fu_k = str(os.environ.get("BINANCE_FUTURES_API_KEY", "") or "").strip()
+    if not _sp_k or not _fu_k:
+        logger.critical(
+            "Sprint 23: mode live nhung thieu BINANCE_SPOT_API_KEY / BINANCE_FUTURES_API_KEY "
+            "-> TAT dat lenh that (execute_real_orders=False)."
+        )
+        return None
+    try:
+        client = BinanceSignedTestnetClient(
+            dry_run=False,
+            recv_window=DEFAULT_LIVE_RECV_WINDOW_MS,
+            spot_base_url=str(os.environ.get("BINANCE_MAINNET_SPOT_BASE_URL", "https://api.binance.com")),
+            perp_base_url=str(os.environ.get("BINANCE_MAINNET_PERP_BASE_URL", "https://fapi.binance.com")),
+            spot_api_key=_sp_k,
+            spot_api_secret=str(os.environ.get("BINANCE_SPOT_API_SECRET", "") or ""),
+            futures_api_key=_fu_k,
+            futures_api_secret=str(os.environ.get("BINANCE_FUTURES_API_SECRET", "") or ""),
+            autoload_dotenv=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - thieu/sai khoa mainnet -> tat dat lenh
+        logger.critical("Sprint 23: khong tao duoc client mainnet (%s) -> tat dat lenh that.", exc)
+        return None
+    try:
+        client.sync_server_time("both")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Mainnet: sync_server_time loi (%s).", exc)
+    return client
+
+
 def _run_signed_snapshot_preflight(
     args: argparse.Namespace,
     executor: object,
@@ -484,7 +544,7 @@ def _run_signed_snapshot_preflight(
 
     Fail-closed: thieu khoa / loi mang / payload la -> report BLOCKED, khong mo lenh moi.
     """
-    auto_live = str(getattr(args, "mode", "")) == "testnet" and not getattr(
+    auto_live = str(getattr(args, "mode", "")) in ("testnet", "live") and not getattr(
         args, "reconcile_snapshot", None
     )
     if not (getattr(args, "live_snapshot", False) or auto_live):
@@ -523,16 +583,30 @@ def _run_signed_snapshot_preflight(
             load_dotenv_testnet,
         )
 
-        # Sprint 20: mode testnet luon nap `.env.testnet` + dong bo gio 2 venue.
+        # Sprint 23 FIX (audit HIGH): dung dung client theo mode. Mode live KHONG duoc
+        # nap `.env.testnet` va KHONG duoc tro ve endpoint testnet.
+        _exec_client = getattr(executor, "signed_client", None)
+        if _exec_client is not None:
+            client = _exec_client
+        elif str(getattr(args, "mode", "")) == "testnet":
+            # Sprint 20: mode testnet luon nap `.env.testnet` + dong bo gio 2 venue.
+            try:
+                load_dotenv_testnet()
+            except Exception as exc:  # thieu file la binh thuong
+                logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
+            # Sprint 19: recvWindow rong hon cho testnet that (bu do tre mang/offset gio).
+            client = BinanceSignedTestnetClient(
+                dry_run=False, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS
+            )
+        else:
+            return _blocked(
+                "SNAPSHOT_CREDENTIALS_MISSING",
+                "mode live: khong co signed_client mainnet (fail-closed)",
+            )
         try:
-            load_dotenv_testnet()
-        except Exception as exc:  # thieu file la binh thuong
-            logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
-        # Sprint 19: recvWindow rong hon cho testnet that (bu do tre mang/offset gio).
-        client = BinanceSignedTestnetClient(
-            dry_run=False, recv_window=DEFAULT_LIVE_RECV_WINDOW_MS
-        )
-        client.sync_server_time("both")
+            client.sync_server_time("both")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("sync_server_time loi (%s).", exc)
     except Exception as exc:  # thieu khoa -> fail-closed
         return _blocked("SNAPSHOT_CREDENTIALS_MISSING", str(exc))
 
@@ -548,7 +622,39 @@ def _run_signed_snapshot_preflight(
                 prices[sym] = px
                 break
 
-    snapshot = client.fetch_exchange_reconcile_snapshot(symbols, prices)
+    # Sprint 23: nap gia bookTicker cho TOAN BO universe TRUOC khi doi soat
+    # (ca mode testnet va live) de Spot holding khong bi dinh gia 0.0 USD.
+    try:
+        from src.exchange_reconciler import normalize_symbol as _norm_sym
+
+        _prefetch_symbols: list[str] = []
+        for _s in list(symbols):
+            _canon = _norm_sym(str(_s))
+            if _canon and _canon not in _prefetch_symbols:
+                _prefetch_symbols.append(_canon)
+        for _canon in _prefetch_symbols:
+            if float(prices.get(_canon, 0.0) or 0.0) > 0.0:
+                continue
+            _tick_fn = getattr(client, "fetch_book_ticker", None)
+            if not callable(_tick_fn):
+                break
+            try:
+                _tk = _tick_fn(_canon.split(":")[0].replace("/", "").replace("-", "").upper(), venue="spot")
+            except Exception as _tk_err:  # noqa: BLE001 - de guard cua client tu backfill
+                logger.warning("Preflight: bookTicker spot loi cho %s: %s", _canon, _tk_err)
+                continue
+            _mid = float((_tk or {}).get("mid") or (_tk or {}).get("bid") or (_tk or {}).get("ask") or 0.0)
+            if _mid > 0.0:
+                prices[_canon] = _mid
+    except Exception as _prefetch_err:  # noqa: BLE001
+        logger.warning("Preflight: khong nap duoc bang gia bookTicker: %s", _prefetch_err)
+
+    try:
+        snapshot = client.fetch_exchange_reconcile_snapshot(symbols, prices)
+    except Exception as exc:  # noqa: BLE001
+        if exc.__class__.__name__ == "SpotValuationPriceMissingError":
+            return _blocked("SPOT_VALUATION_PRICE_MISSING", str(exc))
+        raise
     if not bool(snapshot.get("snapshot_healthy", False)):
         return _blocked("SNAPSHOT_UNHEALTHY", str(snapshot.get("error", "unknown")))
 
@@ -1027,6 +1133,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 eta_override=0.80,
             )
             barbell_symbols = list(LIQUID_8_SYMBOLS)
+            # Sprint 23: persistent/live -> dat lenh THAT qua BinanceSignedClient.
+            _persistent = bool(getattr(args, "persistent_positions", False))
+            _execute_real = (args.mode == "live") or (args.mode == "testnet" and _persistent)
+            _real_client: Any = None
+            if _execute_real:
+                _real_client = _build_real_signed_client(args)
+                logger.info(
+                    "Sprint 23: execute_real_orders=True (mode=%s, persistent=%s) - lenh THAT duoc dinh tuyen.",
+                    args.mode, _persistent,
+                )
             logger.info(
                 "Universe: LIQUID-8 | Venues: %s | Lot quantization: ON", sorted(venues.keys())
             )
@@ -1049,7 +1165,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 strategy=strat,
                 tier1b_gate=True,
                 runtime_mode=args.mode,
-                testnet_dry_state=(args.mode == "testnet"),
+                testnet_dry_state=(args.mode == "testnet" and not _persistent),
+                signed_client=_real_client,
+                execute_real_orders=bool(_execute_real and _real_client is not None),
+                persistent_positions=_persistent,
             )
             logger.info(
                 "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
@@ -1084,6 +1203,17 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 interval_sec=float(args.interval_sec),
             )
 
+        # Sprint 23: persistent/live -> dat lenh THAT qua BinanceSignedClient.
+        _persistent = bool(getattr(args, "persistent_positions", False))
+        _execute_real = (args.mode == "live") or (args.mode == "testnet" and _persistent)
+        _real_client: Any = None
+        if _execute_real:
+            _real_client = _build_real_signed_client(args)
+            logger.info(
+                "Sprint 23: execute_real_orders=True (mode=%s, persistent=%s) - lenh THAT duoc dinh tuyen.",
+                args.mode, _persistent,
+            )
+
         # Sprint 22: Chot chan bao mat fail-closed chong ro ri lenh/key mainnet (chi goi o mode testnet)
         if args.mode == "testnet":
             for ex, ex_name in [(spot_exchange, "binance_spot"), (perp_exchange, "binance_perp")]:
@@ -1110,7 +1240,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             reset_state=bool(args.reset_state),
             strategy=strat,
             runtime_mode=args.mode,
-            testnet_dry_state=(args.mode == "testnet"),
+            testnet_dry_state=(args.mode == "testnet" and not _persistent),
+            signed_client=_real_client,
+            execute_real_orders=bool(_execute_real and _real_client is not None),
+            persistent_positions=_persistent,
         )
         logger.info(
             "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
