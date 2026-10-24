@@ -346,7 +346,11 @@ def _cycle1_bootstrap(
     fut_upnl = float(snapshot.get("perp_unrealized_pnl_usd", 0.0) or 0.0)
     pure_cash_and_margin = pure_spot_cash + fut_wallet + fut_upnl
     detail["pure_cash_and_margin_usd"] = float(pure_cash_and_margin)
-    detail["reconcile_equity_usd"] = float(pure_cash_and_margin)
+    recon_eq = snapshot.get("reconcile_equity_usd")
+    if recon_eq is not None:
+        detail["reconcile_equity_usd"] = float(recon_eq)
+    else:
+        detail["reconcile_equity_usd"] = float(pure_cash_and_margin)
 
     ok = bool(
         credential_ok

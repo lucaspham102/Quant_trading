@@ -1139,6 +1139,12 @@ class CarryLiveExecutor:
         scores_at_t: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Xây dựng phân bổ danh mục Barbell gồm 2 nhánh: carry_sleeve và tactical momentum_overlay."""
+        # Sprint 22 Phase 10: Reset last_overlay_delta o dau ham de khong bi luu gia tri cu neu chu ky sau bi block
+        self.last_overlay_delta = {
+            "long_usd": 0.0,
+            "short_usd": 0.0,
+            "net_delta_usd": 0.0,
+        }
         if not getattr(self, "trading_allowed", True):
             # Sprint 17: doi soat san chua khop -> khong mo vi the moi trong chu ky nay.
             logger.warning(
@@ -3223,13 +3229,8 @@ class CarryLiveExecutor:
                         else:
                             ov_long += _q * _px
                     if self.testnet_dry_state and ov_long == 0.0 and ov_short == 0.0:
-                        delta_rec = getattr(self, "last_overlay_delta", {}) or {}
-                        ov_long = float(delta_rec.get("long_usd", 0.0))
-                        ov_short = float(delta_rec.get("short_usd", 0.0))
-                        if ov_long == 0.0 and ov_short == 0.0:
-                            neut_rec = getattr(self, "last_overlay_neutrality", {}) or {}
-                            ov_long = float(neut_rec.get("long_usd", 0.0))
-                            ov_short = float(neut_rec.get("short_usd", 0.0))
+                        ov_long = float((self.last_overlay_delta or {}).get("long_usd", 0.0))
+                        ov_short = float((self.last_overlay_delta or {}).get("short_usd", 0.0))
                     logger.info(
                         "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s | Reconcile=%s",
                         iterations,

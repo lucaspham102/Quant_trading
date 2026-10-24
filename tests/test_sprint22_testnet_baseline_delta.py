@@ -935,7 +935,9 @@ def test_gate1_then_gate2_no_phantom_in_state(
         cycle_records = [r for r in gate1_records if "cycle" in r]
         assert len(cycle_records) >= 1
         assert cycle_records[0]["mode"] == "testnet"
-        # Sprint 22 Phase 10: overlay telemetry fallback in testnet_dry_state
+        # Sprint 22 Phase 10: overlay telemetry fallback in testnet_dry_state (OverlayGate: PASS)
+        assert cycle_records[0]["overlay_long_usd"] > 0.0
+        assert cycle_records[0]["overlay_short_usd"] > 0.0
         assert cycle_records[0]["overlay_long_usd"] == pytest.approx(360.0)
         assert cycle_records[0]["overlay_short_usd"] == pytest.approx(360.0)
         assert cycle_records[0]["overlay_net_delta_usd"] == pytest.approx(0.0)
@@ -962,6 +964,13 @@ def test_gate1_then_gate2_no_phantom_in_state(
         assert order_records[0]["status"] == "SENT"
         assert order_records[0]["testnet_order_ids"]["spot_entry_order_id"] == 6145739
         assert order_records[0]["testnet_order_ids"]["perp_entry_order_id"] == 28647724834
+
+        gate2_cycles = [r for r in gate2_records if "cycle" in r]
+        assert len(gate2_cycles) >= 1
+        assert gate2_cycles[0]["overlay_long_usd"] > 0.0
+        assert gate2_cycles[0]["overlay_short_usd"] > 0.0
+        assert gate2_cycles[0]["overlay_long_usd"] == pytest.approx(360.0)
+        assert gate2_cycles[0]["overlay_short_usd"] == pytest.approx(360.0)
 
 
 
