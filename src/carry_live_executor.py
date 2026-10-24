@@ -213,6 +213,8 @@ class CarryLiveExecutor:
         max_live_drawdown_pct: float = 0.06,
         min_notional_usd: float = 10.0,
         tier1b_gate: bool = False,
+        runtime_mode: Optional[str] = None,
+        testnet_dry_state: bool = False,
     ) -> None:
         if mode not in ("paper", "live", "testnet"):
             raise ValueError(f"Mode khong hop le: {mode!r}, phai la 'paper', 'live' hoac 'testnet'.")
@@ -310,6 +312,33 @@ class CarryLiveExecutor:
                 for k, v in self.state.carry_positions.items()
                 if isinstance(v, dict)
             }
+
+        self.runtime_mode: str = runtime_mode if runtime_mode is not None else str(mode)
+        self.testnet_dry_state: bool = bool(testnet_dry_state or (self.runtime_mode == "testnet"))
+
+        if self.testnet_dry_state:
+            # Sprint 22 Phase 9: Testnet executor runs with unauthenticated CCXT; positions in state
+            # from paper simulations must not pollute testnet live reconciliation.
+            cleared_any = False
+            if hasattr(self.state, "overlay_positions") and self.state.overlay_positions:
+                logger.info(
+                    "Testnet dry state: clearing %d unexecuted paper overlay positions from local state",
+                    len(self.state.overlay_positions),
+                )
+                self.state.overlay_positions = {}
+                cleared_any = True
+            if hasattr(self.state, "carry_positions") and self.state.carry_positions:
+                logger.info(
+                    "Testnet dry state: clearing %d unexecuted paper carry positions from local state",
+                    len(self.state.carry_positions),
+                )
+                self.state.carry_positions = {}
+                cleared_any = True
+            if cleared_any:
+                try:
+                    self.state_store.save(self.state)
+                except Exception as e:
+                    logger.warning("Could not persist sanitized testnet state: %s", e)
 
         self.executor_functional: bool = bool(getattr(self.state, "executor_functional", False))
         self.max_allowed_spread_bps: float = float(max_allowed_spread_bps)
@@ -1110,6 +1139,12 @@ class CarryLiveExecutor:
         scores_at_t: Optional[dict[str, float]] = None,
     ) -> dict[str, Any]:
         """Xây dựng phân bổ danh mục Barbell gồm 2 nhánh: carry_sleeve và tactical momentum_overlay."""
+        # Sprint 22 Phase 10: Reset last_overlay_delta o dau ham de khong bi luu gia tri cu neu chu ky sau bi block
+        self.last_overlay_delta = {
+            "long_usd": 0.0,
+            "short_usd": 0.0,
+            "net_delta_usd": 0.0,
+        }
         if not getattr(self, "trading_allowed", True):
             # Sprint 17: doi soat san chua khop -> khong mo vi the moi trong chu ky nay.
             logger.warning(
@@ -1185,6 +1220,11 @@ class CarryLiveExecutor:
         overlay_allocations: list[dict[str, Any]] = []
         overlay_active = False
         raw_snr_dispersion = 0.0
+        self.last_overlay_delta = {
+            "long_usd": 0.0,
+            "short_usd": 0.0,
+            "net_delta_usd": 0.0,
+        }
 
         if self.overlay_config is not None and self.tier1b_gate:
             # Sprint 15: overlay parity - dung dung cong thuc smooth_conviction Sprint 11.
@@ -1231,13 +1271,6 @@ class CarryLiveExecutor:
                 max_imbalance_usd=float(getattr(self, "overlay_max_imbalance_usd", 10.0)),
                 min_viable_leg_usd=_min_leg_usd,
             )
-            self.last_overlay_neutrality = {
-                "target_notional_by_symbol": dict(target_notional_signed),
-                "neutral_qty": dict(neutral_qty),
-                "min_viable_leg_usd": float(_min_leg_usd),
-                "adaptive": _min_leg_override is None,
-            }
-
             overlay_long_usd = 0.0
             overlay_short_usd = 0.0
             for sym, q in neutral_qty.items():
@@ -1260,6 +1293,14 @@ class CarryLiveExecutor:
                     if equity_now > 0.0
                     else 0.0,
                 })
+            self.last_overlay_neutrality = {
+                "target_notional_by_symbol": dict(target_notional_signed),
+                "neutral_qty": dict(neutral_qty),
+                "long_usd": float(overlay_long_usd),
+                "short_usd": float(overlay_short_usd),
+                "min_viable_leg_usd": float(_min_leg_usd),
+                "adaptive": _min_leg_override is None,
+            }
             self.last_overlay_delta = {
                 "long_usd": float(overlay_long_usd),
                 "short_usd": float(overlay_short_usd),
@@ -1556,20 +1597,21 @@ class CarryLiveExecutor:
                 status = "paper_filled"
 
             if status != "error":
-                if abs(target) > 0:
-                    self.state.overlay_positions[symbol] = {
-                        "qty": float(target),
-                        "side": "long" if target > 0 else ("short" if target < 0 else "flat"),
-                        "entry_price": float(price),
-                        "ts": str(timestamp or ""),
-                    }
-                else:
-                    close_ok = self._close_overlay_position_emergency(symbol)
-                    if close_ok:
-                        self.state.overlay_positions.pop(symbol, None)
+                if not self.testnet_dry_state:
+                    if abs(target) > 0:
+                        self.state.overlay_positions[symbol] = {
+                            "qty": float(target),
+                            "side": "long" if target > 0 else ("short" if target < 0 else "flat"),
+                            "entry_price": float(price),
+                            "ts": str(timestamp or ""),
+                        }
                     else:
-                        self.state.kill_switch_pending_close = True
-                        logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
+                        close_ok = self._close_overlay_position_emergency(symbol)
+                        if close_ok:
+                            self.state.overlay_positions.pop(symbol, None)
+                        else:
+                            self.state.kill_switch_pending_close = True
+                            logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
                 turnover_notional += float(notional_q)
 
             reason = "close" if abs(target) < 1e-12 else "delta_rebalance"
@@ -1703,6 +1745,7 @@ class CarryLiveExecutor:
     def fetch_latest_aligned_universe(self) -> dict[str, pd.DataFrame]:
         """Tải và đồng bộ dữ liệu cho toàn bộ rổ tài sản từ sàn hoặc cache Parquet."""
         universe: dict[str, pd.DataFrame] = {}
+        data_sources: dict[str, str] = {}
         has_exchanges = self.perp_exchange is not None and self.spot_exchange is not None
 
         for sym in self.symbols:
@@ -1710,6 +1753,7 @@ class CarryLiveExecutor:
                 try:
                     aligned = self._fetch_symbol_from_exchange(sym)
                     universe[sym] = aligned
+                    data_sources[sym] = "exchange"
                     continue
                 except Exception as e:
                     logger.warning(
@@ -1721,6 +1765,7 @@ class CarryLiveExecutor:
             try:
                 aligned = self._load_symbol_from_cache(sym)
                 universe[sym] = aligned
+                data_sources[sym] = "parquet"
             except FileNotFoundError:
                 if not has_exchanges:
                     raise FileNotFoundError(
@@ -1731,6 +1776,9 @@ class CarryLiveExecutor:
                         f"Failed live fetch and missing cache file for {sym} in {self.raw_data_dir}."
                     )
 
+        if data_sources:
+            summary_sources = ", ".join(f"{s}:{src}" for s, src in sorted(data_sources.items()))
+            logger.info("Aligned universe data sources: %s", summary_sources)
         return universe
 
     def audit_delta_drift(
@@ -2669,28 +2717,29 @@ class CarryLiveExecutor:
                         )
                         margin_alloc = max(0.0, (real_allocated - real_notional) - fee)
 
-                        self.state.carry_positions[sym] = {
-                            "symbol": sym,
-                            "spot_symbol": spot_sym,
-                            "qty": float(real_qty),
-                            "entry_spot_price": float(sp_curr),
-                            "entry_perp_price": float(pe_curr),
-                            "notional_usdt": float(real_notional),
-                            "margin_allocated_usdt": float(margin_alloc),
-                            "entry_time": timestamp_str,
-                            "periods_held": 0,
-                            "funding_collected_usdt": 0.0,
-                            "score_at_entry": float(metrics_at_t[sym]["score"]),
-                            "leg1_status": leg2_res.get("leg1_status", "FILLED"),
-                            "leg1_order_id": leg1_res.get("leg1_order_id"),
-                            "leg1_filled_qty": float(filled_qty),
-                            "leg2_hedged_qty": float(hedged_qty),
-                            "exchange_long": "binance_spot",
-                            "exchange_short": "binance",
-                            "capital": float(self.capital),
-                            "execution_state": leg2_res.get("execution_state", "HEDGED"),
-                        }
-                        self.state.current_equity -= fee
+                        if not self.testnet_dry_state:
+                            self.state.carry_positions[sym] = {
+                                "symbol": sym,
+                                "spot_symbol": spot_sym,
+                                "qty": float(real_qty),
+                                "entry_spot_price": float(sp_curr),
+                                "entry_perp_price": float(pe_curr),
+                                "notional_usdt": float(real_notional),
+                                "margin_allocated_usdt": float(margin_alloc),
+                                "entry_time": timestamp_str,
+                                "periods_held": 0,
+                                "funding_collected_usdt": 0.0,
+                                "score_at_entry": float(metrics_at_t[sym]["score"]),
+                                "leg1_status": leg2_res.get("leg1_status", "FILLED"),
+                                "leg1_order_id": leg1_res.get("leg1_order_id"),
+                                "leg1_filled_qty": float(filled_qty),
+                                "leg2_hedged_qty": float(hedged_qty),
+                                "exchange_long": "binance_spot",
+                                "exchange_short": "binance",
+                                "capital": float(self.capital),
+                                "execution_state": leg2_res.get("execution_state", "HEDGED"),
+                            }
+                            self.state.current_equity -= fee
                     else:
                         # Chan 1 khong khop: PHAI huy lenh treo truoc khi xoa state
                         cancel_ok = True
@@ -2727,28 +2776,29 @@ class CarryLiveExecutor:
                         self.spot_exchange.create_order(spot_sym, "market", "buy", spot_qty)
                         self.perp_exchange.create_order(sym, "market", "sell", perp_qty)
 
-                    self.state.carry_positions[sym] = {
-                        "symbol": sym,
-                        "spot_symbol": spot_sym,
-                        "qty": float(spot_qty),
-                        "entry_spot_price": float(sp_curr),
-                        "entry_perp_price": float(pe_curr),
-                        "notional_usdt": float(target_notional),
-                        "margin_allocated_usdt": float(margin_alloc),
-                        "entry_time": timestamp_str,
-                        "periods_held": 0,
-                        "funding_collected_usdt": 0.0,
-                        "score_at_entry": float(metrics_at_t[sym]["score"]),
-                        "leg1_status": "FILLED",
-                        "leg1_order_id": None,
-                        "leg1_filled_qty": float(spot_qty),
-                        "leg2_hedged_qty": float(perp_qty),
-                        "exchange_long": "binance_spot",
-                        "exchange_short": "binance",
-                        "capital": float(self.capital),
-                        "execution_state": "HEDGED",
-                    }
-                    self.state.current_equity -= fee
+                    if not self.testnet_dry_state:
+                        self.state.carry_positions[sym] = {
+                            "symbol": sym,
+                            "spot_symbol": spot_sym,
+                            "qty": float(spot_qty),
+                            "entry_spot_price": float(sp_curr),
+                            "entry_perp_price": float(pe_curr),
+                            "notional_usdt": float(target_notional),
+                            "margin_allocated_usdt": float(margin_alloc),
+                            "entry_time": timestamp_str,
+                            "periods_held": 0,
+                            "funding_collected_usdt": 0.0,
+                            "score_at_entry": float(metrics_at_t[sym]["score"]),
+                            "leg1_status": "FILLED",
+                            "leg1_order_id": None,
+                            "leg1_filled_qty": float(spot_qty),
+                            "leg2_hedged_qty": float(perp_qty),
+                            "exchange_long": "binance_spot",
+                            "exchange_short": "binance",
+                            "capital": float(self.capital),
+                            "execution_state": "HEDGED",
+                        }
+                        self.state.current_equity -= fee
 
         self.state.carry_last_reconcile_ts = timestamp_str
         self.state_store.save(self.state)
@@ -3145,6 +3195,12 @@ class CarryLiveExecutor:
             while True:
                 iterations += 1
                 try:
+                    hook = getattr(self, "cycle_preflight_hook", None)
+                    if callable(hook):
+                        try:
+                            hook(iterations)
+                        except Exception as hook_err:
+                            logger.warning("Cycle preflight hook error in cycle %d: %s", iterations, hook_err)
                     if getattr(self.state, "kill_switch_triggered", False) and getattr(self.state, "kill_switch_pending_close", False):
                         self._flush_pending_emergency_close()
                     plan = self.reconcile_once()
@@ -3172,6 +3228,9 @@ class CarryLiveExecutor:
                             ov_short += _q * _px
                         else:
                             ov_long += _q * _px
+                    if self.testnet_dry_state and ov_long == 0.0 and ov_short == 0.0:
+                        ov_long = float((self.last_overlay_delta or {}).get("long_usd", 0.0))
+                        ov_short = float((self.last_overlay_delta or {}).get("short_usd", 0.0))
                     logger.info(
                         "DASHBOARD [Cycle %d]: Capital=%.2f | Current Equity=%.2f | Peak Equity=%.2f | Drawdown=%.2f%% | Carry (Spot=%.2f vs Perp=%.2f) | Overlay (Long=%.2f vs Short=%.2f | NetDelta=%.2f) | Kill-Switch=%s | Reconcile=%s",
                         iterations,
@@ -3195,7 +3254,7 @@ class CarryLiveExecutor:
                       try:
                         _record = build_cycle_audit_record(
                             cycle=iterations,
-                            mode=str(self.mode),
+                            mode=str(getattr(self, "runtime_mode", None) or self.mode),
                             execution_style=str(self.execution_style),
                             capital=self.capital,
                             equity=cur_eq,

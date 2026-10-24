@@ -1976,11 +1976,13 @@ class BinanceSignedTestnetClient:
                     continue
                 untracked_spot_assets[asset] = float(free_val)
 
+            pure_cash_usd = 0.0
             spot_cash_usd = 0.0
             for asset, free_val in spot_balances_raw.items():
                 if free_val <= 0.0:
                     continue
                 if _is_cash_asset(asset):
+                    pure_cash_usd += free_val
                     spot_cash_usd += free_val
                 else:
                     canon_sym = normalize_symbol(asset)
@@ -2053,7 +2055,9 @@ class BinanceSignedTestnetClient:
                 "snapshot_healthy": True,
                 "snapshot_source": snapshot_source,
                 "spot_balances": spot_balances,
+                "spot_balances_raw": dict(spot_balances_raw),
                 "spot_cash_usd": float(spot_cash_usd),
+                "pure_cash_usd": float(pure_cash_usd),
                 "perp_wallet_balance_usd": float(perp_wallet_balance_usd),
                 "perp_unrealized_pnl_usd": float(perp_unrealized_pnl_usd),
                 "maint_margin_usd": float(maint_margin_usd),
@@ -2069,6 +2073,8 @@ class BinanceSignedTestnetClient:
                 "snapshot_healthy": False,
                 "error": f"Snapshot parse error: {exc}",
                 "spot_balances": {},
+                "spot_balances_raw": {},
+                "pure_cash_usd": 0.0,
                 "perp_positions": {},
                 "exchange_equity_usd": 0.0,
             }

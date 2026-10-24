@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from run_backtest import generate_synthetic_ohlcv
 from src.config import TradingConfig
@@ -120,6 +120,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(/api/v3/account + /fapi/v2/account + /fapi/v2/positionRisk) roi doi soat truoc khi mo lenh.",
     )
     parser.add_argument(
+        "--skip-testnet-baseline",
+        action="store_true",
+        help="Sprint 22: Bo qua baseline-delta tren testnet, doi soat truc tiep tren raw snapshot",
+    )
+    parser.add_argument(
+        "--reset-testnet-baseline",
+        action="store_true",
+        help="Sprint 22: Xoa va chup lai baseline testnet moi tu snapshot san hien tai",
+    )
+    parser.add_argument(
+        "--testnet-baseline-file",
+        default=None,
+        help="Sprint 22: Duong dan file testnet baseline (mac dinh: data/state/testnet_baseline.json)",
+    )
+    parser.add_argument(
         "--symbol",
         default="BTC/USDT:USDT",
         help="Cặp giao dịch (mặc định: BTC/USDT:USDT)",
@@ -132,7 +147,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--strategy",
         choices=("directional", "dynamic_carry", "barbell"),
-        default="directional",
+        default="barbell",
         help="Chiến lược vận hành: directional (mặc định), dynamic_carry, hoặc barbell (Sprint 9)",
     )
     parser.add_argument(
@@ -196,6 +211,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Đường dẫn JSON fixture cho shadow-live (không gọi mạng, dùng để test/CI)",
     )
     return parser.parse_args(argv)
+
+
+def check_testnet_dual_credentials(environ: Mapping[str, str] | None = None) -> bool:
+    """Sprint 22: Kiem tra ca spot lan futures testnet deu co du cap API key va secret.
+
+    Yeu cau bat buoc ca 2 venue; thieu 1 trong 2 tra ve False (khong chap nhan chi mot ben).
+    """
+    env = os.environ if environ is None else environ
+    has_spot = bool(
+        env.get("BINANCE_SPOT_TESTNET_API_KEY")
+        and env.get("BINANCE_SPOT_TESTNET_API_SECRET")
+    )
+    has_futures = bool(
+        env.get("BINANCE_FUTURES_TESTNET_API_KEY")
+        and env.get("BINANCE_FUTURES_TESTNET_API_SECRET")
+    )
+    return bool(has_spot and has_futures)
+
+
+def assert_exchange_credential_safety(exchange: Any, name: str) -> None:
+    """Sprint 22: Chot chan bao mat fail-closed chong ro ri lenh/key mainnet.
+
+    - Neu exchange co apiKey/secret: moi endpoint dang dung bat buoc phai chua 'testnet'.
+    - Neu exchange khong co apiKey/secret: duoc phep dung mainnet public (market data).
+    """
+    if exchange is None:
+        return
+    api_key = getattr(exchange, "apiKey", None)
+    secret = getattr(exchange, "secret", None)
+    has_creds = bool((api_key and str(api_key).strip()) or (secret and str(secret).strip()))
+
+    urls = getattr(exchange, "urls", {}) or {}
+    api_urls = urls.get("api", {}) if isinstance(urls, dict) else {}
+    if not isinstance(api_urls, dict):
+        api_urls = {"base": str(api_urls)}
+
+    target_endpoints: list[tuple[str, str]] = []
+    for k, v in api_urls.items():
+        k_str = str(k).lower()
+        if k_str.startswith("fapi") or k_str in ("public", "private", "v1", "v3", "spot", "base", "sapi"):
+            target_endpoints.append((str(k), str(v).lower()))
+
+    if has_creds:
+        if not target_endpoints:
+            raise RuntimeError(
+                f"CRITICAL_SECURITY_ABORT: Exchange {name} co credential nhung khong tim thay endpoint "
+                f"URL nao trong api_urls de kiem tra. Abort fail-closed!"
+            )
+        for ep_key, ep_url in target_endpoints:
+            if "testnet" not in ep_url:
+                raise RuntimeError(
+                    f"CRITICAL_SECURITY_ABORT: Exchange {name} co credential nhung endpoint {ep_key} "
+                    f"({ep_url}) khong phai testnet! Chan dung de bao ve tien that."
+                )
 
 
 def _load_shadow_fixture(fixture_path: Any) -> Any:
@@ -267,7 +336,7 @@ def _run_testnet_signing_preflight(args: argparse.Namespace, symbols: list[str])
     try:
         client = BinanceSignedTestnetClient(
             dry_run=dry_run,
-            recv_window=DEFAULT_RECV_WINDOW_MS if not dry_run else 5000,
+            recv_window=DEFAULT_LIVE_RECV_WINDOW_MS if not dry_run else 5000,
         )
     except BinanceCredentialsMissingError as e:
         logger.error("Testnet: %s", e)
@@ -421,7 +490,8 @@ def _run_signed_snapshot_preflight(
     if not (getattr(args, "live_snapshot", False) or auto_live):
         return None
     from src.cross_exchange_carry import EXCHANGE_LOT_SPECS
-    from src.exchange_reconciler import reconcile_portfolio_state
+    from src.carry_live_executor import append_audit_record
+    from src.exchange_reconciler import normalize_symbol, reconcile_portfolio_state
 
     def _blocked(status: str, message: str) -> dict:
         report = {
@@ -482,15 +552,101 @@ def _run_signed_snapshot_preflight(
     if not bool(snapshot.get("snapshot_healthy", False)):
         return _blocked("SNAPSHOT_UNHEALTHY", str(snapshot.get("error", "unknown")))
 
-    # Sprint 20: doi soat theo UNIVERSE dang chay (bo qua dust testnet).
-    snapshot = _scope_snapshot_to_symbols(snapshot, symbols)
+    is_testnet = str(getattr(args, "mode", "")) == "testnet"
 
+    # Sprint 20: doi soat theo UNIVERSE dang chay (bo qua dust testnet).
+    # Sprint 22: Chi giu CASH_ASSETS o mode testnet de theo doi pure_cash; mainnet giu nguyen pham vi.
+    snapshot = _scope_snapshot_to_symbols(snapshot, symbols, keep_cash=is_testnet)
+
+    # Sprint 22: Nap day du bang gia prices TRUOC KHI goi baseline/delta
     for item in snapshot.get("perp_positions_detail") or []:
         if isinstance(item, dict):
-            px = float(item.get("mark_price", 0.0) or 0.0)
-            sym = str(item.get("symbol") or "")
+            px = float(item.get("mark_price", item.get("markPrice", 0.0)) or 0.0)
+            sym = normalize_symbol(str(item.get("symbol", "")))
             if px > 0.0 and sym:
                 prices[sym] = px
+
+    # Fallback cho cac ma symbols chua co gia (vi du khi vi the perp dang phang = 0)
+    missing_price_symbols: list[str] = []
+    for sym in symbols:
+        canon_sym = normalize_symbol(sym)
+        if prices.get(canon_sym, 0.0) <= 0.0:
+            fetch_fn = getattr(client, "fetch_book_ticker", None)
+            if callable(fetch_fn):
+                try:
+                    spot_sym = canon_sym.split(":")[0].replace("/", "").replace("-", "").upper()
+                    ticker = fetch_fn(spot_sym, venue="spot")
+                    mid = float(ticker.get("mid") or ticker.get("bid") or ticker.get("ask") or 0.0)
+                    if mid > 0.0:
+                        prices[canon_sym] = mid
+                    else:
+                        missing_price_symbols.append(canon_sym)
+                except Exception as exc:
+                    logger.warning("Preflight: Loi khi lay book ticker spot cho %s: %s", canon_sym, exc)
+                    missing_price_symbols.append(canon_sym)
+            else:
+                missing_price_symbols.append(canon_sym)
+
+    if missing_price_symbols:
+        logger.warning(
+            "Preflight: Thieu gia thi truong cho cac symbols: %s",
+            missing_price_symbols,
+        )
+
+    # Sprint 22: Ap dung Baseline-Delta cho che do testnet (giu nguyen live/mainnet).
+    if is_testnet:
+        if getattr(args, "skip_testnet_baseline", False):
+            logger.warning(
+                "====================================================================\n"
+                "[WARNING] TESTNET BASELINE-DELTA IS SKIPPED (--skip-testnet-baseline)!\n"
+                "Reconcile will run against RAW exchange balances and faucet equity.\n"
+                "This mode is intended for DIAGNOSTICS ONLY and may trigger EQUITY_MISMATCH.\n"
+                "===================================================================="
+            )
+        else:
+            sp_k = str(os.environ.get("BINANCE_SPOT_TESTNET_API_KEY") or "").strip()
+            fu_k = str(os.environ.get("BINANCE_FUTURES_TESTNET_API_KEY") or "").strip()
+            if not sp_k or not fu_k:
+                raise RuntimeError(
+                    "CRITICAL_CREDENTIAL_ABORT: BINANCE_SPOT_TESTNET_API_KEY va BINANCE_FUTURES_TESTNET_API_KEY "
+                    "deu phai khac rong de tao baseline hash tren testnet. Abort fail-closed."
+                )
+            import hashlib
+            from src.exchange_reconciler import (
+                DEFAULT_TESTNET_BASELINE_PATH,
+                compute_testnet_delta_snapshot,
+                load_or_create_testnet_baseline,
+            )
+
+            k_hash = hashlib.sha256(f"{sp_k}:{fu_k}".encode("utf-8")).hexdigest()
+            baseline_file = getattr(args, "testnet_baseline_file", None)
+            baseline_path = Path(baseline_file) if baseline_file else DEFAULT_TESTNET_BASELINE_PATH
+            baseline = load_or_create_testnet_baseline(
+                snapshot=snapshot,
+                prices=prices,
+                api_key_hash=k_hash,
+                universe_symbols=symbols,
+                path=baseline_path,
+                reset_baseline=bool(getattr(args, "reset_testnet_baseline", False)),
+            )
+            if getattr(baseline, "_is_created", False) or baseline.get("_is_created", False):
+                audit_path = getattr(args, "audit_log", None)
+                if audit_path:
+                    append_audit_record(
+                        audit_path,
+                        {
+                            "event": "TESTNET_BASELINE_CREATED",
+                            "created_at": baseline.get("created_at"),
+                            "baseline_file": str(baseline_path),
+                            "spot_assets_count": len(baseline.get("spot_balances", {})),
+                            "perp_positions_flat": True,
+                            "initial_recon_equity": baseline.get("initial_recon_equity", 0.0),
+                            "credentials_sha256": baseline.get("credentials_sha256", ""),
+                        },
+                    )
+            cap = float(getattr(args, "capital", 3000.0) or 3000.0)
+            loc_eq = float(getattr(state, "current_equity", cap) or cap) if state else cap
+            snapshot = compute_testnet_delta_snapshot(snapshot, baseline, prices, cap, loc_eq)
 
     report = reconcile_portfolio_state(
         state if state is not None else {},
@@ -510,7 +666,7 @@ def _run_signed_snapshot_preflight(
 
 
 def _scope_snapshot_to_symbols(
-    snapshot: dict[str, Any], symbols: list[str]
+    snapshot: dict[str, Any], symbols: list[str], keep_cash: bool = False
 ) -> dict[str, Any]:
     """Sprint 20: thu hep `spot_balances` ve dung cac base asset dang giao dich.
 
@@ -530,6 +686,10 @@ def _scope_snapshot_to_symbols(
         base = canon[:-4] if canon.upper().endswith("USDT") else canon
         if base:
             wanted.add(base.upper())
+    # Sprint 22: Chi giu lai cac asset tien mat khi keep_cash=True (che do testnet)
+    if keep_cash:
+        from src.exchange_reconciler import CASH_ASSETS
+        wanted.update(CASH_ASSETS)
     scoped = {k: v for k, v in balances.items() if str(k).upper() in wanted}
     snapshot["untracked_spot_assets"] = max(0, len(balances) - len(scoped))
     snapshot["spot_balances"] = scoped
@@ -681,6 +841,21 @@ def _run_testnet_order_pair(
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main_impl(argv)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if (
+            "CRITICAL_SECURITY_ABORT" in msg
+            or "CRITICAL_CREDENTIAL_ABORT" in msg
+            or "BASELINE_" in msg
+        ):
+            logger.error("FATAL RUNTIME ABORT: %s", exc)
+            return 1
+        raise
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -698,7 +873,14 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Live mode: thieu BINANCE_API_KEY hoac BINANCE_API_SECRET trong env.")
             return 2
     elif args.mode == "testnet":
-        if not has_api_keys:
+        from src.binance_signed_client import load_dotenv_testnet
+
+        try:
+            load_dotenv_testnet()
+        except Exception as exc:
+            logger.info("Testnet: khong nap duoc .env.testnet (%s).", exc)
+
+        if not check_testnet_dual_credentials():
             logger.warning("Testnet: thieu API key, chay Public Live Feed Paper Mode")
             exec_mode = "paper"
         else:
@@ -744,20 +926,16 @@ def main(argv: list[str] | None = None) -> int:
                 import ccxt
 
                 ex_cfg: dict[str, Any] = {"enableRateLimit": True}
-                if has_api_keys and args.mode in ("live", "testnet"):
+                # Sprint 22: Chi truyen key mainnet khi mode=live; testnet KHONG truyen key mainnet
+                if has_api_keys and args.mode == "live":
                     ex_cfg["apiKey"] = api_key
                     ex_cfg["secret"] = api_secret
 
+                # Market data instance: chay mainnet public (khong credential) tren testnet de lay 720h warmup
                 perp_exchange = ccxt.binanceusdm(dict(ex_cfg))
                 spot_exchange = ccxt.binance(dict(ex_cfg))
-
-                if args.mode == "testnet" and has_api_keys:
-                    for ex in (perp_exchange, spot_exchange):
-                        if hasattr(ex, "set_sandbox_mode") and callable(ex.set_sandbox_mode):
-                            try:
-                                ex.set_sandbox_mode(True)
-                            except Exception as ex_err:
-                                logger.warning("Could not set sandbox mode: %s", ex_err)
+            except RuntimeError:
+                raise
             except Exception as e:
                 logger.warning(
                     "Could not initialize live exchanges (%s), falling back to offline cache",
@@ -797,18 +975,35 @@ def main(argv: list[str] | None = None) -> int:
                     bybit_cfg: dict[str, Any] = {"enableRateLimit": True}
                     bybit_key = os.environ.get("BYBIT_API_KEY")
                     bybit_secret = os.environ.get("BYBIT_API_SECRET")
-                    if bybit_key and bybit_secret and args.mode in ("live", "testnet"):
+                    # Sprint 22: Testnet mode khong truyen key mainnet Bybit vao market data feed
+                    if bybit_key and bybit_secret and args.mode == "live":
                         bybit_cfg["apiKey"] = bybit_key
                         bybit_cfg["secret"] = bybit_secret
                     bybit_ex = ccxt.bybit(bybit_cfg)
-                    if args.mode == "testnet" and hasattr(bybit_ex, "set_sandbox_mode") and callable(bybit_ex.set_sandbox_mode):
-                        try:
-                            bybit_ex.set_sandbox_mode(True)
-                        except Exception as ex_err:
-                            logger.warning("Could not set sandbox mode on bybit: %s", ex_err)
                     venues["bybit"] = bybit_ex
+                except RuntimeError:
+                    raise
                 except Exception as e:
                     logger.warning("Could not initialize Bybit exchange for venues: %s", e)
+
+            # Sprint 22: Chot chan bao mat fail-closed chong ro ri lenh/key mainnet (chi goi o mode testnet)
+            if args.mode == "testnet":
+                for ex, ex_name in [
+                    (spot_exchange, "binance_spot"),
+                    (perp_exchange, "binance_perp"),
+                    (venues.get("bybit"), "bybit"),
+                ]:
+                    if ex is not None:
+                        api_k = getattr(ex, "apiKey", None)
+                        sec_k = getattr(ex, "secret", None)
+                        if (api_k and str(api_k).strip()) or (sec_k and str(sec_k).strip()):
+                            raise RuntimeError(
+                                f"CRITICAL_SECURITY_ABORT: CCXT instance {ex_name} o mode testnet mang credential. "
+                                f"CCXT o testnet chi duoc phep chay unauthenticated public feed de lay nen 720h!"
+                            )
+                assert_exchange_credential_safety(spot_exchange, "binance_spot")
+                assert_exchange_credential_safety(perp_exchange, "binance_perp")
+                assert_exchange_credential_safety(venues.get("bybit"), "bybit")
 
             overlay_cfg = BarbellConfig(
                 initial_capital=float(args.capital),
@@ -853,6 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
                 reset_state=bool(args.reset_state),
                 strategy=strat,
                 tier1b_gate=True,
+                runtime_mode=args.mode,
+                testnet_dry_state=(args.mode == "testnet"),
             )
             logger.info(
                 "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
@@ -873,11 +1070,32 @@ def main(argv: list[str] | None = None) -> int:
             _run_signed_snapshot_preflight(args, executor)
             # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
             _run_testnet_order_pair(args, executor, barbell_symbols)
+
+            def _barbell_cycle_hook(cycle_idx: int) -> None:
+                if cycle_idx > 1:
+                    _run_reconcile_preflight(args, executor)
+                    _run_signed_snapshot_preflight(args, executor)
+
+            setattr(executor, "cycle_preflight_hook", _barbell_cycle_hook)
+
             return executor.run_loop(
                 once=bool(args.once),
                 cycles=args.cycles,
                 interval_sec=float(args.interval_sec),
             )
+
+        # Sprint 22: Chot chan bao mat fail-closed chong ro ri lenh/key mainnet (chi goi o mode testnet)
+        if args.mode == "testnet":
+            for ex, ex_name in [(spot_exchange, "binance_spot"), (perp_exchange, "binance_perp")]:
+                if ex is not None:
+                    api_k = getattr(ex, "apiKey", None)
+                    sec_k = getattr(ex, "secret", None)
+                    if (api_k and str(api_k).strip()) or (sec_k and str(sec_k).strip()):
+                        raise RuntimeError(
+                            f"CRITICAL_SECURITY_ABORT: CCXT instance {ex_name} o mode testnet mang credential."
+                        )
+            assert_exchange_credential_safety(spot_exchange, "binance_spot")
+            assert_exchange_credential_safety(perp_exchange, "binance_perp")
 
         executor = CarryLiveExecutor(
             config=trading_config,
@@ -891,6 +1109,8 @@ def main(argv: list[str] | None = None) -> int:
             initial_capital=float(args.capital),
             reset_state=bool(args.reset_state),
             strategy=strat,
+            runtime_mode=args.mode,
+            testnet_dry_state=(args.mode == "testnet"),
         )
         logger.info(
             "Warmup requirement: >= 720h history (saturation gate, lookback_hours=%d).",
@@ -911,6 +1131,14 @@ def main(argv: list[str] | None = None) -> int:
         _run_signed_snapshot_preflight(args, executor)
         # Sprint 20: gui lenh THAT khi --testnet-send-orders (chi khi reconcile cho phep).
         _run_testnet_order_pair(args, executor, [args.symbol])
+
+        def _nonbarbell_cycle_hook(cycle_idx: int) -> None:
+            if cycle_idx > 1:
+                _run_reconcile_preflight(args, executor)
+                _run_signed_snapshot_preflight(args, executor)
+
+        setattr(executor, "cycle_preflight_hook", _nonbarbell_cycle_hook)
+
         return executor.run_loop(
             once=bool(args.once),
             cycles=args.cycles,

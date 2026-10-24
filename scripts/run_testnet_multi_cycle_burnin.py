@@ -328,6 +328,29 @@ def _cycle1_bootstrap(
     detail["untracked_spot_count"] = len(snapshot.get("untracked_spot_assets") or {})
     detail["bootstrap_baseline_symbols"] = len(baseline_state["carry_positions"])
     detail["bootstrap_equity_usd"] = equity
+    from src.exchange_reconciler import CASH_ASSETS
+    raw_balances = (
+        snapshot.get("spot_balances_raw")
+        or snapshot.get("spot_balances")
+        or {}
+    )
+    pure_spot_cash = sum(
+        float(v or 0.0) for a, v in raw_balances.items() if str(a).upper() in CASH_ASSETS
+    )
+    if pure_spot_cash == 0.0 and "pure_cash_usd" in snapshot:
+        pure_spot_cash = float(snapshot.get("pure_cash_usd") or 0.0)
+    if pure_spot_cash == 0.0 and not any(str(a).upper() in CASH_ASSETS for a in raw_balances):
+        pure_spot_cash = float(snapshot.get("spot_cash_usd", 0.0) or 0.0)
+
+    fut_wallet = float(snapshot.get("perp_wallet_balance_usd", 0.0) or 0.0)
+    fut_upnl = float(snapshot.get("perp_unrealized_pnl_usd", 0.0) or 0.0)
+    pure_cash_and_margin = pure_spot_cash + fut_wallet + fut_upnl
+    detail["pure_cash_and_margin_usd"] = float(pure_cash_and_margin)
+    recon_eq = snapshot.get("reconcile_equity_usd")
+    if recon_eq is not None:
+        detail["reconcile_equity_usd"] = float(recon_eq)
+    else:
+        detail["reconcile_equity_usd"] = float(pure_cash_and_margin)
 
     ok = bool(
         credential_ok
@@ -777,7 +800,11 @@ def main(argv: list[str] | None = None) -> int:
         "--evidence-doc", default=DEFAULT_EVIDENCE_PATH, help="Duong dan file evidence markdown"
     )
     parser.add_argument(
-        "--log-jsonl", default=DEFAULT_LOG_PATH, help="Duong dan file log JSONL"
+        "--log-jsonl",
+        "--audit-log",
+        dest="log_jsonl",
+        default=DEFAULT_LOG_PATH,
+        help="Duong dan file log JSONL",
     )
     parser.add_argument("--no-write", action="store_true", help="Khong ghi evidence/log")
     parser.add_argument("--json", action="store_true", help="In 1 dong JSON tom tat")

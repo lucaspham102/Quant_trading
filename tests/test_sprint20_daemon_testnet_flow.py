@@ -138,6 +138,8 @@ def _install_preflight_client(
     snapshot_factory: Callable[[], dict[str, Any]],
 ) -> type:
     """Patch ``BinanceSignedTestnetClient`` bang fake tra snapshot tu factory."""
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", "sprint20_spot_key_64_characters_long_for_testing_credentials_ok_123")
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_KEY", "sprint20_futures_key_64_characters_long_for_testing_credentials_ok_456")
 
     class _FakePreflightClient:
         last_client: Any = None
@@ -240,7 +242,8 @@ def test_signed_snapshot_preflight_returns_none_for_paper(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_signed_snapshot_preflight_auto_runs_and_scopes(monkeypatch) -> None:
+def test_signed_snapshot_preflight_auto_runs_and_scopes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("src.exchange_reconciler.DEFAULT_TESTNET_BASELINE_PATH", tmp_path / "baseline.json")
     def factory() -> dict[str, Any]:
         return _snapshot(
             spot_balances={"BTC": 0.001, "ETH": 0.0},
@@ -282,7 +285,7 @@ def test_signed_snapshot_preflight_orphan_blocks(monkeypatch) -> None:
         monkeypatch, lambda: _snapshot(spot_balances={"BTC": 0.001})
     )
     executor = _FakeExecutor(state=_FakeState(), trading_allowed=True)
-    args = run_live.parse_args(["--mode", "testnet"])
+    args = run_live.parse_args(["--mode", "testnet", "--skip-testnet-baseline"])
 
     report = run_live._run_signed_snapshot_preflight(args, executor)
 
@@ -312,7 +315,7 @@ def test_signed_snapshot_preflight_margin_danger_blocks(monkeypatch) -> None:
     executor = _FakeExecutor(
         state=_FakeState(carry_positions=_btc_carry(), current_equity=1082.0)
     )
-    args = run_live.parse_args(["--mode", "testnet"])
+    args = run_live.parse_args(["--mode", "testnet", "--skip-testnet-baseline"])
 
     report = run_live._run_signed_snapshot_preflight(args, executor)
 
@@ -341,7 +344,7 @@ def test_signed_snapshot_preflight_synced_allows(monkeypatch) -> None:
     executor = _FakeExecutor(
         state=_FakeState(carry_positions=_btc_carry(), current_equity=1082.0)
     )
-    args = run_live.parse_args(["--mode", "testnet"])
+    args = run_live.parse_args(["--mode", "testnet", "--skip-testnet-baseline"])
 
     report = run_live._run_signed_snapshot_preflight(args, executor)
 

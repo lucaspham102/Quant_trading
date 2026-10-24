@@ -367,8 +367,8 @@ def test_run_live_cli_dynamic_carry_paper_once(
 
 
 def test_parse_args_strategy_default_and_choices() -> None:
-    """parse_args mặc định directional, nhận dynamic_carry và từ chối giá trị lạ."""
-    assert run_live.parse_args([]).strategy == "directional"
+    """parse_args mặc định barbell, nhận dynamic_carry và từ chối giá trị lạ."""
+    assert run_live.parse_args([]).strategy == "barbell"
     assert run_live.parse_args(["--strategy", "dynamic_carry"]).strategy == "dynamic_carry"
 
     with pytest.raises(SystemExit):
