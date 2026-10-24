@@ -12,6 +12,8 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from src.strategy_profiles import (
@@ -32,6 +34,17 @@ except Exception:  # pragma: no cover - fallback if scripts is not importable
     )
     demo = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(demo)
+
+try:
+    from scripts import run_1k_profile_tournament_backtest as tournament
+except Exception:  # pragma: no cover - fallback if scripts is not importable
+    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _spec = importlib.util.spec_from_file_location(
+        "run_1k_profile_tournament_backtest",
+        os.path.join(_ROOT, "scripts", "run_1k_profile_tournament_backtest.py"),
+    )
+    tournament = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(tournament)
 
 EXPECTED_PROFILES = {"default", "canary_400", "baseline_1k", "alpha_boost_1k", "turbo_neutral_1k"}
 MONEY = dict(rel=1e-6, abs=1e-6)
@@ -159,8 +172,10 @@ def test_enforce_split_wallet_futures_cap():
 
 def test_passive_yield_cases():
     base = PROFILE_REGISTRY["baseline_1k"]
-    assert base.enable_yield_stacking is False
-    assert compute_step_passive_yield_usd(base, 1.0, {})["total_passive_yield_usd"] == 0.0
+    # Sprint 25.1: baseline_1k tracks yield stacking alongside its pure trading equity.
+    assert base.enable_yield_stacking is True
+    assert compute_step_passive_yield_usd(base, 0.0, {})["total_passive_yield_usd"] == 0.0
+    assert compute_step_passive_yield_usd(base, 1.0, {})["total_passive_yield_usd"] > 0.0
 
     boosted = PROFILE_REGISTRY["alpha_boost_1k"]
     assert compute_step_passive_yield_usd(boosted, 0.0, {ETH: 100.0})[
@@ -413,6 +428,335 @@ def test_fetch_market_once_never_raises(monkeypatch):
         raise RuntimeError("network down")
 
     monkeypatch.setattr(demo, "fetch_binance_shadow_snapshot", boom)
-    result = demo.fetch_market_once(timeout_sec=0.01)
+    result = demo.fetch_market_once(timeout_sec=0.01, spot_timeout_sec=0.01)
     assert result["healthy"] is False
     assert "errors" in result
+    assert result["spot_symbols"] == {}
+
+
+# ------------------------------------------- sprint 25.1 regression guards ----
+def test_live_default_profile_is_baseline_1k():
+    """Audit fix 1: baseline_1k (beat alpha_boost on 181d holdout) is now the default."""
+    assert demo.parse_args([]).live_testnet_profile == "baseline_1k"
+
+
+def test_default_and_baseline_track_yield_stacking():
+    assert PROFILE_REGISTRY["baseline_1k"].enable_yield_stacking is True
+    assert PROFILE_REGISTRY["default"].enable_yield_stacking is True
+    # Pure trading equity is untouched: yield is reported in its own column only.
+    base = PROFILE_REGISTRY["baseline_1k"]
+    res = compute_step_passive_yield_usd(base, 1.0, {})
+    assert res["total_passive_yield_usd"] > 0.0
+
+
+def test_tournament_includes_default_3000_profile():
+    profiles = tournament.build_tournament_profiles()
+    assert "default" in tournament.DEFAULT_PROFILES
+    assert profiles["default"].capital_usd == pytest.approx(3000.0, **MONEY)
+    assert set(tournament.build_tournament_profiles()) == {
+        "default",
+        "baseline_1k",
+        "alpha_boost_1k",
+        "turbo_neutral_1k",
+        "alpha_boost_1k_pure_equal",
+    }
+
+
+def _synthetic_carry_market(funding_bars: list[int], n: int = 48) -> dict:
+    index = pd.date_range("2024-01-01 00:00", periods=n, freq="h", tz="UTC")
+    cols = [BTC, ETH]
+    perp = pd.DataFrame({s: np.full(n, 100.0) for s in cols}, index=index)
+    spot = perp.copy()
+    funding = pd.DataFrame({s: np.zeros(n) for s in cols}, index=index)
+    for bar in funding_bars:
+        funding.loc[index[bar], BTC] = 0.001
+    score = pd.DataFrame({BTC: np.full(n, 1.0), ETH: np.full(n, -1.0)}, index=index)
+    snr = pd.DataFrame(np.nan, index=index, columns=cols)
+    return {
+        "index": index,
+        "perp_close": perp,
+        "spot_close": spot,
+        "funding_event": funding,
+        "funding_bps": funding * 10000.0,
+        "carry_score": score,
+        "snr": snr,
+        "snr_dispersion": pd.Series(np.nan, index=index),
+        "spot_cost_bps": 7.5,
+        "perp_cost_bps": 5.0,
+        "carry_cost_bps": 12.5,
+    }
+
+
+def test_regression_no_funding_lookahead_on_entry_bar():
+    """A leg opened at bar t must NOT receive bar t's funding (audit bug 1)."""
+    prof = PROFILE_REGISTRY["baseline_1k"]
+    open_bar_only = tournament.simulate_profile(
+        prof, _synthetic_carry_market(funding_bars=[0]), start_idx=0, end_idx=48,
+        trade_start_idx=0,
+    )
+    assert open_bar_only["diagnostics"]["n_carry_opens"] > 0
+    assert open_bar_only["funding_pnl_usd"] == pytest.approx(0.0, abs=1e-12)
+
+    later_bar_too = tournament.simulate_profile(
+        prof, _synthetic_carry_market(funding_bars=[0, 8]), start_idx=0, end_idx=48,
+        trade_start_idx=0,
+    )
+    # Only the *subsequent* funding stamp pays the position opened at bar 0.
+    assert later_bar_too["funding_pnl_usd"] > 0.0
+    assert later_bar_too["funding_pnl_usd"] == pytest.approx(
+        0.5 * (later_bar_too["funding_pnl_usd"]) * 2.0, rel=1e-9
+    )
+
+
+def _carry_leg(qty: float = 1.0, spot_entry: float = 100.0, perp_entry: float = 100.0) -> dict:
+    return {
+        "symbol": BTC,
+        "qty": qty,
+        "entry_price": perp_entry,
+        "kind": "carry",
+        "signed_usd": qty * perp_entry,
+        "spot_qty": qty,
+        "perp_qty": -qty,
+        "spot_entry": spot_entry,
+        "perp_entry": perp_entry,
+    }
+
+
+def _dual_snapshot(spot_mid: float, perp_mark: float) -> dict:
+    return {
+        "symbols": {BTC: {"mid": perp_mark}},
+        "spot_symbols": {BTC: {"bid": spot_mid, "ask": spot_mid, "mid": spot_mid}},
+        "perp_symbols": {BTC: {"mid": perp_mark, "mark": perp_mark}},
+    }
+
+
+def test_regression_carry_delta_neutral_price_pnl_and_basis(tmp_path, prof_1k):
+    """Carry must be flat when Spot/Perp move together and carry only the real basis."""
+    ledger = _fresh_ledger(tmp_path / "basis.json", prof_1k)
+    ledger["positions_snapshot"] = {BTC: _carry_leg()}
+    t0 = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+    demo.accrue_cycle_accounting(ledger, prof_1k, _dual_snapshot(110.0, 110.0), t0)
+    assert ledger["basis_pnl_usd"] == pytest.approx(0.0, abs=1e-9)
+    assert ledger["pure_trading_equity_usd"] == pytest.approx(prof_1k.capital_usd, **MONEY)
+
+    # Spot +10% / Perp +12%: basis = 1*(110-100) + (-1)*(112-100) = -2.00 USD.
+    demo.accrue_cycle_accounting(ledger, prof_1k, _dual_snapshot(110.0, 112.0), t0)
+    assert ledger["spot_unrealized_pnl_usd"] == pytest.approx(10.0, **MONEY)
+    assert ledger["perp_unrealized_pnl_usd"] == pytest.approx(-12.0, **MONEY)
+    assert ledger["basis_pnl_usd"] == pytest.approx(-2.0, **MONEY)
+    assert ledger["pure_trading_equity_usd"] == pytest.approx(
+        prof_1k.capital_usd - 2.0, **MONEY
+    )
+
+    # Without a Spot book the basis is not observable -> treated as neutral, never invented.
+    no_spot = {"symbols": {BTC: {"mid": 112.0}}, "perp_symbols": {BTC: {"mid": 112.0, "mark": 112.0}}}
+    demo.accrue_cycle_accounting(ledger, prof_1k, no_spot, t0)
+    assert ledger["basis_pnl_usd"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_regression_carry_and_overlay_same_symbol_key_isolation(tmp_path, prof_1k):
+    """Carry and Overlay on the same symbol must not share one ledger slot (audit bug 3)."""
+    ledger = _fresh_ledger(tmp_path / "isolation.json", prof_1k)
+    state = FakeExecState(
+        carry_positions={
+            ETH: {"qty": 1.0, "entry_spot_price": 100.0, "entry_perp_price": 101.0}
+        },
+        overlay_positions={ETH: {"qty": 2.0, "signed_usd": 200.0}},
+    )
+    snapshot = {
+        "symbols": {ETH: {"mid": 100.0}},
+        "spot_symbols": {ETH: {"mid": 100.0}},
+        "perp_symbols": {ETH: {"mid": 100.0, "mark": 100.0}},
+    }
+    demo.apply_shadow_fills(ledger, state, snapshot, prof_1k)
+    assert set(ledger["positions_snapshot"]) == {ETH, f"{ETH}|overlay"}
+    carry_leg = ledger["positions_snapshot"][ETH]
+    overlay_leg = ledger["positions_snapshot"][f"{ETH}|overlay"]
+    assert carry_leg["kind"] == "carry"
+    assert overlay_leg["kind"] == "overlay"
+    assert carry_leg["spot_entry"] == pytest.approx(100.0, **MONEY)
+    assert carry_leg["perp_entry"] == pytest.approx(101.0, **MONEY)
+    assert overlay_leg["signed_usd"] == pytest.approx(200.0, **MONEY)
+
+    # Closing the Overlay must never delete or overwrite the Carry slot.
+    state.overlay_positions = {}
+    demo.apply_shadow_fills(ledger, state, snapshot, prof_1k)
+    assert set(ledger["positions_snapshot"]) == {ETH}
+    assert ledger["positions_snapshot"][ETH]["spot_entry"] == pytest.approx(100.0, **MONEY)
+
+
+def test_regression_partial_downsize_vwap_realization(tmp_path, prof_1k):
+    """Downsize realises pro-rata PnL, upsize averages entries (audit bug 4)."""
+    ledger = _fresh_ledger(tmp_path / "vwap.json", prof_1k)
+    state = FakeExecState(overlay_positions={ETH: {"qty": 1.0, "signed_usd": 100.0}})
+    snap_100 = {"symbols": {ETH: {"mid": 100.0}}}
+    snap_120 = {"symbols": {ETH: {"mid": 120.0}}}
+    snap_130 = {"symbols": {ETH: {"mid": 130.0}}}
+
+    demo.apply_shadow_fills(ledger, state, snap_100, prof_1k)
+    assert ledger["positions_snapshot"][f"{ETH}|overlay"]["entry_price"] == pytest.approx(
+        100.0, **MONEY
+    )
+
+    # Scale 100 -> 200 USD at 120: VWAP = (100*100 + 100*120) / 200 = 110.
+    demo.apply_shadow_fills(ledger, state, snap_120, prof_1k)
+    state.overlay_positions = {ETH: {"qty": 200.0 / 120.0, "signed_usd": 200.0}}
+    demo.apply_shadow_fills(ledger, state, snap_120, prof_1k)
+    leg = ledger["positions_snapshot"][f"{ETH}|overlay"]
+    assert leg["entry_price"] == pytest.approx(110.0, **MONEY)
+    assert leg["signed_usd"] == pytest.approx(200.0, **MONEY)
+
+    # Scale down 200 -> 100 USD at 130: half of the +36.36 gain is realised, entry stays 110.
+    realized_before = ledger["realized_pnl_usd"]
+    state.overlay_positions = {ETH: {"qty": 100.0 / 130.0, "signed_usd": 100.0}}
+    demo.apply_shadow_fills(ledger, state, snap_130, prof_1k)
+    leg = ledger["positions_snapshot"][f"{ETH}|overlay"]
+    assert leg["entry_price"] == pytest.approx(110.0, **MONEY)
+    assert ledger["realized_pnl_usd"] - realized_before == pytest.approx(
+        200.0 * (130.0 / 110.0 - 1.0) * 0.5 - 100.0 * demo.OVERLAY_FEE_RATE, **MONEY
+    )
+
+
+def test_dual_price_maps_split_spot_and_perp():
+    snapshot = {
+        "symbols": {BTC: {"bid": 100.0, "ask": 102.0, "mid": 101.0, "mark_price": 101.5}},
+        "spot_symbols": {BTC: {"bid": 99.0, "ask": 101.0, "mid": 100.0}},
+        "perp_symbols": {BTC: {"bid": 100.0, "ask": 102.0, "mid": 101.0, "mark": 101.5}},
+    }
+    spot, perp = demo.dual_price_maps(snapshot)
+    assert spot[BTC] == {"bid": 99.0, "ask": 101.0, "mid": 100.0}
+    assert perp[BTC]["mark"] == pytest.approx(101.5, **MONEY)
+    assert perp[BTC]["mid"] == pytest.approx(101.0, **MONEY)
+
+    # Legacy snapshot (Perp only) must still produce a Perp map and no invented Spot book.
+    legacy_spot, legacy_perp = demo.dual_price_maps({"symbols": {BTC: {"mid": 100.0}}})
+    assert legacy_spot == {}
+    assert legacy_perp[BTC]["mid"] == pytest.approx(100.0, **MONEY)
+
+
+def test_fetch_spot_book_tickers_fixture_and_fail_closed():
+    good = demo.fetch_binance_spot_book_tickers(
+        [BTC, ETH], fixture_data={BTC: {"bid": 99.0, "ask": 101.0}}
+    )
+    assert good == {BTC: {"bid": 99.0, "ask": 101.0, "mid": 100.0}}
+
+    crossed = demo.fetch_binance_spot_book_tickers(
+        [BTC], fixture_data={BTC: {"bid": 101.0, "ask": 100.0}}
+    )
+    assert crossed == {}
+
+
+class _ReconClient:
+    """Minimal fake signed client exposing only the reconcile snapshot call."""
+
+    def __init__(self, snapshot: dict) -> None:
+        self.snapshot = snapshot
+        self.calls = 0
+
+    def fetch_exchange_reconcile_snapshot(self, symbols, prices=None, **kwargs):
+        self.calls += 1
+        return self.snapshot
+
+
+def _healthy_exchange_snapshot(spot_usdt: float = 1000.0) -> dict:
+    return {
+        "snapshot_healthy": True,
+        "spot_balances": {"USDT": spot_usdt},
+        "spot_balances_raw": {"USDT": spot_usdt},
+        "perp_positions": {},
+        "perp_positions_detail": [],
+        "pure_cash_usd": spot_usdt,
+        "spot_cash_usd": spot_usdt,
+        "perp_wallet_balance_usd": 0.0,
+        "perp_unrealized_pnl_usd": 0.0,
+        "exchange_equity_usd": spot_usdt,
+        "universe_symbols": [BTC],
+    }
+
+
+def test_exchange_reconcile_synced_and_drift_warning(tmp_path, monkeypatch):
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", "spot-key")
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_KEY", "futures-key")
+    baseline_path = str(tmp_path / "demo_testnet_baseline.json")
+
+    client = _ReconClient(_healthy_exchange_snapshot(1000.0))
+    synced = demo.compute_exchange_reconcile(
+        client, [BTC], {BTC: 100.0}, baseline_path, 1000.0, 1000.0
+    )
+    assert synced["reconcile_status"] == "SYNCED"
+    assert synced["exchange_recon_equity_usd"] == pytest.approx(1000.0, abs=1e-6)
+    assert synced["recon_drift_usd"] == pytest.approx(0.0, abs=1e-6)
+    assert os.path.exists(baseline_path)
+
+    # Local ledger claims 1,050 USD while the exchange only holds 1,000 -> 5% drift.
+    drift = demo.compute_exchange_reconcile(
+        client, [BTC], {BTC: 100.0}, baseline_path, 1000.0, 1050.0
+    )
+    assert drift["reconcile_status"] == "DRIFT_WARNING"
+    assert drift["recon_drift_usd"] == pytest.approx(-50.0, abs=1e-6)
+
+    unhealthy = demo.compute_exchange_reconcile(
+        _ReconClient({"snapshot_healthy": False}), [BTC], {}, baseline_path, 1000.0, 1000.0
+    )
+    assert unhealthy["reconcile_status"] == "UNAVAILABLE"
+    assert unhealthy["exchange_recon_equity_usd"] is None
+
+
+def test_initialize_demo_testnet_baseline_idempotent_and_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("BINANCE_SPOT_TESTNET_API_KEY", "spot-key")
+    monkeypatch.setenv("BINANCE_FUTURES_TESTNET_API_KEY", "futures-key")
+
+    baseline_path = str(tmp_path / "demo_testnet_baseline.json")
+    assert os.path.exists(baseline_path) is False
+    # Existing file -> reused, no exchange call needed.
+    with open(baseline_path, "w", encoding="utf-8") as fh:
+        json.dump({"credentials_sha256": "x"}, fh)
+    ok, note = demo.initialize_demo_testnet_baseline(
+        _ReconClient({"snapshot_healthy": False}), baseline_path, [BTC]
+    )
+    assert ok is True
+    assert note == "BASELINE_EXISTS"
+
+    # Unhealthy snapshot -> refuse (fail-closed), operator is told why.
+    fresh_path = str(tmp_path / "fresh.json")
+    ok, note = demo.initialize_demo_testnet_baseline(
+        _ReconClient({"snapshot_healthy": False}), fresh_path, [BTC]
+    )
+    assert ok is False
+    assert note == "snapshot_unhealthy"
+    assert os.path.exists(fresh_path) is False
+
+
+def test_run_profile_cycle_records_reconciliation_fields(tmp_path, prof_1k):
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.state = FakeExecState()
+            self.calls = 0
+
+        def reconcile_once(self, aligned_universe=None):
+            self.calls += 1
+            return None
+
+    ledger = _fresh_ledger(tmp_path / "cycle.json", prof_1k)
+    executor = FakeExecutor()
+    rec = demo.run_profile_cycle(
+        prof_1k,
+        ledger,
+        {"symbols": {}},
+        None,
+        mode="TESTNET_REAL",
+        execute_real=True,
+        executor=executor,
+        reconcile_fn=lambda _ledger: {
+            "exchange_recon_equity_usd": 1003.0,
+            "recon_drift_usd": 3.0,
+            "reconcile_status": "SYNCED",
+        },
+    )
+    assert executor.calls == 1
+    assert rec["reconcile_status"] == "SYNCED"
+    assert rec["exchange_recon_equity_usd"] == pytest.approx(1003.0, **MONEY)
+    assert rec["recon_drift_usd"] == pytest.approx(3.0, **MONEY)
+    assert rec["basis_pnl_usd"] == pytest.approx(0.0, abs=1e-12)
+    assert ledger["reconcile_status"] == "SYNCED"

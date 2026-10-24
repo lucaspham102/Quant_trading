@@ -42,7 +42,10 @@ from src.strategy_profiles import (  # noqa: E402
 
 LOGGER = logging.getLogger("sprint25_tournament")
 
-DEFAULT_PROFILES = "baseline_1k,alpha_boost_1k,turbo_neutral_1k,alpha_boost_1k_pure_equal"
+DEFAULT_PROFILES = (
+    "default,baseline_1k,alpha_boost_1k,turbo_neutral_1k,alpha_boost_1k_pure_equal"
+)
+DEFAULT_SENSITIVITY_PROFILES = "baseline_1k,default"
 
 TOURNAMENT_LOT_STEPS: dict[str, float] = {
     "BTC/USDT:USDT": 0.001,
@@ -74,6 +77,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--carry-cost-bps", type=float, default=12.5)
     p.add_argument("--spot-cost-bps", type=float, default=7.5)
     p.add_argument("--perp-cost-bps", type=float, default=5.0)
+    # Sprint 25.1: secondary sensitivity run under BNB/maker-optimised fees (15 bps roundtrip)
+    # so the operator guide can compare strict taker (25 bps) vs real-world maker execution.
+    p.add_argument("--sensitivity-profiles", type=str, default=DEFAULT_SENSITIVITY_PROFILES)
+    p.add_argument("--sens-spot-cost-bps", type=float, default=4.5)
+    p.add_argument("--sens-perp-cost-bps", type=float, default=3.0)
+    p.add_argument("--sens-carry-cost-bps", type=float, default=7.5)
     p.add_argument("--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -86,7 +95,8 @@ def _floor_to_step(qty: float, step: float) -> float:
 
 def build_tournament_profiles() -> dict[str, StrategyProfileConfig]:
     out: dict[str, StrategyProfileConfig] = {
-        n: PROFILE_REGISTRY[n] for n in ("baseline_1k", "alpha_boost_1k", "turbo_neutral_1k")
+        n: PROFILE_REGISTRY[n]
+        for n in ("default", "baseline_1k", "alpha_boost_1k", "turbo_neutral_1k")
     }
     out["alpha_boost_1k_pure_equal"] = dataclasses.replace(
         PROFILE_REGISTRY["alpha_boost_1k"],
@@ -564,6 +574,51 @@ def format_tournament_table(payload: dict[str, Any]) -> str:
     rows.append("")
     rows.append(f"Best by pure APR: {payload['best_profile_by_pure_apr']}")
     rows.append(f"Best by yield-stacked APR: {payload['best_profile_by_yield_stacked_apr']}")
+
+    fs = payload.get("fee_sensitivity")
+    if isinstance(fs, dict):
+        taker_costs = payload.get("costs", {}).get("taker", {})
+        rows.append("")
+        rows.append(
+            "Fee sensitivity (roundtrip = 2 x one-way): taker "
+            f"{taker_costs.get('roundtrip_bps', 0.0):.1f} bps "
+            f"(one-way {taker_costs.get('one_way_bps', 0.0):.1f}) vs BNB/maker "
+            f"{fs.get('roundtrip_bps', 0.0):.1f} bps "
+            f"(one-way {fs.get('spot_cost_bps', 0.0) + fs.get('perp_cost_bps', 0.0):.1f})"
+        )
+        cols2 = [
+            ("Profile", 26), ("Window", 8), ("Pure APR taker %", 16),
+            ("Pure APR maker %", 16), ("Delta bps", 10), ("PnL taker $", 12),
+            ("PnL maker $", 12), ("Fees taker $", 12), ("Fees maker $", 12),
+        ]
+        sep2 = "+" + "+".join("-" * (w + 2) for _, w in cols2) + "+"
+
+        def line2(vals: list[str]) -> str:
+            return "| " + " | ".join(
+                v.rjust(w) if i > 1 else v.ljust(w)
+                for i, (v, (_, w)) in enumerate(zip(vals, cols2))
+            ) + " |"
+
+        rows.extend([sep2, line2([c for c, _ in cols2]), sep2])
+        base_profiles = payload["profiles"]
+        for name, res in fs.get("profiles", {}).items():
+            ref = base_profiles.get(name, {})
+            for label, key in (("FULL", "full"), ("HOLDOUT", "holdout")):
+                if key not in res or key not in ref:
+                    continue
+                r_maker, r_taker = res[key], ref[key]
+                delta_bps = (r_maker["pure_trading_net_apr_pct"] - r_taker["pure_trading_net_apr_pct"]) * 100.0
+                rows.append(line2([
+                    name, label,
+                    f"{r_taker['pure_trading_net_apr_pct']:.2f}",
+                    f"{r_maker['pure_trading_net_apr_pct']:.2f}",
+                    f"{delta_bps:+.1f}",
+                    f"{r_taker['pure_trading_net_pnl_usd']:.2f}",
+                    f"{r_maker['pure_trading_net_pnl_usd']:.2f}",
+                    f"{r_taker['fees_usd']:.2f}",
+                    f"{r_maker['fees_usd']:.2f}",
+                ]))
+        rows.append(sep2)
     return "\n".join(rows)
 
 
@@ -622,6 +677,44 @@ def main(argv=None) -> int:
     payload = run_tournament(
         profiles, market, holdout_days=args.holdout_days, warmup_hours=args.warmup_hours,
     )
+    taker_one_way = float(args.spot_cost_bps) + float(args.perp_cost_bps)
+    maker_one_way = float(args.sens_spot_cost_bps) + float(args.sens_perp_cost_bps)
+    payload["costs"] = {
+        "taker": {
+            "spot_cost_bps": float(args.spot_cost_bps),
+            "perp_cost_bps": float(args.perp_cost_bps),
+            "carry_cost_bps": float(args.carry_cost_bps),
+            "one_way_bps": taker_one_way,
+            "roundtrip_bps": 2.0 * taker_one_way,
+        },
+        "maker": {
+            "spot_cost_bps": float(args.sens_spot_cost_bps),
+            "perp_cost_bps": float(args.sens_perp_cost_bps),
+            "carry_cost_bps": float(args.sens_carry_cost_bps),
+            "one_way_bps": maker_one_way,
+            "roundtrip_bps": 2.0 * maker_one_way,
+        },
+    }
+
+    sens_names = [x.strip() for x in args.sensitivity_profiles.split(",") if x.strip()]
+    sens_profiles = {n: available[n] for n in sens_names if n in available}
+    if sens_profiles:
+        market_maker = dict(market)
+        market_maker["spot_cost_bps"] = float(args.sens_spot_cost_bps)
+        market_maker["perp_cost_bps"] = float(args.sens_perp_cost_bps)
+        market_maker["carry_cost_bps"] = float(args.sens_carry_cost_bps)
+        LOGGER.info("sensitivity run (maker) cho: %s", list(sens_profiles))
+        sens_payload = run_tournament(
+            sens_profiles, market_maker,
+            holdout_days=args.holdout_days, warmup_hours=args.warmup_hours,
+        )
+        payload["fee_sensitivity"] = {
+            "spot_cost_bps": float(args.sens_spot_cost_bps),
+            "perp_cost_bps": float(args.sens_perp_cost_bps),
+            "carry_cost_bps": float(args.sens_carry_cost_bps),
+            "roundtrip_bps": 2.0 * maker_one_way,
+            "profiles": sens_payload["profiles"],
+        }
     out_path = Path(args.out_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(_jsonable(payload), indent=2, ensure_ascii=True), encoding="utf-8")
