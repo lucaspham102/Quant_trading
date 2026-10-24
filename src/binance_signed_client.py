@@ -1837,6 +1837,32 @@ class BinanceSignedTestnetClient:
         result.setdefault("avgPrice", 0.0)
         return result
 
+    def get_spot_free_balance(self, symbol: str) -> Optional[float]:
+        """Sprint 24: free balance cua base asset tren Spot (BTC/USDT:USDT -> BTC).
+
+        Sprint 24 FIX (audit HIGH): tra None khi KHONG doc duoc (dry_run/loi mang/loi API)
+        de caller phan biet "khong biet so du" voi "so du that = 0.0". Truoc day loi mang
+        bi hieu nham la 0.0 -> clamp lenh SELL ve 0 -> bo qua vong dong vi the Spot that.
+        """
+        try:
+            base = str(symbol).split(":")[0].split("/")[0].strip().upper()
+            if self.dry_run or not base:
+                return None
+            req = self.build_signed_get_request(SPOT_ACCOUNT_PATH, futures=False)
+            account = self._http_request(
+                "GET",
+                req["url"],
+                req.get("params", {}),
+                req.get("headers", {}),
+                timeout_sec=5.0,
+            )
+            for b in (account or {}).get("balances", []) or []:
+                if isinstance(b, dict) and str(b.get("asset", "")).strip().upper() == base:
+                    return float(b.get("free", 0.0) or 0.0)
+            return 0.0
+        except Exception:  # noqa: BLE001 - loi -> None (khong biet), caller KHONG duoc clamp
+            return None
+
     def fetch_exchange_reconcile_snapshot(
         self,
         symbols: list[str],

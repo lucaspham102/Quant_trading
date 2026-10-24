@@ -441,3 +441,66 @@ def filter_canary_lot_unviable_overlay_symbols(
         else:
             out[sym] = w * short_scale
     return out
+
+
+
+def compute_split_wallet_canary_plan(
+    total_capital_usd: float = 400.0,
+    carry_eta: float = 0.65,
+    overlay_gross_pct: float = 0.15,
+    target_futures_leverage: float = 2.5,
+    bnb_fee_buffer_usd: float = 10.0,
+) -> dict:
+    """Sprint 24: ke hoach chia vi Spot/Futures cho Canary.
+
+    spot = capital * eta; futures = capital - spot; futures notional = carry perp (= spot)
+    + overlay gross (capital * pct); leverage = futures notional / futures USDT.
+    is_safe_leverage dung nguong cung <= 3.0 (target chi de bao cao).
+    """
+    spot = round(total_capital_usd * carry_eta, 2)
+    futures = round(total_capital_usd - spot, 2)
+    carry_perp_notional = spot
+    overlay_gross = round(total_capital_usd * overlay_gross_pct, 2)
+    total_notional = round(carry_perp_notional + overlay_gross, 2)
+    leverage = round(total_notional / max(futures, 1e-9), 2)
+    is_safe = bool(leverage <= 3.0) and bool(leverage <= float(target_futures_leverage) + 1e-9)
+    return {
+        "recommended_spot_usdt": spot,
+        "recommended_futures_usdt": futures,
+        "carry_perp_notional_usd": carry_perp_notional,
+        "overlay_gross_notional_usd": overlay_gross,
+        "total_futures_notional_usd": total_notional,
+        "effective_futures_leverage": leverage,
+        "is_safe_leverage": is_safe,
+        "recommended_bnb_buffer_usd": float(bnb_fee_buffer_usd),
+        "carry_slot_usdt": round(spot / 2.0, 2),
+        "target_futures_leverage": float(target_futures_leverage),
+        "capital_usd": float(total_capital_usd),
+        "carry_eta": float(carry_eta),
+        "overlay_gross_pct": float(overlay_gross_pct),
+    }
+
+
+def validate_wallet_split_readiness(
+    spot_pure_cash_usd: float,
+    futures_available_balance_usd: float,
+    plan: dict,
+    tolerance_pct: float = 0.05,
+) -> dict:
+    """Sprint 24: kiem tra so du vi dap ung plan.
+
+    required = recommended * (1 - tolerance_pct); shortfall = max(required - balance, 0);
+    ready khi ca hai shortfall == 0.
+    """
+    spot_req = float(plan.get("recommended_spot_usdt", 0.0)) * (1.0 - tolerance_pct)
+    fut_req = float(plan.get("recommended_futures_usdt", 0.0)) * (1.0 - tolerance_pct)
+    spot_shortfall = round(max(spot_req - float(spot_pure_cash_usd), 0.0), 2)
+    fut_shortfall = round(max(fut_req - float(futures_available_balance_usd), 0.0), 2)
+    return {
+        "ready": bool(spot_shortfall <= 0.0 and fut_shortfall <= 0.0),
+        "spot_shortfall_usd": spot_shortfall,
+        "futures_shortfall_usd": fut_shortfall,
+        "plan": plan,
+        "spot_required_usdt": round(spot_req, 2),
+        "futures_required_usdt": round(fut_req, 2),
+    }
