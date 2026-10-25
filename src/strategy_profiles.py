@@ -50,6 +50,12 @@ class StrategyProfileConfig:
     trend_max_gross_pct: float = 0.0
     trend_rebalance_hours: int = 24
     trend_z_entry: float = 1.15
+    # ---- Sprint 27: bidirectional trend, stat-arb reversal, dynamic futures capacity
+    allow_short_trend: bool = False
+    trend_z_short_entry: float = 1.10
+    enable_reversal_sleeve: bool = False
+    reversal_gross_pct: float = 0.0
+    dynamic_carry_to_alpha_margin: bool = False
     soft_dd_threshold_pct: float = 0.06
     hard_dd_threshold_pct: float = 0.10
     bfusd_apy: float = 0.045
@@ -124,6 +130,26 @@ class StrategyProfileConfig:
                     "0.0 <= soft < hard <= 1.0, got "
                     f"({self.soft_dd_threshold_pct!r}, {self.hard_dd_threshold_pct!r})"
                 )
+        if self.allow_short_trend and not self.enable_trend_sleeve:
+            raise ValueError(
+                "allow_short_trend=True requires enable_trend_sleeve=True"
+            )
+        if self.allow_short_trend and not self.trend_z_short_entry > 0:
+            raise ValueError(
+                "trend_z_short_entry must be > 0 when allow_short_trend=True, "
+                f"got {self.trend_z_short_entry!r}"
+            )
+        if self.enable_reversal_sleeve:
+            if not 0.0 < self.reversal_gross_pct <= 1.0:
+                raise ValueError(
+                    "reversal_gross_pct must be in (0, 1] when "
+                    f"enable_reversal_sleeve=True, got {self.reversal_gross_pct!r}"
+                )
+        elif self.reversal_gross_pct != 0.0:
+            raise ValueError(
+                "reversal_gross_pct must be 0.0 when enable_reversal_sleeve=False, "
+                f"got {self.reversal_gross_pct!r}"
+            )
         object.__setattr__(self, "liquid_staking_apy_map", dict(self.liquid_staking_apy_map))
 
 
@@ -294,6 +320,89 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         trend_max_gross_pct=0.80,
         trend_rebalance_hours=24,
         trend_z_entry=1.05,
+        soft_dd_threshold_pct=0.06,
+        hard_dd_threshold_pct=0.10,
+    ),
+    # ---- Sprint 27: 550/450 split -> cong suat futures 1,350 USD (3.0x) thay vi 1,050 USD.
+    "bi_trend_carry_1k": StrategyProfileConfig(
+        name="bi_trend_carry_1k",
+        capital_usd=1000.0,
+        spot_wallet_usd=550.0,
+        futures_wallet_usd=450.0,
+        carry_eta=0.55,
+        carry_top_k=3,
+        carry_min_hold_bars=63,
+        carry_entry_bps=0.45,
+        carry_exit_bps=0.0,
+        carry_buffer_rank=3,
+        carry_weighting_mode="equal",
+        carry_tilt_alpha=0.0,
+        carry_max_single_weight=0.50,
+        overlay_target_vol_ann=0.075,
+        overlay_gross_pct=0.15,
+        max_futures_leverage=3.0,
+        enable_yield_stacking=True,
+        enable_trend_sleeve=True,
+        allow_short_trend=True,
+        trend_target_vol_ann=0.15,
+        trend_max_gross_pct=0.65,
+        trend_rebalance_hours=24,
+        trend_z_entry=1.15,
+        trend_z_short_entry=1.10,
+        soft_dd_threshold_pct=0.06,
+        hard_dd_threshold_pct=0.10,
+    ),
+    "carry_stat_arb_1k": StrategyProfileConfig(
+        name="carry_stat_arb_1k",
+        capital_usd=1000.0,
+        spot_wallet_usd=550.0,
+        futures_wallet_usd=450.0,
+        carry_eta=0.55,
+        carry_top_k=3,
+        carry_min_hold_bars=63,
+        carry_entry_bps=0.45,
+        carry_exit_bps=0.0,
+        carry_buffer_rank=3,
+        carry_weighting_mode="equal",
+        carry_tilt_alpha=0.0,
+        carry_max_single_weight=0.50,
+        overlay_target_vol_ann=0.11,
+        overlay_gross_pct=0.25,
+        max_futures_leverage=3.0,
+        enable_yield_stacking=True,
+        enable_reversal_sleeve=True,
+        reversal_gross_pct=0.35,
+        soft_dd_threshold_pct=0.06,
+        hard_dd_threshold_pct=0.10,
+    ),
+    "regime_omni_1k": StrategyProfileConfig(
+        name="regime_omni_1k",
+        capital_usd=1000.0,
+        spot_wallet_usd=550.0,
+        futures_wallet_usd=450.0,
+        carry_eta=0.55,
+        carry_top_k=3,
+        carry_min_hold_bars=63,
+        carry_entry_bps=0.45,
+        carry_exit_bps=0.0,
+        carry_buffer_rank=3,
+        carry_weighting_mode="equal",
+        carry_tilt_alpha=0.0,
+        carry_max_single_weight=0.50,
+        overlay_target_vol_ann=0.11,
+        overlay_gross_pct=0.25,
+        max_futures_leverage=3.0,
+        enable_yield_stacking=True,
+        enable_trend_sleeve=True,
+        allow_short_trend=True,
+        trend_target_vol_ann=0.15,
+        trend_max_gross_pct=0.65,
+        trend_rebalance_hours=24,
+        trend_z_entry=1.15,
+        trend_z_short_entry=1.10,
+        enable_reversal_sleeve=True,
+        reversal_gross_pct=0.35,
+        dynamic_carry_to_alpha_margin=True,
         soft_dd_threshold_pct=0.06,
         hard_dd_threshold_pct=0.10,
     ),

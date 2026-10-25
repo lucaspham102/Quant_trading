@@ -40,6 +40,11 @@ from src.directional_trend_sleeve import (  # noqa: E402
     evaluate_drawdown_circuit_breaker,
     trend_weights_to_target_qty,
 )
+from src.stat_arb_sleeve import (  # noqa: E402
+    ReversalSleeveConfig,
+    compute_funding_conditioned_reversal_weights,
+    reversal_weights_to_target_qty,
+)
 from src.strategy_profiles import (  # noqa: E402
     PROFILE_REGISTRY,
     StrategyProfileConfig,
@@ -52,7 +57,8 @@ LOGGER = logging.getLogger("sprint25_tournament")
 
 DEFAULT_PROFILES = (
     "baseline_1k,carry_max_eta_1k,hybrid_trend_conservative_1k,"
-    "hybrid_trend_balanced_1k,alpha_boost_1k,turbo_neutral_1k"
+    "hybrid_trend_balanced_1k,alpha_boost_1k,turbo_neutral_1k,"
+    "bi_trend_carry_1k,carry_stat_arb_1k,regime_omni_1k"
 )
 DEFAULT_SENSITIVITY_PROFILES = "baseline_1k,default"
 PROFILE_ORDER: tuple[str, ...] = (
@@ -63,6 +69,9 @@ PROFILE_ORDER: tuple[str, ...] = (
     "hybrid_trend_balanced_1k",
     "alpha_boost_1k",
     "turbo_neutral_1k",
+    "bi_trend_carry_1k",
+    "carry_stat_arb_1k",
+    "regime_omni_1k",
 )
 
 TOURNAMENT_LOT_STEPS: dict[str, float] = {
@@ -81,6 +90,10 @@ _RESIZE_DEADBAND = 0.20
 _SNR_GATE = 1.35
 _OVERLAY_STEP_BARS = 48
 _VOL_LOOKBACK = 168
+# Sprint 27: EWMA funding (span 9 funding events ~ 3 ngay) cho long veto / short anti-squeeze.
+_FUNDING_EWMA_ALPHA = 2.0 / (9.0 + 1.0)
+_REVERSAL_WINDOW_BARS = 240
+_REVERSAL_MAX_IMBALANCE_USD = 10.0
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -259,6 +272,8 @@ def simulate_profile(
             max_gross_pct=float(profile.trend_max_gross_pct),
             rebalance_every_hours=int(profile.trend_rebalance_hours),
             z_entry=float(profile.trend_z_entry),
+            allow_short_trend=bool(profile.allow_short_trend),
+            z_short_entry=float(profile.trend_z_short_entry),
         )
         breaker_cfg = DrawdownCircuitBreakerConfig(
             soft_dd_threshold_pct=float(profile.soft_dd_threshold_pct),
@@ -267,6 +282,21 @@ def simulate_profile(
     trend_state = TrendSleeveState()
     trend: dict[str, dict[str, float]] = {}
     trend_pnl = 0.0
+    short_trend_pnl = 0.0
+    long_trend_pnl = 0.0
+    # ---- Sprint 27: funding-conditioned reversal sleeve (market-neutral) + EWMA funding
+    reversal_enabled = bool(getattr(profile, "enable_reversal_sleeve", False))
+    reversal_cfg: ReversalSleeveConfig | None = None
+    if reversal_enabled:
+        reversal_cfg = ReversalSleeveConfig(
+            capital_usd=cap_usd, gross_pct=float(profile.reversal_gross_pct),
+        )
+    reversal: dict[str, dict[str, float]] = {}
+    reversal_pnl = 0.0
+    reversal_rebalances = 0
+    reversal_skipped_imbalance = 0
+    max_reversal_imbalance = 0.0
+    f_ewma = np.zeros(len(syms), dtype=float)
     trend_peak_equity = cap_usd
     trend_hard_lock_bars: int | None = None
     trend_cb_state = "DISABLED"
@@ -307,7 +337,22 @@ def simulate_profile(
             for s, pos in trend.items():
                 d_pp = perp[t, sidx[s]] - perp[t - 1, sidx[s]]
                 if np.isfinite(d_pp):
-                    trend_pnl += pos["qty"] * d_pp
+                    step_pnl = pos["qty"] * d_pp
+                    trend_pnl += step_pnl
+                    if pos["qty"] < 0.0:
+                        short_trend_pnl += step_pnl
+                    else:
+                        long_trend_pnl += step_pnl
+            for key, pos in reversal.items():
+                i_r = sidx[key.split("|")[0]]
+                d_pp = perp[t, i_r] - perp[t - 1, i_r]
+                if np.isfinite(d_pp):
+                    reversal_pnl += pos["qty"] * d_pp
+
+        # Sprint 27: EWMA funding (causal, cap nhat tai moi su kien funding, ke ca warmup).
+        if is_fund[t]:
+            f_now = np.where(np.isfinite(fbps[t]), fbps[t], 0.0)
+            f_ewma = (1.0 - _FUNDING_EWMA_ALPHA) * f_ewma + _FUNDING_EWMA_ALPHA * f_now
 
         # Sprint 25 fix: harvest funding for positions held during the period ENDING at t
         # BEFORE any rebalance at t, otherwise a leg opened at close t would instantly collect
@@ -328,7 +373,17 @@ def simulate_profile(
                 i = sidx[s]
                 f = fund[t, i]
                 if np.isfinite(f) and np.isfinite(perp[t, i]):
-                    trend_pnl += -pos["qty"] * perp[t, i] * f
+                    f_pnl = -pos["qty"] * perp[t, i] * f
+                    trend_pnl += f_pnl
+                    if pos["qty"] < 0.0:
+                        short_trend_pnl += f_pnl
+                    else:
+                        long_trend_pnl += f_pnl
+            for key, pos in reversal.items():
+                i = sidx[key.split("|")[0]]
+                f = fund[t, i]
+                if np.isfinite(f) and np.isfinite(perp[t, i]):
+                    reversal_pnl += -pos["qty"] * perp[t, i] * f
 
         if traded and is_fund[t]:
             valid = [s for s in syms if _ok(perp[t, sidx[s]]) and _ok(spot[t, sidx[s]])]
@@ -466,7 +521,7 @@ def simulate_profile(
 
         # ---- Sprint 26: 2-tier circuit breaker tren equity mark-to-market, roi moi tai can bang trend
         if trend_enabled:
-            eq_now = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl - fees
+            eq_now = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl - fees
             trend_peak_equity = max(trend_peak_equity, eq_now)
             pending_bars = None if trend_hard_lock_bars is None else trend_hard_lock_bars + 1
             cb = evaluate_drawdown_circuit_breaker(
@@ -516,6 +571,7 @@ def simulate_profile(
                     state=trend_state,
                     circuit_breaker=cb,
                     allow_new_entries=True,
+                    funding_bps=dict(zip(syms, f_ewma.tolist())),
                 )
                 prices_now = {
                     s: float(perp[t, sidx[s]]) for s in syms if np.isfinite(perp[t, sidx[s]])
@@ -528,13 +584,19 @@ def simulate_profile(
                     if np.isfinite(perp[t, sidx[s]])
                 )
                 overlay_gross_now = sum(abs(float(p.get("usd", 0.0))) for p in overlay.values())
+                reversal_gross_now = sum(
+                    abs(p["qty"]) * perp[t, sidx[k_r.split("|")[0]]]
+                    for k_r, p in reversal.items()
+                    if np.isfinite(perp[t, sidx[k_r.split("|")[0]]])
+                )
                 fut_capacity = max(
                     0.0,
                     float(profile.futures_wallet_usd) * float(profile.max_futures_leverage)
                     - carry_notional_now
-                    - overlay_gross_now,
+                    - overlay_gross_now
+                    - reversal_gross_now,
                 )
-                desired_gross = float(sum(weights.values())) * cap_usd
+                desired_gross = float(sum(abs(w) for w in weights.values())) * cap_usd
                 if desired_gross > 0.0 and desired_gross > fut_capacity:
                     scale = fut_capacity / desired_gross
                     weights = {s: float(w) * scale for s, w in weights.items()}
@@ -551,13 +613,13 @@ def simulate_profile(
                     if new_q == old_q:
                         continue
                     fees += abs(new_q - old_q) * px * cost_perp
-                    if new_q <= 0.0:
+                    if new_q == 0.0:
                         trend.pop(s, None)
                     else:
                         trend[s] = {"qty": new_q, "entry": px, "bar": float(t)}
                 if trend:
                     gross_now = sum(
-                        p["qty"] * float(perp[t, sidx[s]])
+                        abs(p["qty"]) * float(perp[t, sidx[s]])
                         for s, p in trend.items()
                         if np.isfinite(perp[t, sidx[s]])
                     )
@@ -569,12 +631,86 @@ def simulate_profile(
                     if fut_equity > 0.0:
                         max_lev = max(
                             max_lev,
-                            (carry_notional_now + overlay_gross_now + gross_now) / fut_equity,
+                            (carry_notional_now + overlay_gross_now + reversal_gross_now + gross_now)
+                            / fut_equity,
                         )
+
+        # ---- Sprint 27: funding-conditioned reversal sleeve (dollar-neutral, key SYM|reversal)
+        if reversal_enabled and traded and reversal_cfg is not None:
+            if (t - tstart) % trend_rebalance_bars == 0:
+                lo_r = max(0, t - _REVERSAL_WINDOW_BARS)
+                window_r = perp_frame.iloc[lo_r : t + 1]
+                rev_w = compute_funding_conditioned_reversal_weights(
+                    window_r,
+                    bar_index=len(window_r) - 1,
+                    funding_bps=dict(zip(syms, f_ewma.tolist())),
+                    config=reversal_cfg,
+                )
+                prices_r = {
+                    s: float(perp[t, sidx[s]]) for s in syms if np.isfinite(perp[t, sidx[s]])
+                }
+                carry_n = sum(
+                    p["qty"] * perp[t, sidx[s]]
+                    for s, p in carry.items()
+                    if np.isfinite(perp[t, sidx[s]])
+                )
+                ov_n = sum(abs(float(p.get("usd", 0.0))) for p in overlay.values())
+                tr_n = sum(
+                    abs(p["qty"]) * perp[t, sidx[s]]
+                    for s, p in trend.items()
+                    if np.isfinite(perp[t, sidx[s]])
+                )
+                cap_r = max(
+                    0.0,
+                    float(profile.futures_wallet_usd) * float(profile.max_futures_leverage)
+                    - carry_n - ov_n - tr_n,
+                )
+                want_r = float(sum(abs(w) for w in rev_w.values())) * cap_usd
+                if want_r > 0.0 and want_r > cap_r:
+                    rev_w = {s: float(w) * (cap_r / want_r) for s, w in rev_w.items()}
+                rev_q = reversal_weights_to_target_qty(
+                    rev_w, prices_r, cap_usd, TOURNAMENT_LOT_STEPS, min_notional_usd=10.0,
+                )
+                imbalance = abs(sum(q * prices_r[s] for s, q in rev_q.items() if s in prices_r))
+                max_reversal_imbalance = max(max_reversal_imbalance, imbalance)
+                if imbalance > _REVERSAL_MAX_IMBALANCE_USD:
+                    reversal_skipped_imbalance += 1
+                    rev_q = {}
+                    rev_w = {}
+                if rev_q or reversal:
+                    new_keys = {f"{s}|reversal": q for s, q in rev_q.items() if q != 0.0}
+                    changed = False
+                    for key in sorted(set(reversal) | set(new_keys)):
+                        s_r = key.split("|")[0]
+                        px_r = float(perp[t, sidx[s_r]]) if np.isfinite(perp[t, sidx[s_r]]) else 0.0
+                        if px_r <= 0.0:
+                            continue
+                        old_q = reversal[key]["qty"] if key in reversal else 0.0
+                        new_q = float(new_keys.get(key, 0.0))
+                        if new_q == old_q:
+                            continue
+                        fees += abs(new_q - old_q) * px_r * cost_perp
+                        changed = True
+                        if new_q == 0.0:
+                            reversal.pop(key, None)
+                        else:
+                            reversal[key] = {"qty": new_q, "entry": px_r, "bar": float(t)}
+                    if changed:
+                        reversal_rebalances += 1
+                        rev_gross = sum(
+                            abs(p["qty"]) * float(perp[t, sidx[k_r.split("|")[0]]])
+                            for k_r, p in reversal.items()
+                            if np.isfinite(perp[t, sidx[k_r.split("|")[0]]])
+                        )
+                        if float(profile.futures_wallet_usd) > 0.0:
+                            max_lev = max(
+                                max_lev,
+                                (carry_n + ov_n + tr_n + rev_gross) / float(profile.futures_wallet_usd),
+                            )
 
         k = t - start
         if traded:
-            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl - fees
+            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl - fees
             deployed = {
                 s: p["qty"] * spot[t, sidx[s]] for s, p in carry.items() if np.isfinite(spot[t, sidx[s]])
             }
@@ -594,6 +730,23 @@ def simulate_profile(
         "basis_pnl_usd": float(basis_pnl),
         "overlay_pnl_usd": float(overlay_pnl),
         "trend_pnl_usd": float(trend_pnl),
+        "short_trend_pnl_usd": float(short_trend_pnl),
+        "long_trend_pnl_usd": float(long_trend_pnl),
+        "reversal_pnl_usd": float(reversal_pnl),
+        "accounting_delta_usd": float(
+            round(
+                (float(eq[-1]) - cap_usd)
+                - (
+                    funding_pnl + basis_pnl + overlay_pnl
+                    + long_trend_pnl + short_trend_pnl + reversal_pnl - fees
+                ),
+                6,
+            )
+            + 0.0
+        ),
+        "reversal_rebalances": int(reversal_rebalances),
+        "reversal_skipped_imbalance": int(reversal_skipped_imbalance),
+        "max_reversal_imbalance_usd": float(max_reversal_imbalance),
         "trend_enabled": bool(trend_enabled),
         "circuit_breaker_triggers": int(trend_cb_triggers),
         "circuit_breaker_soft_activations": int(trend_cb_soft_activations),
@@ -615,6 +768,7 @@ def simulate_profile(
             "open_carry_symbols": sorted(carry),
             "open_overlay_symbols": sorted(overlay),
             "open_trend_symbols": sorted(trend),
+            "open_reversal_symbols": sorted(reversal),
         },
     }
 
@@ -678,6 +832,13 @@ def evaluate_window(
         "basis_pnl_usd": sim["basis_pnl_usd"],
         "overlay_pnl_usd": sim["overlay_pnl_usd"],
         "trend_pnl_usd": sim["trend_pnl_usd"],
+        "short_trend_pnl_usd": sim["short_trend_pnl_usd"],
+        "long_trend_pnl_usd": sim["long_trend_pnl_usd"],
+        "reversal_pnl_usd": sim["reversal_pnl_usd"],
+        "accounting_delta_usd": sim["accounting_delta_usd"],
+        "reversal_rebalances": sim["reversal_rebalances"],
+        "reversal_skipped_imbalance": sim["reversal_skipped_imbalance"],
+        "max_reversal_imbalance_usd": sim["max_reversal_imbalance_usd"],
         "circuit_breaker_triggers": sim["circuit_breaker_triggers"],
         "circuit_breaker_soft_activations": sim["circuit_breaker_soft_activations"],
         "circuit_breaker_bars_soft": sim["circuit_breaker_bars_soft"],
@@ -765,7 +926,8 @@ def format_tournament_table(payload: dict[str, Any]) -> str:
         ("Pure Net PnL $", 14), ("Yield APR %", 11),
         ("Yield Sharpe", 12), ("Yield MaxDD %", 13), ("Yield Net PnL $", 15),
         ("Funding $", 10), ("Overlay $", 10), ("Fees $", 9), ("Peak Fut Lev x", 14),
-        ("Cap Binds", 9), ("Trend $", 9), ("CB H/S", 7),
+        ("Cap Binds", 9), ("Trend $", 9), ("Short $", 9), ("Long $", 9), ("Rev $", 9),
+        ("Delta", 10), ("CB H/S", 7),
     ]
     sep = "+" + "+".join("-" * (w + 2) for _, w in cols) + "+"
 
@@ -788,6 +950,10 @@ def format_tournament_table(payload: dict[str, Any]) -> str:
                 f"{r['funding_pnl_usd']:.2f}", f"{r['overlay_pnl_usd']:.2f}", f"{r['fees_usd']:.2f}",
                 f"{r['max_observed_futures_leverage']:.2f}", str(int(r["cap_bind_count"])),
                 f"{r.get('trend_pnl_usd', 0.0):.2f}",
+                f"{r.get('short_trend_pnl_usd', 0.0):.2f}",
+                f"{r.get('long_trend_pnl_usd', 0.0):.2f}",
+                f"{r.get('reversal_pnl_usd', 0.0):.2f}",
+                f"{r.get('accounting_delta_usd', 0.0):.3e}",
                 # "hard triggers / soft activations" so a throttled run can never be
                 # misread as "the breaker never fired".
                 f"{int(r.get('circuit_breaker_triggers', 0))}/{int(r.get('circuit_breaker_soft_activations', 0))}",
