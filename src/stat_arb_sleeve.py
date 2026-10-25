@@ -33,6 +33,13 @@ class ReversalSleeveConfig:
     gross_pct: float = 0.35
     max_pairs: int = 2
     min_leg_usd: float = 10.0
+    only_in_choppy_regime: bool = True
+    btc_symbol: str = "BTC/USDT:USDT"
+    er_window_hours: int = 336
+    ema_med_hours: int = 504
+    max_btc_er: float = 0.22
+    min_bull_breadth: float = 0.20
+    max_bull_breadth: float = 0.75
 
     def __post_init__(self) -> None:
         if not self.capital_usd > 0:
@@ -66,6 +73,10 @@ class ReversalSleeveConfig:
             raise ValueError(f"max_pairs must be >= 1, got {self.max_pairs!r}")
         if not self.min_leg_usd >= 0:
             raise ValueError(f"min_leg_usd must be >= 0, got {self.min_leg_usd!r}")
+        if self.er_window_hours < 1 or self.ema_med_hours < 1:
+            raise ValueError("er_window_hours and ema_med_hours must be >= 1")
+        if not (0.0 <= self.min_bull_breadth <= self.max_bull_breadth <= 1.0):
+            raise ValueError("bull_breadth bounds must satisfy 0 <= min <= max <= 1")
 
 
 def _funding_lookup(funding_bps: "dict[str, float] | pd.Series | None", sym: str) -> float:
@@ -92,6 +103,7 @@ def compute_funding_conditioned_reversal_weights(
     bar_index: int,
     funding_bps: "dict[str, float] | pd.Series | None" = None,
     config: "ReversalSleeveConfig | None" = None,
+    only_in_choppy_regime: bool = True,
 ) -> dict[str, float]:
     """Compute strictly causal dollar-neutral signed weights (long > 0, short < 0).
 
@@ -122,6 +134,43 @@ def compute_funding_conditioned_reversal_weights(
     vol_win = int(cfg.vol_window_hours)
     if len(frame) < max(lookback, vol_win) + 1:
         return {}
+
+    # Sprint 28: Orthogonal Choppiness Gate (chi danh Reversal khi thi truong di ngang).
+    choppy_gate = bool(only_in_choppy_regime) and bool(cfg.only_in_choppy_regime)
+    if choppy_gate:
+        er_win = int(cfg.er_window_hours)
+        btc_er_336 = 0.0
+        btc_col = frame.get(cfg.btc_symbol)
+        if btc_col is not None and len(btc_col) >= er_win + 1:
+            tail_btc = btc_col.iloc[-(er_win + 1) :].to_numpy(dtype=float)
+            if np.all(np.isfinite(tail_btc)):
+                net_chg = abs(float(tail_btc[-1] - tail_btc[0]))
+                path_len = float(np.sum(np.abs(np.diff(tail_btc))))
+                if math.isfinite(path_len) and path_len > 1e-12:
+                    btc_er_336 = float(min(1.0, max(0.0, net_chg / path_len)))
+        ema_span = int(cfg.ema_med_hours)
+        valid_b = 0
+        above_b = 0
+        for s in frame.columns:
+            col_s = frame[s]
+            px_s = float(col_s.iloc[-1])
+            if not (math.isfinite(px_s) and px_s > 0.0):
+                continue
+            min_p = ema_span if len(col_s) >= ema_span else max(2, len(col_s))
+            ema_s = float(
+                col_s.ewm(span=ema_span, adjust=False, min_periods=min_p).mean().iloc[-1]
+            )
+            if math.isfinite(ema_s):
+                valid_b += 1
+                if px_s > ema_s:
+                    above_b += 1
+        bull_breadth = (above_b / float(valid_b)) if valid_b > 0 else 0.0
+        if (
+            (btc_er_336 > cfg.max_btc_er)
+            or (bull_breadth < cfg.min_bull_breadth)
+            or (bull_breadth > cfg.max_bull_breadth)
+        ):
+            return {}
 
     # Buoc b/c: return lookback va sigma tung symbol.
     rets: dict[str, float] = {}

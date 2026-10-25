@@ -18,6 +18,7 @@ __all__ = [
     "compute_triple_confirmed_trend_weights",
     "trend_weights_to_target_qty",
     "annualized_realized_vol",
+    "kaufman_efficiency_ratio",
 ]
 
 YEAR_HOURS = 8760.0
@@ -126,6 +127,19 @@ class TrendSleeveConfig:
     funding_short_exit_bps: float = -0.50
     btc_bear_return_hours: int = 504
 
+    # ---- Sprint 28: Macro Efficiency & Breadth Regime Filter (anti-whipsaw).
+    # Mac dinh False de khong lam doi ket qua cac profile cu.
+    require_macro_regime_filter: bool = False
+    short_gross_scale: "float | None" = None
+    er_window_hours: int = 336
+    er_slow_window_hours: int = 720
+    min_bull_breadth: float = 0.375
+    min_bear_breadth: float = 0.75
+    short_exit_bear_breadth: float = 0.50
+    min_long_er: float = 0.16
+    min_btc_bear_er: float = 0.20
+    min_btc_bear_er_slow: float = 0.20
+
     def __post_init__(self) -> None:
         if not self.capital_usd > 0:
             raise ValueError(f"capital_usd must be > 0, got {self.capital_usd!r}")
@@ -190,6 +204,31 @@ class TrendSleeveConfig:
                     f"got ({self.funding_short_entry_floor_bps!r}, "
                     f"{self.funding_short_exit_bps!r})"
                 )
+        if self.short_gross_scale is None:
+            object.__setattr__(
+                self,
+                "short_gross_scale",
+                0.65 if self.require_macro_regime_filter else 1.0,
+            )
+        if not (0.0 < float(self.short_gross_scale) <= 1.0):
+            raise ValueError(
+                f"short_gross_scale must be in (0, 1.0], got {self.short_gross_scale!r}"
+            )
+        if self.er_window_hours < 1 or self.er_slow_window_hours < self.er_window_hours:
+            raise ValueError(
+                "er_window_hours must be >= 1 and <= er_slow_window_hours, "
+                f"got ({self.er_window_hours!r}, {self.er_slow_window_hours!r})"
+            )
+        if not (0.0 <= self.min_bull_breadth <= 1.0):
+            raise ValueError(
+                f"min_bull_breadth must be in [0, 1], got {self.min_bull_breadth!r}"
+            )
+        if not (0.0 <= self.short_exit_bear_breadth <= self.min_bear_breadth <= 1.0):
+            raise ValueError(
+                "bear breadth thresholds must satisfy "
+                "0 <= short_exit_bear_breadth <= min_bear_breadth <= 1, "
+                f"got ({self.short_exit_bear_breadth!r}, {self.min_bear_breadth!r})"
+            )
 
 
 @dataclass
@@ -264,6 +303,24 @@ def annualized_realized_vol(
     if not math.isfinite(std_val) or std_val <= 0.0:
         return 0.0
     return float(std_val * math.sqrt(YEAR_HOURS) * math.sqrt(float(bar_hours)))
+
+
+def kaufman_efficiency_ratio(prices: "pd.Series", window: int = 336) -> float:
+    """Compute Kaufman Efficiency Ratio ER(w) over the last `window` bars (causal)."""
+    w = int(window)
+    if prices is None or w <= 0:
+        return 0.0
+    series = pd.Series(prices).astype("float64")
+    if len(series) < w + 1:
+        return 0.0
+    tail = series.iloc[-(w + 1) :].to_numpy(dtype=float)
+    if not np.all(np.isfinite(tail)):
+        return 0.0
+    net_change = abs(float(tail[-1] - tail[0]))
+    path_length = float(np.sum(np.abs(np.diff(tail))))
+    if not math.isfinite(path_length) or path_length <= 1e-12:
+        return 0.0
+    return float(min(1.0, max(0.0, net_change / path_length)))
 
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
@@ -393,6 +450,92 @@ def compute_triple_confirmed_trend_weights(
 
     px_now_row = frame.iloc[-1]
     sigma_vol_by_sym: dict[str, float] = {}
+    emas_by_sym: dict[str, tuple[float, float, float]] = {}
+    for s in frame.columns:
+        px_s = float(px_now_row[s])
+        if not (math.isfinite(px_s) and px_s > 0.0):
+            continue
+        ser_s = frame[s]
+        ef_s = float(_ema(ser_s, cfg.ema_fast_hours).iloc[-1])
+        em_s = float(_ema(ser_s, cfg.ema_med_hours).iloc[-1])
+        es_s = float(_ema(ser_s, cfg.ema_slow_hours).iloc[-1])
+        emas_by_sym[s] = (ef_s, em_s, es_s)
+
+    # Sprint 28: Macro Efficiency & Breadth Regime Filter (causal 100%).
+    bull_breadth = 1.0
+    bear_breadth = 1.0
+    btc_er_336 = 1.0
+    btc_smooth_bear = True
+    btc_cascade_bear = True
+    btc_above_fast = False
+    if cfg.require_macro_regime_filter:
+        valid_breadth_syms = [
+            s
+            for s, (_, em_s, es_s) in emas_by_sym.items()
+            if math.isfinite(em_s) and math.isfinite(es_s)
+        ]
+        if valid_breadth_syms:
+            n_b = float(len(valid_breadth_syms))
+            bull_breadth = (
+                sum(
+                    1
+                    for s in valid_breadth_syms
+                    if float(px_now_row[s]) > emas_by_sym[s][1]
+                )
+                / n_b
+            )
+            bear_breadth = (
+                sum(
+                    1
+                    for s in valid_breadth_syms
+                    if (float(px_now_row[s]) < emas_by_sym[s][1])
+                    and (float(px_now_row[s]) < emas_by_sym[s][2])
+                )
+                / n_b
+            )
+        else:
+            bull_breadth = 0.0
+            bear_breadth = 0.0
+
+        btc_ser = frame.get(cfg.btc_symbol)
+        macro_btc = _btc_macro_state(frame, cfg)
+        btc_dd_ok = (macro_btc is not None) and (macro_btc[3] >= 0.12)
+        if btc_ser is not None and cfg.btc_symbol in emas_by_sym:
+            btc_px = float(px_now_row[cfg.btc_symbol])
+            btc_ef, btc_em, btc_es = emas_by_sym[cfg.btc_symbol]
+            btc_er_336 = kaufman_efficiency_ratio(btc_ser, cfg.er_window_hours)
+            btc_er_504 = kaufman_efficiency_ratio(btc_ser, cfg.short_horizon_hours)
+            btc_er_720 = kaufman_efficiency_ratio(btc_ser, cfg.er_slow_window_hours)
+            btc_smooth_bear = bool(
+                (btc_er_336 >= cfg.min_btc_bear_er)
+                or (btc_er_504 >= cfg.min_btc_bear_er_slow)
+                or (btc_er_720 >= cfg.min_btc_bear_er_slow)
+            )
+            btc_cascade_bear = bool(
+                math.isfinite(btc_px)
+                and math.isfinite(btc_ef)
+                and math.isfinite(btc_em)
+                and math.isfinite(btc_es)
+                and (btc_px < btc_ef < btc_em < btc_es)
+            )
+            btc_above_fast = bool(
+                (not math.isfinite(btc_px))
+                or (not math.isfinite(btc_ef))
+                or (btc_px > btc_ef)
+            )
+        else:
+            btc_er_336 = 0.0
+            btc_smooth_bear = False
+            btc_cascade_bear = False
+            btc_above_fast = True
+
+        bear_regime = bool(
+            cfg.allow_short_trend
+            and (bear_breadth >= cfg.min_bear_breadth)
+            and btc_smooth_bear
+            and btc_cascade_bear
+            and btc_dd_ok
+        )
 
     for s in frame.columns:
         px_now = float(px_now_row[s])
@@ -404,9 +547,12 @@ def compute_triple_confirmed_trend_weights(
             continue
 
         series = frame[s]
-        ema_f = float(_ema(series, cfg.ema_fast_hours).iloc[-1])
-        ema_m = float(_ema(series, cfg.ema_med_hours).iloc[-1])
-        ema_s = float(_ema(series, cfg.ema_slow_hours).iloc[-1])
+        ema_f, ema_m, ema_s = emas_by_sym[s]
+        er_symbol_336 = (
+            kaufman_efficiency_ratio(series, cfg.er_window_hours)
+            if cfg.require_macro_regime_filter
+            else 1.0
+        )
 
         if len(series) >= cfg.short_horizon_hours:
             idx_short = max(0, len(series) - 1 - int(cfg.short_horizon_hours))
@@ -515,7 +661,14 @@ def compute_triple_confirmed_trend_weights(
                 px_now < peak * (1.0 - cfg.trail_k_sigma * sigma_daily)
             )
             med_hit = (not math.isfinite(ema_m)) or (px_now < ema_m)
-            stay = not (trail_hit or med_hit)
+            macro_long_exit = bool(
+                cfg.require_macro_regime_filter
+                and (
+                    (bull_breadth < cfg.min_bull_breadth)
+                    or ((bull_breadth < 0.50) and (er_symbol_336 < 0.12))
+                )
+            )
+            stay = not (trail_hit or med_hit or macro_long_exit)
             if not stay:
                 state.active[s] = False
                 state.peak_close.pop(s, None)
@@ -532,7 +685,11 @@ def compute_triple_confirmed_trend_weights(
             )
             fast_hit = (not math.isfinite(ema_f)) or (px_now > ema_f)
             squeeze_hit = f_bps < cfg.funding_short_exit_bps
-            stay = not (trail_up or fast_hit or squeeze_hit)
+            macro_short_exit = bool(
+                cfg.require_macro_regime_filter
+                and (btc_above_fast or (bear_breadth < cfg.short_exit_bear_breadth))
+            )
+            stay = not (trail_up or fast_hit or squeeze_hit or macro_short_exit)
             if not stay:
                 state.active[s] = False
                 state.peak_close.pop(s, None)
@@ -544,7 +701,36 @@ def compute_triple_confirmed_trend_weights(
             long_funding_ok = (not cfg.allow_short_trend) or (
                 f_bps <= cfg.funding_long_veto_bps
             )
-            if aligned and conviction and gate and long_funding_ok and long_macro_ok:
+            btc_emas = emas_by_sym.get(cfg.btc_symbol)
+            btc_px_now = (
+                float(px_now_row[cfg.btc_symbol])
+                if cfg.btc_symbol in frame.columns
+                else float("nan")
+            )
+            btc_super_bull = bool(
+                btc_emas is not None
+                and math.isfinite(btc_px_now)
+                and math.isfinite(btc_emas[0])
+                and math.isfinite(btc_emas[1])
+                and math.isfinite(btc_emas[2])
+                and (btc_px_now > btc_emas[0] > btc_emas[1] > btc_emas[2])
+            )
+            if not cfg.require_macro_regime_filter:
+                long_regime_ok = True
+            elif (bull_breadth >= 0.875) and btc_super_bull:
+                long_regime_ok = er_symbol_336 >= max(0.08, float(cfg.min_long_er))
+            elif bull_breadth >= cfg.min_bull_breadth:
+                long_regime_ok = er_symbol_336 >= max(0.16, float(cfg.min_long_er))
+            else:
+                long_regime_ok = False
+            if (
+                aligned
+                and conviction
+                and gate
+                and long_funding_ok
+                and long_macro_ok
+                and long_regime_ok
+            ):
                 state.active[s] = True
                 state.side[s] = 1
                 state.peak_close[s] = px_now
@@ -598,12 +784,15 @@ def compute_triple_confirmed_trend_weights(
     else:
         raw_scale = 1.0
     risk_scale = min(1.0, max(0.0, raw_scale))
+    short_scale = float(
+        cfg.short_gross_scale if cfg.short_gross_scale is not None else 1.0
+    )
 
     result: dict[str, float] = {}
     for s in ordered:
         weight_i = gross_total * raw_weights[s] / total_raw
         if weight_i > 0.0:
-            signed_i = weight_i if side_of[s] == 1 else -weight_i
+            signed_i = weight_i if side_of[s] == 1 else -(weight_i * short_scale)
             result[s] = float(signed_i * risk_scale)
     return result
 
@@ -614,7 +803,7 @@ def trend_weights_to_target_qty(
     capital_usd: float,
     lot_steps: "dict[str, float] | None" = None,
     min_notional_usd: float = 10.0,
-  ) -> dict[str, float]:
+) -> dict[str, float]:
     """Convert target capital weights into rounded SIGNED base quantities per symbol.
 
     Sprint 27: weight am tao qty am (short). Weight duong giu nguyen ket qua Sprint 26.

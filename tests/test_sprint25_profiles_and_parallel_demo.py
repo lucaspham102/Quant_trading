@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover - fallback if scripts is not importable
 # below stays frozen so a rename/removal of the original five still fails this test.
 SPRINT25_PROFILES = {"default", "canary_400", "baseline_1k", "alpha_boost_1k", "turbo_neutral_1k"}
 SPRINT26_PROFILES = {"carry_max_eta_1k", "hybrid_trend_conservative_1k", "hybrid_trend_balanced_1k"}
-SPRINT27_PROFILES = {"bi_trend_carry_1k", "carry_stat_arb_1k", "regime_omni_1k"}
+SPRINT27_PROFILES = {"bi_trend_carry_1k", "carry_stat_arb_1k", "regime_omni_1k", "flexible_regime_1k"}
 EXPECTED_PROFILES = SPRINT25_PROFILES | SPRINT26_PROFILES | SPRINT27_PROFILES
 MONEY = dict(rel=1e-6, abs=1e-6)
 BTC = "BTC/USDT:USDT"
@@ -78,7 +78,7 @@ def _fresh_ledger(path, profile):
 # ------------------------------------------------------------------ profiles --
 def test_registry_has_exactly_the_five_profiles():
     assert set(PROFILE_REGISTRY) == EXPECTED_PROFILES
-    assert len(PROFILE_REGISTRY) == 11
+    assert len(PROFILE_REGISTRY) == 12
     # The original Sprint 25 five must never disappear.
     assert SPRINT25_PROFILES <= set(PROFILE_REGISTRY)
 
@@ -472,7 +472,7 @@ def test_tournament_includes_default_3000_profile():
         "hybrid_trend_balanced_1k",
         "alpha_boost_1k",
         "turbo_neutral_1k",
-        "alpha_boost_1k_pure_equal", "bi_trend_carry_1k", "carry_stat_arb_1k", "regime_omni_1k",
+        "alpha_boost_1k_pure_equal", "bi_trend_carry_1k", "carry_stat_arb_1k", "regime_omni_1k", "flexible_regime_1k",
     }
 
 

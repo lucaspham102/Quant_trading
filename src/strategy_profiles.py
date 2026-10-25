@@ -1,6 +1,6 @@
 """Bo may profile chien luoc cho giai dau toi uu hoa von 1,000 USDT.
 
-Module gom 8 profile dang ky trong PROFILE_REGISTRY:
+Module gom 12 profile dang ky trong PROFILE_REGISTRY:
 - default: baseline mainnet 3,000 USDT (dong bang, khong doi).
 - canary_400: canary 400 USDT chia vi spot/futures.
 - baseline_1k: baseline bao thu 1,000 USDT.
@@ -9,6 +9,10 @@ Module gom 8 profile dang ky trong PROFILE_REGISTRY:
 - carry_max_eta_1k: 100% market-neutral carry hieu suat von cao (Sprint 26).
 - hybrid_trend_conservative_1k: carry + trend sleeve bao thu + circuit breaker (Sprint 26).
 - hybrid_trend_balanced_1k: carry + trend sleeve can bang + circuit breaker (Sprint 26).
+- bi_trend_carry_1k: carry + bidirectional trend sleeve (Sprint 27).
+- carry_stat_arb_1k: carry + funding-conditioned reversal sleeve (Sprint 27).
+- regime_omni_1k: carry + bidirectional trend + reversal sleeve (Sprint 27).
+- flexible_regime_1k: carry + macro efficiency & breadth regime switcher (Sprint 28).
 
 Chi dung thu vien chuan, khong co tac dung phu khi import.
 """
@@ -56,6 +60,9 @@ class StrategyProfileConfig:
     enable_reversal_sleeve: bool = False
     reversal_gross_pct: float = 0.0
     dynamic_carry_to_alpha_margin: bool = False
+    # ---- Sprint 28: Macro Efficiency & Breadth Regime Filter
+    require_macro_regime_filter: bool = False
+    short_gross_scale: float = 1.0
     soft_dd_threshold_pct: float = 0.06
     hard_dd_threshold_pct: float = 0.10
     bfusd_apy: float = 0.045
@@ -138,6 +145,14 @@ class StrategyProfileConfig:
             raise ValueError(
                 "trend_z_short_entry must be > 0 when allow_short_trend=True, "
                 f"got {self.trend_z_short_entry!r}"
+            )
+        if self.require_macro_regime_filter and not self.enable_trend_sleeve:
+            raise ValueError(
+                "require_macro_regime_filter=True requires enable_trend_sleeve=True"
+            )
+        if not (0.0 < self.short_gross_scale <= 1.0):
+            raise ValueError(
+                f"short_gross_scale must be in (0, 1], got {self.short_gross_scale!r}"
             )
         if self.enable_reversal_sleeve:
             if not 0.0 < self.reversal_gross_pct <= 1.0:
@@ -395,6 +410,8 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         enable_yield_stacking=True,
         enable_trend_sleeve=True,
         allow_short_trend=True,
+        require_macro_regime_filter=True,
+        short_gross_scale=0.75,
         trend_target_vol_ann=0.15,
         trend_max_gross_pct=0.65,
         trend_rebalance_hours=24,
@@ -402,6 +419,40 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         trend_z_short_entry=1.10,
         enable_reversal_sleeve=True,
         reversal_gross_pct=0.35,
+        dynamic_carry_to_alpha_margin=True,
+        soft_dd_threshold_pct=0.06,
+        hard_dd_threshold_pct=0.10,
+    ),
+    # ---- Sprint 28: Market-Structure & Macro Regime Switcher (600 Spot / 400 Futures)
+    "flexible_regime_1k": StrategyProfileConfig(
+        name="flexible_regime_1k",
+        capital_usd=1000.0,
+        spot_wallet_usd=600.0,
+        futures_wallet_usd=400.0,
+        carry_eta=0.60,
+        carry_top_k=3,
+        carry_min_hold_bars=63,
+        carry_entry_bps=0.45,
+        carry_exit_bps=0.0,
+        carry_buffer_rank=3,
+        carry_weighting_mode="equal",
+        carry_tilt_alpha=0.0,
+        carry_max_single_weight=0.50,
+        overlay_target_vol_ann=0.075,
+        overlay_gross_pct=0.15,
+        max_futures_leverage=3.0,
+        enable_yield_stacking=True,
+        enable_trend_sleeve=True,
+        allow_short_trend=True,
+        require_macro_regime_filter=True,
+        short_gross_scale=0.65,
+        trend_target_vol_ann=0.15,
+        trend_max_gross_pct=0.70,
+        trend_rebalance_hours=24,
+        trend_z_entry=1.15,
+        trend_z_short_entry=1.10,
+        enable_reversal_sleeve=True,
+        reversal_gross_pct=0.25,
         dynamic_carry_to_alpha_margin=True,
         soft_dd_threshold_pct=0.06,
         hard_dd_threshold_pct=0.10,

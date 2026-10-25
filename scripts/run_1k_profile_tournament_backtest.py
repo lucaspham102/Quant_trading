@@ -58,7 +58,7 @@ LOGGER = logging.getLogger("sprint25_tournament")
 DEFAULT_PROFILES = (
     "baseline_1k,carry_max_eta_1k,hybrid_trend_conservative_1k,"
     "hybrid_trend_balanced_1k,alpha_boost_1k,turbo_neutral_1k,"
-    "bi_trend_carry_1k,carry_stat_arb_1k,regime_omni_1k"
+    "bi_trend_carry_1k,carry_stat_arb_1k,regime_omni_1k,flexible_regime_1k"
 )
 DEFAULT_SENSITIVITY_PROFILES = "baseline_1k,default"
 PROFILE_ORDER: tuple[str, ...] = (
@@ -72,6 +72,7 @@ PROFILE_ORDER: tuple[str, ...] = (
     "bi_trend_carry_1k",
     "carry_stat_arb_1k",
     "regime_omni_1k",
+    "flexible_regime_1k",
 )
 
 TOURNAMENT_LOT_STEPS: dict[str, float] = {
@@ -274,6 +275,10 @@ def simulate_profile(
             z_entry=float(profile.trend_z_entry),
             allow_short_trend=bool(profile.allow_short_trend),
             z_short_entry=float(profile.trend_z_short_entry),
+            require_macro_regime_filter=bool(
+                getattr(profile, "require_macro_regime_filter", False)
+            ),
+            short_gross_scale=float(getattr(profile, "short_gross_scale", 1.0)),
         )
         breaker_cfg = DrawdownCircuitBreakerConfig(
             soft_dd_threshold_pct=float(profile.soft_dd_threshold_pct),
@@ -567,7 +572,7 @@ def simulate_profile(
                 weights = compute_triple_confirmed_trend_weights(
                     window,
                     bar_index=len(window) - 1,
-                    config=trend_cfg,
+                    config= dataclasses.replace(trend_cfg, max_gross_pct=min(1.0, float(profile.trend_max_gross_pct) + max(0.0, float(profile.carry_eta) - sum(p["qty"] * perp[t, sidx[s]] for s, p in carry.items() if np.isfinite(perp[t, sidx[s]])) / cap_usd) * 0.5)) if bool(getattr(profile, "dynamic_carry_to_alpha_margin", False)) else trend_cfg,
                     state=trend_state,
                     circuit_breaker=cb,
                     allow_new_entries=True,

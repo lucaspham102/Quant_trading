@@ -55,6 +55,11 @@ from src.exchange_reconciler import (
     load_or_create_testnet_baseline,
 )
 from src.state_store import StateStore
+from src.stat_arb_sleeve import (
+    ReversalSleeveConfig,
+    compute_funding_conditioned_reversal_weights,
+    reversal_weights_to_target_qty,
+)
 from src.strategy_profiles import (
     PROFILE_REGISTRY,
     StrategyProfileConfig,
@@ -218,6 +223,7 @@ def _default_ledger(profile: str | StrategyProfileConfig) -> dict[str, Any]:
         "funding_pnl_usd": 0.0,
         "overlay_pnl_usd": 0.0,
         "trend_pnl_usd": 0.0,
+        "reversal_pnl_usd": 0.0,
         "basis_pnl_usd": 0.0,
         "spot_unrealized_pnl_usd": 0.0,
         "perp_unrealized_pnl_usd": 0.0,
@@ -235,6 +241,7 @@ def _default_ledger(profile: str | StrategyProfileConfig) -> dict[str, Any]:
         "overlay_short_usd": 0.0,
         "trend_long_usd": 0.0,
         "trend_gross_usd": 0.0,
+        "reversal_gross_usd": 0.0,
         "futures_leverage": 0.0,
         "status": "INIT",
         "circuit_breaker_state": "DISABLED",
@@ -254,6 +261,7 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         "funding_pnl_usd",
         "overlay_pnl_usd",
         "trend_pnl_usd",
+        "reversal_pnl_usd",
         "basis_pnl_usd",
         "spot_unrealized_pnl_usd",
         "perp_unrealized_pnl_usd",
@@ -266,6 +274,7 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         "overlay_short_usd",
         "trend_long_usd",
         "trend_gross_usd",
+        "reversal_gross_usd",
         "futures_leverage",
         "circuit_breaker_risk_scale",
     )
@@ -624,6 +633,7 @@ def accrue_cycle_accounting(
         funding_delta = 0.0
         overlay_funding_delta = 0.0
         trend_funding_delta = 0.0
+        reversal_funding_delta = 0.0
         for key, pos in pos_map.items():
             if not isinstance(pos, dict):
                 continue
