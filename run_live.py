@@ -1,6 +1,8 @@
 """CLI khởi chạy Paper/Live Executor (24/7 hoặc --once)."""
 import argparse
 import dataclasses
+import socket
+socket.setdefaulttimeout(25.0)
 import logging
 import os
 import sys
@@ -957,6 +959,31 @@ def _run_testnet_order_pair(
     return record
 
 
+def disable_windows_quick_edit() -> bool:
+    """Disable Windows Console QuickEdit mode to prevent stdout freeze on mouse click."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+
+        h_stdin = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if not h_stdin or h_stdin == -1:
+            return False
+
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return False
+
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        return bool(kernel32.SetConsoleMode(h_stdin, new_mode))
+    except Exception:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         return _main_impl(argv)
@@ -973,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main_impl(argv: list[str] | None = None) -> int:
+    disable_windows_quick_edit()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

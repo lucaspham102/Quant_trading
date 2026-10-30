@@ -2,6 +2,7 @@
 import logging
 import os
 from collections.abc import Callable
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,7 +69,7 @@ class TelegramNotifier:
 
         self.bot_token: Optional[str] = resolved_token.strip() if resolved_token else None
         self.chat_id: Optional[str] = resolved_chat.strip() if resolved_chat else None
-        self.timeout_sec: float = float(timeout_sec)
+        self.timeout_sec: float = float(timeout_sec) if timeout_sec and float(timeout_sec) > 0 else 5.0
         self.max_retries: int = max(1, int(max_retries))
         self.env_file: Optional[Path] = Path(env_file) if env_file is not None else None
         self.http_post: Callable[..., Any] = http_post if http_post is not None else requests.post
@@ -82,8 +83,12 @@ class TelegramNotifier:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {"chat_id": self.chat_id, "text": str(text)}
         last_error: Optional[ BaseException | str ] = None
+        start_mono = time.monotonic()
+        max_elapsed_sec = float(self.max_retries) * self.timeout_sec + 5.0
 
         for _ in range(self.max_retries):
+            if time.monotonic() - start_mono > max_elapsed_sec:
+                break
             try:
                 response = self.http_post(url, json=payload, timeout=self.timeout_sec)
                 status_code = getattr(response, "status_code", 200)

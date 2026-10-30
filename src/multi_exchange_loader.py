@@ -11,6 +11,7 @@ Cung cấp:
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -151,11 +152,11 @@ def fetch_exchange_funding_history(
         import ccxt
 
         if ex == "binance":
-            exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            exchange = ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
         elif ex == "bybit":
-            exchange = ccxt.bybit({"enableRateLimit": True})
+            exchange = ccxt.bybit({"enableRateLimit": True, "timeout": 20000})
         elif ex == "okx":
-            exchange = ccxt.okx({"enableRateLimit": True})
+            exchange = ccxt.okx({"enableRateLimit": True, "timeout": 20000})
 
     now_ms = (
         int(exchange.milliseconds())
@@ -178,8 +179,15 @@ def fetch_exchange_funding_history(
     # 3. Vòng lặp phân trang theo đặc thù từng sàn
     all_rows: list[dict[str, Any]] = []
     curr_since = fetch_start_ms
+    start_mono = time.monotonic()
+    max_elapsed_sec = 120.0
+    max_pages = 500
+    pages = 0
 
     while True:
+        pages += 1
+        if pages > max_pages or (time.monotonic() - start_mono) > max_elapsed_sec:
+            break
         if curr_since >= target_end_ms:
             break
 

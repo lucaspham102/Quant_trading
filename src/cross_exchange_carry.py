@@ -29,7 +29,7 @@ EXCHANGE_LOT_SPECS: dict[str, dict[str, float]] = {
     "BNB/USDT:USDT": {"step_size": 0.01,  "min_notional": 10.0},
     "DOGE/USDT:USDT": {"step_size": 1.0,  "min_notional": 10.0},
     "XRP/USDT:USDT": {"step_size": 0.1,   "min_notional": 10.0},
-    "AVAX/USDT:USDT": {"step_size": 0.1,  "min_notional": 10.0},
+    "AVAX/USDT:USDT": {"step_size": 1.0,  "min_notional": 10.0},
     "LINK/USDT:USDT": {"step_size": 0.01, "min_notional": 10.0},
 }
 LOT_STEP_SIZES: dict[str, float] = {k: v["step_size"] for k, v in EXCHANGE_LOT_SPECS.items()}

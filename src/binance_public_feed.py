@@ -115,6 +115,7 @@ def fetch_binance_shadow_snapshot(
         }
 
     # Network mode
+    safe_timeout = float(timeout_sec) if timeout_sec and float(timeout_sec) > 0 else 5.0
     book_url = f"{BINANCE_FAPI_BASE}{BOOK_TICKER_PATH}"
     prem_url = f"{BINANCE_FAPI_BASE}{PREMIUM_INDEX_PATH}"
 
@@ -122,13 +123,13 @@ def fetch_binance_shadow_snapshot(
     prem_map: dict[str, dict[str, Any]] = {}
 
     try:
-        with urllib.request.urlopen(book_url, timeout=timeout_sec) as resp:
+        with urllib.request.urlopen(book_url, timeout=safe_timeout) as resp:
             raw_book = resp.read()
         book_list = json.loads(raw_book)
         if not isinstance(book_list, list):
             raise ValueError("bookTicker response is not a list")
 
-        with urllib.request.urlopen(prem_url, timeout=timeout_sec) as resp:
+        with urllib.request.urlopen(prem_url, timeout=safe_timeout) as resp:
             raw_prem = resp.read()
         prem_list = json.loads(raw_prem)
         if not isinstance(prem_list, list):

@@ -125,7 +125,7 @@ def test_lot_specs_cover_liquid_8_with_correct_step_sizes() -> None:
     expected_steps = {
         "DOGE/USDT:USDT": 1.0,
         "XRP/USDT:USDT": 0.1,
-        "AVAX/USDT:USDT": 0.1,
+        "AVAX/USDT:USDT": 1.0,
         "LINK/USDT:USDT": 0.01,
         "BTC/USDT:USDT": 0.001,
         "ETH/USDT:USDT": 0.01,

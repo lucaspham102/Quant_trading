@@ -15,9 +15,13 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import socket
+socket.setdefaulttimeout(25.0)
+import threading
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 import sys
@@ -54,6 +58,7 @@ from src.exchange_reconciler import (
     compute_testnet_delta_snapshot,
     load_or_create_testnet_baseline,
 )
+from src.raw_data_refresh import cache_last_timestamps, refresh_raw_data
 from src.state_store import StateStore
 from src.stat_arb_sleeve import (
     ReversalSleeveConfig,
@@ -66,6 +71,8 @@ from src.strategy_profiles import (
     compute_step_passive_yield_usd,
 )
 
+logger = logging.getLogger(__name__)
+
 CARRY_FEE_RATE = (7.5 + 5.0) / 10000.0
 OVERLAY_FEE_RATE = 5.0 / 10000.0
 
@@ -77,9 +84,9 @@ DEMO_LOT_STEPS: dict[str, float] = {
     "BTC/USDT:USDT": 0.001,
     "ETH/USDT:USDT": 0.001,
     "SOL/USDT:USDT": 0.01,
-    "BNB/USDT:USDT": 0.001,
+    "BNB/USDT:USDT": 0.01,
     "LINK/USDT:USDT": 0.01,
-    "AVAX/USDT:USDT": 0.01,
+    "AVAX/USDT:USDT": 1.0,
     "XRP/USDT:USDT": 1.0,
     "DOGE/USDT:USDT": 1.0,
 }
@@ -89,10 +96,173 @@ DEMO_LOT_STEPS: dict[str, float] = {
 SPOT_BOOK_TICKER_URL = "https://api.binance.com/api/v3/ticker/bookTicker"
 
 #: Isolated testnet baseline for the demo runner. Never share it with ``run_live.py``.
+#: Isolated testnet baseline for the demo runner. Never share it with ``run_live.py``.
 DEMO_TESTNET_BASELINE_FILENAME = "demo_testnet_baseline.json"
+
+#: Heartbeat state filename for active watchdog monitoring.
+HEARTBEAT_FILENAME = "tournament_heartbeat.json"
+
+#: Maximum wall-clock seconds for a single cycle before the watchdog aborts the process.
+DEFAULT_MAX_CYCLE_DURATION_SEC = 600.0
+
+
+def disable_windows_quick_edit() -> bool:
+    """Disable Windows Console QuickEdit mode to prevent stdout freeze on mouse click."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+
+        h_stdin = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        if not h_stdin or h_stdin == -1:
+            return False
+
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return False
+
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        return bool(kernel32.SetConsoleMode(h_stdin, new_mode))
+    except Exception:
+        return False
+
+
+def write_heartbeat(
+    demo_dir: str,
+    cycle: int,
+    phase: str,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Write an atomic heartbeat record with PID, cycle, phase, timestamp and epoch."""
+    path = os.path.join(demo_dir, HEARTBEAT_FILENAME)
+    payload = {
+        "pid": os.getpid(),
+        "cycle": int(cycle),
+        "phase": str(phase),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "epoch_sec": float(time.time()),
+    }
+    if extra:
+        payload.update(extra)
+
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
+    return path
+
+
+class CycleWatchdog:
+    """Cycle-level watchdog thread that forces process termination on hang."""
+
+    def __init__(self, max_duration_sec: float = DEFAULT_MAX_CYCLE_DURATION_SEC) -> None:
+        self.max_duration_sec = float(max_duration_sec)
+        self._current_cycle: int = 0
+        self._cycle_start_mono: float | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name="CycleWatchdog")
+        self._thread.start()
+
+    def start_cycle(self, cycle: int) -> None:
+        with self._lock:
+            self._current_cycle = int(cycle)
+            self._cycle_start_mono = time.monotonic()
+
+    def stop_cycle(self) -> None:
+        with self._lock:
+            self._cycle_start_mono = None
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+
+    def _monitor_loop(self) -> None:
+        interval = min(1.0, max(0.05, self.max_duration_sec / 4.0))
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(timeout=interval):
+                break
+            with self._lock:
+                if self._cycle_start_mono is not None:
+                    elapsed = time.monotonic() - self._cycle_start_mono
+                    if elapsed > self.max_duration_sec:
+                        logger.critical(
+                            "CRITICAL: CYCLE_WATCHDOG_TIMEOUT - cycle %d exceeded %.1fs ceiling (elapsed=%.1fs). Forcing os._exit(2).",
+                            self._current_cycle,
+                            self.max_duration_sec,
+                            elapsed,
+                        )
+                        print(
+                            f"\n[WATCHDOG] CRITICAL: CYCLE_WATCHDOG_TIMEOUT - cycle {self._current_cycle} "
+                            f"exceeded {self.max_duration_sec:.1f}s ceiling (elapsed: {elapsed:.1f}s). Aborting process immediately.\n",
+                            flush=True,
+                        )
+                        os._exit(2)
+
+
+def interruptible_sleep(
+    total_seconds: float,
+    cycle: int,
+    demo_dir: str,
+    chunk_seconds: float = 60.0,
+) -> None:
+    """Sleeps total_seconds in chunks of chunk_seconds, updating heartbeat and flushing stdout."""
+    start_mono = time.monotonic()
+    total = float(total_seconds)
+    chunk = max(0.01, float(chunk_seconds))
+    while True:
+        elapsed = time.monotonic() - start_mono
+        remaining = total - elapsed
+        if remaining <= 0:
+            break
+        step = min(remaining, chunk)
+        time.sleep(step)
+        now_remaining = max(0.0, total - (time.monotonic() - start_mono))
+        write_heartbeat(
+            demo_dir,
+            cycle=cycle,
+            phase="SLEEPING",
+            extra={
+                "sleep_remaining_sec": round(now_remaining, 2),
+                "sleep_total_sec": float(total),
+            },
+        )
+        sys.stdout.flush()
 
 #: Reconcile drift tolerance (fraction of capital) before the status flips to DRIFT_WARNING.
 RECONCILE_DRIFT_TOLERANCE_PCT = 0.015
+
+#: Hours of 1h history handed to the Trend / Reversal sleeves (needs >= TrendSleeveConfig.min_history_hours).
+TREND_HISTORY_BARS = 1500
+#: Window the Carry/Overlay executor keeps using, so the Carry baseline is bit-for-bit unchanged.
+CARRY_LOOKBACK_BARS = 720
+#: Smoothing of the funding input shared with the backtest (span 9 over funding events).
+FUNDING_EWMA_ALPHA = 2.0 / (9.0 + 1.0)
+#: Reversal sleeve parameters copied from run_1k_profile_tournament_backtest.py.
+REVERSAL_WINDOW_BARS = 240
+REVERSAL_MAX_IMBALANCE_USD = 10.0
+#: Last aligned candle older than this (hours) raises a STALE_DATA warning.
+STALE_DATA_MAX_AGE_HOURS = 2.0
 
 
 def _num(x: Any, default: float = 0.0) -> float:
@@ -161,6 +331,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=10.0,
         help="HTTP timeout in seconds for public market snapshot.",
+    )
+    parser.add_argument(
+        "--no-refresh-raw",
+        action="store_true",
+        help="Do not refresh data/raw parquet files at the start of each cycle (static data test).",
+    )
+    parser.add_argument(
+        "--no-directional-real-orders",
+        action="store_true",
+        help="In TESTNET_REAL keep Trend/Reversal on the virtual ledger (no real orders).",
+    )
+    parser.add_argument(
+        "--max-cycle-duration-sec",
+        type=float,
+        default=DEFAULT_MAX_CYCLE_DURATION_SEC,
+        help="Maximum duration in seconds per cycle before watchdog aborts process.",
     )
     return parser.parse_args(argv)
 
@@ -367,7 +553,18 @@ def save_ledger_atomic(path: str, ledger: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(clean, f, indent=2, ensure_ascii=True, sort_keys=True)
         f.flush()
-    os.replace(tmp_path, path)
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 def build_demo_executor(
@@ -378,6 +575,7 @@ def build_demo_executor(
     raw_dir: str = "data/raw",
     execute_real: bool = False,
     signed_client: Any = None,
+    lookback_hours: int | None = None,
 ) -> CarryLiveExecutor:
     if not execute_real or mode in ("SHADOW_LIVE", "paper"):
         exec_mode = "paper"
@@ -386,7 +584,11 @@ def build_demo_executor(
     else:
         exec_mode = str(mode)
 
+    extra_kwargs: dict[str, Any] = {}
+    if lookback_hours is not None:
+        extra_kwargs["lookback_hours"] = int(lookback_hours)
     return CarryLiveExecutor(
+        **extra_kwargs,
         config=TradingConfig(
             timeframe="1h",
             raw_data_dir=str(raw_dir),
@@ -679,6 +881,7 @@ def accrue_cycle_accounting(
     unrealized_carry = 0.0
     unrealized_overlay = 0.0
     unrealized_trend = 0.0
+    unrealized_reversal = 0.0
     basis_total = 0.0
     spot_unreal_total = 0.0
     perp_unreal_total = 0.0
@@ -711,6 +914,9 @@ def accrue_cycle_accounting(
         elif kind == "trend":
             if entry > 0.0 and mid > 0.0:
                 unrealized_trend += signed_usd * (mid / entry - 1.0)
+        elif kind == "reversal":
+            if entry > 0.0 and mid > 0.0:
+                unrealized_reversal += signed_usd * (mid / entry - 1.0)
 
     ledger["basis_pnl_usd"] = basis_total
     ledger["spot_unrealized_pnl_usd"] = spot_unreal_total
@@ -723,7 +929,9 @@ def accrue_cycle_accounting(
     )
 
     realized = _num(ledger.get("realized_pnl_usd"), 0.0)
-    unrealized_total = unrealized_carry + unrealized_overlay + unrealized_trend
+    unrealized_total = (
+        unrealized_carry + unrealized_overlay + unrealized_trend + unrealized_reversal
+    )
     pure_eq = _num(profile.capital_usd, 1000.0) + realized + unrealized_total
     yield_eq = pure_eq + _num(ledger.get("cumulative_passive_yield_usd"), 0.0)
 
@@ -917,7 +1125,7 @@ def refresh_position_ledger(
     # ---- Sprint 26: trend legs are owned by apply_trend_sleeve (not by the executor), so
     # they must survive the executor-driven rebuild of the snapshot.
     for key, pos in prev.items():
-        if isinstance(pos, dict) and str(pos.get("kind", "carry")) == "trend":
+        if isinstance(pos, dict) and str(pos.get("kind", "carry")) in ("trend", "reversal"):
             new_snapshot[str(key)] = dict(pos)
 
     ledger["positions_snapshot"] = new_snapshot
@@ -998,6 +1206,16 @@ def _mark_to_market(
             basis_total += basis
             spot_unreal_total += spot_u
             perp_unreal_total += perp_u
+    unreal_reversal = 0.0
+    if isinstance(positions, dict):
+        for key, pos in positions.items():
+            if not isinstance(pos, dict) or str(pos.get("kind", "carry")) != "reversal":
+                continue
+            r_entry = _num(pos.get("entry_price"), 0.0)
+            r_mid = _extract_mid_price(_pos_symbol(str(key), pos), sym_map, last_prices, r_entry)
+            if r_entry > 0.0 and r_mid > 0.0:
+                unreal_reversal += _num(pos.get("signed_usd"), 0.0) * (r_mid / r_entry - 1.0)
+
     ledger["basis_pnl_usd"] = basis_total
     ledger["spot_unrealized_pnl_usd"] = spot_unreal_total
     ledger["perp_unrealized_pnl_usd"] = perp_unreal_total
@@ -1007,6 +1225,7 @@ def _mark_to_market(
         + unreal_carry
         + unreal_overlay
         + unreal_trend
+        + unreal_reversal
     )
     ledger["pure_trading_equity_usd"] = pure_eq
     ledger["yield_stacked_equity_usd"] = pure_eq + _num(
@@ -1044,6 +1263,7 @@ def _update_exposure_metrics(
     overlay_long_usd = 0.0
     overlay_short_usd = 0.0
     trend_gross = 0.0
+    reversal_gross = 0.0
 
     if isinstance(pos_map, dict):
         for pos in pos_map.values():
@@ -1065,11 +1285,13 @@ def _update_exposure_metrics(
                     overlay_short_usd += abs(signed_usd)
             elif kind == "trend":
                 trend_gross += abs(signed_usd)
+            elif kind == "reversal":
+                reversal_gross += abs(signed_usd)
 
     overlay_gross = overlay_long_usd + overlay_short_usd
     fut_wallet = _num(profile.futures_wallet_usd, 0.0)
     fut_lev = (
-        (carry_perp_notional + overlay_gross + trend_gross) / fut_wallet
+        (carry_perp_notional + overlay_gross + trend_gross + reversal_gross) / fut_wallet
         if fut_wallet > 0.0
         else 0.0
     )
@@ -1077,7 +1299,239 @@ def _update_exposure_metrics(
     ledger["overlay_long_usd"] = _num(overlay_long_usd, 0.0)
     ledger["overlay_short_usd"] = _num(overlay_short_usd, 0.0)
     ledger["trend_gross_usd"] = _num(trend_gross, 0.0)
+    ledger["reversal_gross_usd"] = _num(reversal_gross, 0.0)
     ledger["futures_leverage"] = _num(fut_lev, 0.0)
+
+
+def _slice_universe(
+    universe: dict[str, Any] | None, bars: int
+) -> dict[str, Any] | None:
+    """Return a view of ``universe`` limited to the last ``bars`` rows per symbol."""
+    if not isinstance(universe, dict):
+        return universe
+    out: dict[str, Any] = {}
+    for sym, df in universe.items():
+        if df is not None and hasattr(df, "iloc") and bars > 0 and len(df) > bars:
+            out[sym] = df.iloc[-bars:]
+        else:
+            out[sym] = df
+    return out
+
+
+def compute_funding_ewma_bps(universe: dict[str, Any] | None) -> dict[str, float]:
+    """Smoothed funding (bps per 8h) per symbol, same recursion as the backtest.
+
+    The backtest (``run_1k_profile_tournament_backtest``) updates
+    ``f = (1 - a) * f + a * funding_bps`` on every funding event (00/08/16 UTC) with
+    ``a = 2 / (9 + 1)`` and ``funding_bps = funding_rate * 10_000``. Missing data -> 0.0.
+    """
+    out: dict[str, float] = {}
+    if not isinstance(universe, dict):
+        return out
+    alpha = FUNDING_EWMA_ALPHA
+    for sym, df in universe.items():
+        f_ewma = 0.0
+        try:
+            col = next(
+                (c for c in ("funding_rate_event", "funding_event_binance") if c in df.columns),
+                None,
+            )
+            if col is not None and len(df) > 0:
+                idx = pd.DatetimeIndex(df.index)
+                is_event = ((idx.hour == 0) | (idx.hour == 8) | (idx.hour == 16)) & (idx.minute == 0)
+                vals = df[col].astype("float64").to_numpy()[is_event]
+                for v in vals:
+                    f_now = float(v) * 10000.0 if math.isfinite(float(v)) else 0.0
+                    f_ewma = (1.0 - alpha) * f_ewma + alpha * f_now
+        except Exception:  # noqa: BLE001 - a bad funding column must not kill the cycle
+            f_ewma = 0.0
+        out[str(sym)] = float(f_ewma) if math.isfinite(f_ewma) else 0.0
+    return out
+
+
+def compute_data_staleness(
+    universe: dict[str, Any] | None, now_utc: datetime
+) -> tuple[bool, float, str]:
+    """(is_stale, age_hours_of_oldest_symbol, last_candle_iso) for an aligned universe."""
+    last_ts: list[pd.Timestamp] = []
+    if isinstance(universe, dict):
+        for df in universe.values():
+            if df is not None and getattr(df, "empty", True) is False:
+                last_ts.append(pd.Timestamp(df.index[-1]))
+    if not last_ts:
+        return True, float("inf"), ""
+    oldest = min(last_ts)
+    if oldest.tzinfo is None:
+        oldest = oldest.tz_localize("UTC")
+    age_h = (pd.Timestamp(now_utc) - oldest).total_seconds() / 3600.0
+    return bool(age_h > STALE_DATA_MAX_AGE_HOURS), float(age_h), oldest.isoformat()
+
+
+def _build_price_frame(aligned_universe: dict[str, Any]) -> pd.DataFrame:
+    price_frame = pd.DataFrame()
+    for sym in sorted(aligned_universe):
+        df = aligned_universe[sym]
+        if df is None or getattr(df, "empty", True):
+            continue
+        col = "perp_close" if "perp_close" in df.columns else ("close" if "close" in df.columns else None)
+        if col is None:
+            continue
+        price_frame[str(sym)] = df[col].astype("float64")
+    if price_frame.empty:
+        return price_frame
+    return price_frame.sort_index().ffill()
+
+
+def _sleeve_notional(pos_map: Any, kinds: tuple[str, ...]) -> float:
+    total = 0.0
+    if isinstance(pos_map, dict):
+        for pos in pos_map.values():
+            if isinstance(pos, dict) and str(pos.get("kind", "carry")) in kinds:
+                total += abs(_num(pos.get("signed_usd"), 0.0))
+    return total
+
+
+def _place_directional_order(
+    client: Any,
+    executor: Any,
+    sym: str,
+    side: str,
+    qty: float,
+    price: float,
+) -> tuple[float, float, str]:
+    """Send one Perp MARKET order for a directional sleeve. Returns (filled, avg_px, error).
+
+    ``reduce_only`` is deliberately never set: Trend/Reversal share the one-way Futures
+    position of a symbol with Carry (short) and Overlay, so a sleeve-level close is only a
+    *partial* reduction of the netted position and would be rejected (-2022) or clipped.
+    """
+    qty_q = float(qty)
+    quantize = getattr(executor, "quantize_leg", None)
+    if callable(quantize):
+        qty_q, _ = quantize(sym, abs(qty_q) * price, price)
+    if qty_q <= 0.0:
+        return 0.0, price, "BELOW_MIN_NOTIONAL"
+    try:
+        resp = client.place_futures_market_order(sym, side, float(qty_q), reduce_only=False)
+    except Exception as exc:  # noqa: BLE001 - a rejected order must not kill the cycle
+        logger.error("directional order failed %s %s %s: %s", sym, side, qty_q, exc)
+        return 0.0, price, f"{type(exc).__name__}:{str(exc)[:80]}"
+    resp = resp if isinstance(resp, dict) else {}
+    executed = _num(resp.get("executedQty"), 0.0)
+    status = str(resp.get("status", "")).upper()
+    if executed <= 0.0 and (status == "FILLED" or bool(resp.get("dry_run"))):
+        executed = float(qty_q)
+    avg = _num(resp.get("avgPrice"), 0.0)
+    if avg <= 0.0:
+        avg = price
+    return float(executed), float(avg), ("" if executed > 0.0 else f"NOT_FILLED:{status}")
+
+
+def _apply_directional_deltas(
+    ledger: dict[str, Any],
+    kind: str,
+    targets: dict[str, float],
+    prices_now: dict[str, float],
+    *,
+    charge_fees: bool,
+    signed_client: Any = None,
+    execute_real: bool = False,
+    executor: Any = None,
+) -> dict[str, Any]:
+    """Move the ``"SYM|<kind>"`` ledger legs to the signed ``targets`` (qty, long > 0).
+
+    Shadow mode only books the estimated fee. With ``execute_real`` every delta is first sent
+    to Binance Futures through ``signed_client`` and the ledger moves by the *filled* quantity
+    at the *fill* price, so a rejected order leaves the ledger identical to the exchange.
+    Sign flips are executed as close + open. Long-only trend reproduces the Sprint 26 booking.
+    """
+    pos_map = ledger.get("positions_snapshot", {}) or {}
+    new_positions = dict(pos_map) if isinstance(pos_map, dict) else {}
+    existing = {
+        _pos_symbol(str(k), v)
+        for k, v in new_positions.items()
+        if isinstance(v, dict) and str(v.get("kind", "carry")) == kind
+    }
+    book = {sym: float(targets.get(sym, 0.0)) for sym in set(targets) | existing}
+
+    def _old_qty(sym: str) -> float:
+        p = new_positions.get(_snapshot_key(sym, kind))
+        return _num(p.get("qty"), 0.0) if isinstance(p, dict) else 0.0
+
+    # Reductions first (frees margin and keeps dollar-neutral sleeves covered).
+    order = sorted(book, key=lambda s: (0 if abs(book[s]) < abs(_old_qty(s)) else 1, s))
+    real = bool(execute_real and signed_client is not None)
+
+    fees = turnover = realized_closed = 0.0
+    n_orders = 0
+    errors: list[str] = []
+    for sym in order:
+        px = float(prices_now.get(sym, 0.0))
+        if px <= 0.0:
+            continue
+        key = _snapshot_key(sym, kind)
+        old_pos = new_positions.get(key) if isinstance(new_positions.get(key), dict) else {}
+        cur = _num(old_pos.get("qty"), 0.0)
+        cur_entry = _num(old_pos.get("entry_price"), 0.0)
+        new_qty = book[sym]
+        if abs(new_qty - cur) <= 1e-12:
+            continue
+        steps = [(cur, 0.0), (0.0, new_qty)] if cur * new_qty < 0.0 else [(cur, new_qty)]
+        for a, b in steps:
+            delta = b - a
+            if abs(delta) <= 1e-12:
+                continue
+            fill_px = px
+            if real:
+                filled, fill_px, err = _place_directional_order(
+                    signed_client, executor, sym, "BUY" if delta > 0.0 else "SELL", abs(delta), px
+                )
+                if filled <= 0.0:
+                    errors.append(f"{sym}:{err}")
+                    break
+                b = a + (1.0 if delta > 0.0 else -1.0) * min(filled, abs(delta))
+            notional = abs(b - a) * fill_px
+            fee = notional * TREND_FEE_RATE if charge_fees else 0.0
+            fees += fee
+            turnover += notional
+            n_orders += 1
+            same_side = a != 0.0 and (a > 0.0) == (b > 0.0)
+            if abs(b) < abs(a) - 1e-12 or abs(b) <= 1e-12:
+                if a != 0.0 and cur_entry > 0.0:
+                    closed_mag = abs(a) - abs(b)
+                    realized_closed += closed_mag * (fill_px - cur_entry) * (1.0 if a > 0.0 else -1.0)
+            if abs(b) > abs(a) + 1e-12 and same_side and cur_entry > 0.0:
+                cur_entry = _vwap_entry(abs(a), cur_entry, abs(b), fill_px)
+            elif abs(b) > abs(a) + 1e-12:
+                cur_entry = fill_px
+            cur = b
+        if abs(cur) <= 1e-12:
+            new_positions.pop(key, None)
+        elif cur != _num(old_pos.get("qty"), 0.0):
+            new_positions[key] = {
+                "symbol": sym,
+                "qty": float(cur),
+                "entry_price": float(cur_entry),
+                "kind": kind,
+                # Cost basis (qty * entry) so qty*entry*(mid/entry - 1) == qty*(mid - entry).
+                "signed_usd": float(cur * cur_entry),
+            }
+
+    ledger["positions_snapshot"] = new_positions
+    realized = _num(ledger.get("realized_pnl_usd"), 0.0) + realized_closed
+    if charge_fees:
+        realized -= fees
+        ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
+    ledger["realized_pnl_usd"] = realized
+    if errors:
+        ledger["note"] = ((ledger.get("note") or "")[:120] + f" {kind}_order_err:" + ",".join(errors)[:80]).strip()
+    return {
+        "fees": float(fees),
+        "turnover": float(turnover),
+        "n_orders": int(n_orders),
+        "realized_closed": float(realized_closed),
+        "errors": errors,
+    }
 
 
 def apply_trend_sleeve(
@@ -1088,13 +1542,25 @@ def apply_trend_sleeve(
     *,
     now_utc: datetime | None = None,
     charge_fees: bool = True,
+    signed_client: Any = None,
+    execute_real: bool = False,
+    executor: Any = None,
+    funding_bps: dict[str, float] | None = None,
+    hold_only: bool = False,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Mark and rebalance the directional Trend sleeve (long Perp) on isolated keys.
+    """Mark and rebalance the directional Trend sleeve on isolated ``"SYM|trend"`` keys.
 
     Every Trend leg lives under ``"SYM|trend"`` inside ``positions_snapshot`` so a symbol can
     be held by carry, overlay and trend simultaneously without any collision. Sizing is
     inverse-volatility with a hard gross cap, then multiplied by the 2-tier drawdown circuit
     breaker ``risk_scale`` (0.5 at -6%, 0.0 at -10% until the cooldown expires).
+
+    Sprint 27-28 parameters (``allow_short_trend``, ``trend_z_short_entry``,
+    ``require_macro_regime_filter``, ``short_gross_scale``) and the smoothed ``funding_bps``
+    are forwarded exactly like the backtest. With ``dynamic_carry_to_alpha_margin`` the unused
+    Carry budget is routed to Trend: ``min(1, max_gross + max(0, eta - carry/cap) * 0.5)``.
+    ``hold_only`` freezes the book (used on stale data in real mode).
     """
     disabled = {
         "state": "DISABLED",
@@ -1141,27 +1607,39 @@ def apply_trend_sleeve(
     ledger["circuit_breaker_risk_scale"] = _num(cb["risk_scale"], 1.0)
 
     # ---- 2) Strictly causal signal: only bars up to the last one in the frame are read.
-    price_frame = pd.DataFrame()
-    for sym in sorted(aligned_universe):
-        df = aligned_universe[sym]
-        if df is None or getattr(df, "empty", True):
-            continue
-        col = "perp_close" if "perp_close" in df.columns else ("close" if "close" in df.columns else None)
-        if col is None:
-            continue
-        price_frame[str(sym)] = df[col].astype("float64")
+    price_frame = _build_price_frame(aligned_universe)
     if price_frame.empty:
         return disabled
-    price_frame = price_frame.sort_index().ffill()
 
+    pos_map = ledger.get("positions_snapshot", {}) or {}
+    # Dynamic Carry -> Alpha margin (copied from run_1k_profile_tournament_backtest.py L575).
+    effective_max_gross = float(profile.trend_max_gross_pct)
+    if bool(getattr(profile, "dynamic_carry_to_alpha_margin", False)):
+        carry_used_pct = _sleeve_notional(pos_map, ("carry",)) / capital if capital > 0.0 else 0.0
+        effective_max_gross = min(
+            1.0,
+            effective_max_gross
+            + max(0.0, float(profile.carry_eta) - carry_used_pct) * 0.5,
+        )
+
+    allow_short = bool(getattr(profile, "allow_short_trend", False))
+    raw_short_scale = getattr(profile, "short_gross_scale", None)
     trend_cfg = TrendSleeveConfig(
         capital_usd=capital,
         target_vol_ann=float(profile.trend_target_vol_ann),
-        max_gross_pct=float(profile.trend_max_gross_pct),
+        max_gross_pct=float(effective_max_gross),
         rebalance_every_hours=int(profile.trend_rebalance_hours),
         z_entry=float(profile.trend_z_entry),
+        allow_short_trend=allow_short,
+        z_short_entry=float(getattr(profile, "trend_z_short_entry", 1.10)),
+        require_macro_regime_filter=bool(getattr(profile, "require_macro_regime_filter", False)),
+        short_gross_scale=(
+            float(raw_short_scale) if allow_short and raw_short_scale is not None else 0.65
+        ),
     )
     state = TrendSleeveState.from_snapshot(ledger.get("trend_sleeve_state"))
+    if funding_bps is None:
+        funding_bps = compute_funding_ewma_bps(aligned_universe)
 
     last_reb = _parse_iso_utc(ledger.get("last_trend_rebalance_ts"))
     rebalance_due = last_reb is None or (
@@ -1175,7 +1653,17 @@ def apply_trend_sleeve(
         state=state,
         circuit_breaker=cb,
         allow_new_entries=bool(rebalance_due),
+        funding_bps=funding_bps,
     )
+    if diagnostics is not None:
+        diagnostics["trend"] = {
+            "bars": int(len(price_frame)),
+            "min_history_hours": int(trend_cfg.min_history_hours),
+            "effective_max_gross_pct": float(effective_max_gross),
+            "rebalance_due": bool(rebalance_due),
+            "weights": {str(k): float(v) for k, v in weights.items()},
+            "allow_short_trend": allow_short,
+        }
 
     # ---- 3) Execution price: snapshot Perp mark when available, else last close.
     spot_prices, perp_prices = dual_price_maps(snapshot)
@@ -1188,23 +1676,19 @@ def apply_trend_sleeve(
             prices_now[sym] = px
 
     # ---- 4) Hard risk cap: trend notional may never exceed the free futures capacity.
-    pos_map = ledger.get("positions_snapshot", {}) or {}
-    used_notional = 0.0
-    has_trend_positions = False
-    for _key, pos in (pos_map.items() if isinstance(pos_map, dict) else []):
-        if not isinstance(pos, dict):
-            continue
-        _kind = str(pos.get("kind", "carry"))
-        if _kind in ("carry", "overlay"):
-            used_notional += abs(_num(pos.get("signed_usd"), 0.0))
-        elif _kind == "trend" and abs(_num(pos.get("qty"), 0.0)) > 0.0:
-            has_trend_positions = True
+    has_trend_positions = any(
+        isinstance(p, dict)
+        and str(p.get("kind", "carry")) == "trend"
+        and abs(_num(p.get("qty"), 0.0)) > 0.0
+        for p in (pos_map.values() if isinstance(pos_map, dict) else [])
+    )
+    used_notional = _sleeve_notional(pos_map, ("carry", "overlay", "reversal"))
     fut_capacity = max(
         0.0,
         _num(profile.futures_wallet_usd, 0.0) * _num(profile.max_futures_leverage, 1.0)
         - used_notional,
     )
-    desired_gross = float(sum(weights.values())) * capital
+    desired_gross = float(sum(abs(w) for w in weights.values())) * capital
     if desired_gross > 0.0 and desired_gross > fut_capacity:
         shrink = fut_capacity / desired_gross
         weights = {s: float(w) * shrink for s, w in weights.items()}
@@ -1221,11 +1705,11 @@ def apply_trend_sleeve(
     # when the rebalance clock fires, or immediately when the breaker / trailing stop
     # demands a flat book.
     risk_scale_now = _num(cb.get("risk_scale"), 1.0)
-    live_weights = any(float(w) > 0.0 for w in weights.values())
+    live_weights = any(abs(float(w)) > 0.0 for w in weights.values())
     # Emergency flatten must never wait for the 24h clock: a hard-stopped breaker
     # (risk_scale == 0) or an empty target set with positions still open both qualify.
     force_flat = has_trend_positions and (risk_scale_now <= 0.0 or not live_weights)
-    if not rebalance_due and not force_flat:
+    if hold_only or (not rebalance_due and not force_flat):
         ledger["trend_sleeve_state"] = state.snapshot()
         ledger["trend_active_symbols"] = sorted(
             s for s, is_on in (state.active or {}).items() if bool(is_on)
@@ -1246,74 +1730,23 @@ def apply_trend_sleeve(
             "held": True,
         }
 
-    # ---- 5) Apply deltas on "SYM|trend" keys.
-    new_positions = dict(pos_map) if isinstance(pos_map, dict) else {}
-    existing_trend_syms = {
-        _pos_symbol(str(k), v)
-        for k, v in new_positions.items()
-        if isinstance(v, dict) and str(v.get("kind", "carry")) == "trend"
-    }
-    for sym in sorted(existing_trend_syms):
-        targets.setdefault(sym, 0.0)
-
-    fees = 0.0
-    turnover = 0.0
-    n_orders = 0
-    trend_realized = 0.0
-    realized = _num(ledger.get("realized_pnl_usd"), 0.0)
-    for sym in sorted(targets):
-        px = float(prices_now.get(sym, 0.0))
-        if px <= 0.0:
-            continue
-        key = _snapshot_key(sym, "trend")
-        old_pos = new_positions.get(key) if isinstance(new_positions.get(key), dict) else {}
-        old_qty = _num(old_pos.get("qty"), 0.0)
-        old_entry = _num(old_pos.get("entry_price"), 0.0)
-        new_qty = float(targets.get(sym, 0.0))
-        delta = new_qty - old_qty
-        if abs(delta) <= 1e-12:
-            continue
-        notional = abs(delta) * px
-        fee = notional * TREND_FEE_RATE if charge_fees else 0.0
-        fees += fee
-        turnover += notional
-        n_orders += 1
-        if charge_fees:
-            realized -= fee
-        if new_qty <= 0.0:
-            if old_qty > 0.0 and old_entry > 0.0:
-                closed_pnl = old_qty * (px - old_entry)
-                trend_realized += closed_pnl
-                realized += closed_pnl
-            new_positions.pop(key, None)
-            continue
-        if old_qty > 0.0 and old_entry > 0.0 and new_qty > old_qty:
-            entry_px = _vwap_entry(old_qty, old_entry, new_qty, px)
-        elif old_qty > 0.0 and old_entry > 0.0 and new_qty < old_qty:
-            closed_pnl = (old_qty - new_qty) * (px - old_entry)
-            trend_realized += closed_pnl
-            realized += closed_pnl
-            entry_px = old_entry
-        else:
-            entry_px = px
-        new_positions[key] = {
-            "symbol": sym,
-            "qty": float(new_qty),
-            "entry_price": float(entry_px),
-            "kind": "trend",
-            # Cost basis (qty * entry) so the unrealized mark qty*entry*(mid/entry - 1)
-            # is exactly qty*(mid - entry); using the live price here would mis-scale PnL.
-            "signed_usd": float(new_qty * entry_px),
-        }
-
-    ledger["positions_snapshot"] = new_positions
-    ledger["realized_pnl_usd"] = realized
-    if charge_fees:
-        ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
+    # ---- 5) Apply deltas on "SYM|trend" keys (real orders first when execute_real).
+    res = _apply_directional_deltas(
+        ledger,
+        "trend",
+        targets,
+        prices_now,
+        charge_fees=charge_fees,
+        signed_client=signed_client,
+        execute_real=execute_real,
+        executor=executor,
+    )
     # Attribution: trend_pnl_usd must carry its own realised closes and its own fees,
     # otherwise the scoreboard column silently under-reports the sleeve.
     ledger["trend_pnl_usd"] = (
-        _num(ledger.get("trend_pnl_usd"), 0.0) + trend_realized - (fees if charge_fees else 0.0)
+        _num(ledger.get("trend_pnl_usd"), 0.0)
+        + res["realized_closed"]
+        - (res["fees"] if charge_fees else 0.0)
     )
     ledger["trend_sleeve_state"] = state.snapshot()
     ledger["trend_active_symbols"] = sorted(
@@ -1321,6 +1754,7 @@ def apply_trend_sleeve(
     )
     if rebalance_due:
         ledger["last_trend_rebalance_ts"] = now.isoformat()
+    new_positions = ledger.get("positions_snapshot", {}) or {}
     held = sorted(
         _pos_symbol(str(k), v)
         for k, v in new_positions.items()
@@ -1329,10 +1763,146 @@ def apply_trend_sleeve(
     return {
         "state": str(cb["state"]),
         "risk_scale": _num(cb["risk_scale"], 1.0),
-        "n_orders": int(n_orders),
-        "turnover_notional": float(turnover),
-        "fees_usd": float(fees),
+        "n_orders": int(res["n_orders"]),
+        "turnover_notional": float(res["turnover"]),
+        "fees_usd": float(res["fees"]),
         "targets": {str(k): float(v) for k, v in targets.items()},
+        "positions": held,
+    }
+
+
+def apply_reversal_sleeve(
+    ledger: dict[str, Any],
+    profile: StrategyProfileConfig,
+    aligned_universe: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+    *,
+    now_utc: datetime | None = None,
+    charge_fees: bool = True,
+    signed_client: Any = None,
+    execute_real: bool = False,
+    executor: Any = None,
+    funding_bps: dict[str, float] | None = None,
+    hold_only: bool = False,
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Dollar-neutral funding-conditioned reversal sleeve on isolated ``"SYM|reversal"`` keys.
+
+    Mirrors the backtest (``run_1k_profile_tournament_backtest.py`` L643-L714): signal on the
+    last ``REVERSAL_WINDOW_BARS`` Perp closes with smoothed funding, capped by the free
+    Futures capacity, skipped when the rounded legs are imbalanced by more than
+    ``REVERSAL_MAX_IMBALANCE_USD`` (which also flattens an open book), rebalanced on the
+    same clock as Trend.
+    """
+    disabled = {
+        "state": "DISABLED",
+        "n_orders": 0,
+        "turnover_notional": 0.0,
+        "fees_usd": 0.0,
+        "targets": {},
+        "positions": [],
+    }
+    if not bool(getattr(profile, "enable_reversal_sleeve", False)):
+        ledger["reversal_gross_usd"] = 0.0
+        return disabled
+    if not isinstance(aligned_universe, dict) or not aligned_universe:
+        return disabled
+
+    now = now_utc or datetime.now(timezone.utc)
+    capital = _num(profile.capital_usd, 1000.0)
+    price_frame = _build_price_frame(aligned_universe)
+    if price_frame.empty:
+        return disabled
+
+    last_reb = _parse_iso_utc(ledger.get("last_reversal_rebalance_ts"))
+    rebalance_due = last_reb is None or (
+        (now - last_reb).total_seconds()
+        >= 3600.0 * max(1, int(getattr(profile, "trend_rebalance_hours", 24) or 24))
+    )
+    pos_map = ledger.get("positions_snapshot", {}) or {}
+    held_now = sorted(
+        _pos_symbol(str(k), v)
+        for k, v in (pos_map.items() if isinstance(pos_map, dict) else [])
+        if isinstance(v, dict) and str(v.get("kind", "carry")) == "reversal"
+    )
+    if hold_only or not rebalance_due:
+        return {**disabled, "state": "HELD", "positions": held_now, "held": True}
+
+    if funding_bps is None:
+        funding_bps = compute_funding_ewma_bps(aligned_universe)
+    rev_cfg = ReversalSleeveConfig(
+        capital_usd=capital, gross_pct=float(profile.reversal_gross_pct)
+    )
+    window = price_frame.iloc[-REVERSAL_WINDOW_BARS:]
+    rev_w = compute_funding_conditioned_reversal_weights(
+        window,
+        bar_index=len(window) - 1,
+        funding_bps=funding_bps,
+        config=rev_cfg,
+    )
+
+    spot_prices, perp_prices = dual_price_maps(snapshot)
+    prices_now: dict[str, float] = {}
+    for sym in price_frame.columns:
+        px = _mark_from_map(perp_prices, sym, 0.0)
+        if px <= 0.0:
+            px = float(price_frame[sym].iloc[-1])
+        if math.isfinite(px) and px > 0.0:
+            prices_now[sym] = px
+
+    used_notional = _sleeve_notional(pos_map, ("carry", "overlay", "trend"))
+    cap_r = max(
+        0.0,
+        _num(profile.futures_wallet_usd, 0.0) * _num(profile.max_futures_leverage, 1.0)
+        - used_notional,
+    )
+    want_r = float(sum(abs(w) for w in rev_w.values())) * capital
+    if want_r > 0.0 and want_r > cap_r:
+        rev_w = {s: float(w) * (cap_r / want_r) for s, w in rev_w.items()}
+    rev_q = reversal_weights_to_target_qty(
+        rev_w, prices_now, capital, DEMO_LOT_STEPS, min_notional_usd=10.0
+    ) if rev_w else {}
+    imbalance = abs(sum(q * prices_now[s] for s, q in rev_q.items() if s in prices_now))
+    skipped_imbalance = imbalance > REVERSAL_MAX_IMBALANCE_USD
+    if skipped_imbalance:
+        rev_q = {}
+    if diagnostics is not None:
+        diagnostics["reversal"] = {
+            "bars": int(len(window)),
+            "weights": {str(k): float(v) for k, v in rev_w.items()},
+            "target_qty": {str(k): float(v) for k, v in rev_q.items()},
+            "imbalance_usd": float(imbalance),
+            "skipped_imbalance": bool(skipped_imbalance),
+        }
+
+    res = _apply_directional_deltas(
+        ledger,
+        "reversal",
+        {s: float(q) for s, q in rev_q.items() if q != 0.0},
+        prices_now,
+        charge_fees=charge_fees,
+        signed_client=signed_client,
+        execute_real=execute_real,
+        executor=executor,
+    )
+    ledger["reversal_pnl_usd"] = (
+        _num(ledger.get("reversal_pnl_usd"), 0.0)
+        + res["realized_closed"]
+        - (res["fees"] if charge_fees else 0.0)
+    )
+    ledger["last_reversal_rebalance_ts"] = now.isoformat()
+    new_positions = ledger.get("positions_snapshot", {}) or {}
+    held = sorted(
+        _pos_symbol(str(k), v)
+        for k, v in new_positions.items()
+        if isinstance(v, dict) and str(v.get("kind", "carry")) == "reversal"
+    )
+    return {
+        "state": "ACTIVE" if held else "FLAT",
+        "n_orders": int(res["n_orders"]),
+        "turnover_notional": float(res["turnover"]),
+        "fees_usd": float(res["fees"]),
+        "targets": {str(k): float(v) for k, v in rev_q.items()},
         "positions": held,
     }
 
@@ -1347,6 +1917,9 @@ def run_profile_cycle(
     execute_real: bool,
     executor: Any,
     reconcile_fn: Any = None,
+    signed_client: Any = None,
+    diagnostics: dict[str, Any] | None = None,
+    real_directional_orders: bool = True,
 ) -> dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
     ledger["profile"] = profile.name
@@ -1363,7 +1936,10 @@ def run_profile_cycle(
 
     reconcile_failed = False
     try:
-        executor.reconcile_once(aligned_universe=aligned_universe)
+        # Carry/Overlay keep their historical 720h window; Trend/Reversal get the full history.
+        executor.reconcile_once(
+            aligned_universe=_slice_universe(aligned_universe, CARRY_LOOKBACK_BARS)
+        )
         ledger["status"] = "OK"
     except Exception as exc:
         reconcile_failed = True
@@ -1387,10 +1963,48 @@ def run_profile_cycle(
             _mark_to_market(ledger, profile, sym_map, last_prices, snapshot)
 
     # ---- Sprint 26: trend sleeve (long Perp on isolated "SYM|trend" ledger keys)
+    stale, age_h, last_candle = compute_data_staleness(aligned_universe, now_utc)
+    if aligned_universe is not None and stale:
+        ledger["note"] = ((ledger.get("note") or "")[:120] + f" STALE_DATA:age={age_h:.1f}h").strip()
+    # Real orders need a clean state: no reconcile error and fresh candles, otherwise the
+    # sleeves hold (the virtual ledger must never run ahead of the exchange).
+    directional_real = bool(execute_real and real_directional_orders and signed_client is not None)
+    hold_only = bool(directional_real and (reconcile_failed or stale))
+    funding_map = compute_funding_ewma_bps(aligned_universe)
     trend_result = apply_trend_sleeve(
-        ledger, profile, aligned_universe, snapshot, now_utc=now_utc, charge_fees=True
+        ledger,
+        profile,
+        aligned_universe,
+        snapshot,
+        now_utc=now_utc,
+        charge_fees=True,
+        signed_client=signed_client,
+        execute_real=directional_real,
+        executor=executor,
+        funding_bps=funding_map,
+        hold_only=hold_only,
+        diagnostics=diagnostics,
     )
-    if trend_result.get("n_orders", 0) > 0 and not reconcile_failed:
+    reversal_result = apply_reversal_sleeve(
+        ledger,
+        profile,
+        aligned_universe,
+        snapshot,
+        now_utc=now_utc,
+        charge_fees=True,
+        signed_client=signed_client,
+        execute_real=directional_real,
+        executor=executor,
+        funding_bps=funding_map,
+        hold_only=hold_only,
+        diagnostics=diagnostics,
+    )
+    if diagnostics is not None:
+        diagnostics["trend_result"] = trend_result
+        diagnostics["reversal_result"] = reversal_result
+    if (
+        trend_result.get("n_orders", 0) + reversal_result.get("n_orders", 0) > 0
+    ) and not reconcile_failed:
         sym_map_t = snapshot.get("symbols", {}) if isinstance(snapshot, dict) else {}
         _mark_to_market(
             ledger, profile, sym_map_t, ledger.setdefault("last_prices", {}), snapshot
@@ -1436,6 +2050,8 @@ def run_profile_cycle(
         "trend_pnl_usd": _num(ledger.get("trend_pnl_usd"), 0.0),
         "trend_gross_usd": _num(ledger.get("trend_gross_usd"), 0.0),
         "trend_active_symbols": ledger.get("trend_active_symbols", []),
+        "reversal_pnl_usd": _num(ledger.get("reversal_pnl_usd"), 0.0),
+        "reversal_gross_usd": _num(ledger.get("reversal_gross_usd"), 0.0),
         "circuit_breaker_state": str(ledger.get("circuit_breaker_state", "DISABLED")),
         "circuit_breaker_risk_scale": _num(ledger.get("circuit_breaker_risk_scale"), 1.0),
         "circuit_breaker_triggers": int(_num(ledger.get("circuit_breaker_triggers"), 0.0)),
@@ -1556,9 +2172,17 @@ def append_scoreboard(path: str, record: dict[str, Any]) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
-        f.flush()
+    line = json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
+    for attempt in range(5):
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05)
 
 
 def fetch_binance_spot_book_tickers(
@@ -1579,8 +2203,9 @@ def fetch_binance_spot_book_tickers(
         entries: list[tuple[str, Any]] = [(sym, fixture_data.get(sym)) for sym in symbols]
     else:
         try:
+            safe_timeout = float(timeout_sec) if timeout_sec and float(timeout_sec) > 0 else 10.0
             with urllib.request.urlopen(
-                SPOT_BOOK_TICKER_URL, timeout=float(timeout_sec)
+                SPOT_BOOK_TICKER_URL, timeout=safe_timeout
             ) as resp:
                 raw = json.loads(resp.read())
         except Exception:
@@ -1817,6 +2442,20 @@ def initialize_demo_testnet_baseline(
     return True, "BASELINE_CREATED"
 
 
+def fetch_history_universe(executor: Any, bars: int) -> dict[str, Any]:
+    """Fetch the aligned universe with ``bars`` hours of history, then restore the executor.
+
+    The executor's own ``lookback_hours`` (720) is left untouched for Carry/Overlay.
+    """
+    prev = getattr(executor, "lookback_hours", None)
+    executor.lookback_hours = max(int(bars), int(prev or 0))
+    try:
+        return executor.fetch_latest_aligned_universe()
+    finally:
+        if prev is not None:
+            executor.lookback_hours = prev
+
+
 def _remove_if_exists(path: str) -> None:
     try:
         if os.path.exists(path):
@@ -1826,6 +2465,7 @@ def _remove_if_exists(path: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    disable_windows_quick_edit()
     args = parse_args(argv)
     profiles = build_profiles(args.profiles)
 
@@ -1863,6 +2503,7 @@ def main(argv: list[str] | None = None) -> int:
 
     last_records: list[dict[str, Any]] = []
     cycle_count = 0
+    watchdog = CycleWatchdog(max_duration_sec=args.max_cycle_duration_sec)
 
     try:
         while True:
@@ -1883,6 +2524,23 @@ def main(argv: list[str] | None = None) -> int:
                     signed_client=signed_client if is_real else None,
                 )
 
+            target_cycle = max((int(_num(l.get("cycle"), 0.0)) for l in ledgers.values()), default=0) + 1
+            watchdog.start_cycle(target_cycle)
+            write_heartbeat(args.demo_dir, cycle=target_cycle, phase="CYCLE_START")
+
+            if not args.no_refresh_raw:
+                refresh = refresh_raw_data(
+                    list(LIQUID_8_SYMBOLS),
+                    args.raw_dir,
+                    max_age_hours=1.0,
+                    on_progress=lambda m: print(m, flush=True),
+                )
+                if refresh.get("errors"):
+                    logger.warning("raw refresh errors: %s", refresh["errors"])
+                    print(f"[DATA] WARNING refresh errors: {refresh['errors']}", flush=True)
+                elif refresh.get("refreshed"):
+                    print("[DATA] raw parquet refreshed to latest 1h candles", flush=True)
+
             snapshot = fetch_market_once(args.shadow_timeout_sec)
 
             shadow_exec = next(
@@ -1894,9 +2552,16 @@ def main(argv: list[str] | None = None) -> int:
                 next(iter(executors.values())),
             )
             try:
-                aligned_universe = shadow_exec.fetch_latest_aligned_universe()
-            except Exception:
+                aligned_universe = fetch_history_universe(shadow_exec, TREND_HISTORY_BARS)
+            except Exception as exc:  # noqa: BLE001 - log loudly, never swallow silently
+                logger.exception("fetch_latest_aligned_universe failed")
+                print(f"[DATA] ERROR aligned universe unavailable: {type(exc).__name__}: {exc}", flush=True)
                 aligned_universe = None
+            if aligned_universe is not None:
+                _stale, _age_h, _last_c = compute_data_staleness(aligned_universe, datetime.now(timezone.utc))
+                if _stale:
+                    logger.warning("STALE_DATA last candle %s age=%.1fh", _last_c, _age_h)
+                    print(f"[DATA] WARNING STALE_DATA last candle {_last_c} age={_age_h:.1f}h", flush=True)
 
             cycle_records: list[dict[str, Any]] = []
             for pname, prof in profiles.items():
@@ -1947,6 +2612,8 @@ def main(argv: list[str] | None = None) -> int:
                         execute_real=is_real,
                         executor=executors[pname],
                         reconcile_fn=reconcile_fn,
+                        signed_client=signed_client if is_real else None,
+                        real_directional_orders=not args.no_directional_real_orders,
                     )
                     if pname == live_profile_name and signed_client is None and not rec.get("note"):
                         rec["note"] = client_note
@@ -2008,6 +2675,20 @@ def main(argv: list[str] | None = None) -> int:
                 save_ledger_atomic(l_path, ledger)
                 append_scoreboard(args.scoreboard_log, rec)
                 cycle_records.append(rec)
+                write_heartbeat(
+                    args.demo_dir,
+                    cycle=int(_num(ledger.get("cycle"), target_cycle)),
+                    phase=f"PROFILE_DONE_{pname}",
+                    extra={"profile": pname, "status": str(rec.get("status"))},
+                )
+
+            watchdog.stop_cycle()
+            write_heartbeat(
+                args.demo_dir,
+                cycle=target_cycle,
+                phase="CYCLE_DONE",
+                extra={"completed_profiles": list(profiles.keys())},
+            )
 
             last_records = cycle_records
             print_scoreboard(cycle_records)
@@ -2016,11 +2697,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.cycles > 0 and cycle_count >= args.cycles:
                 break
             if args.interval_seconds > 0:
-                time.sleep(args.interval_seconds)
+                interruptible_sleep(
+                    total_seconds=args.interval_seconds,
+                    cycle=target_cycle,
+                    demo_dir=args.demo_dir,
+                    chunk_seconds=60.0,
+                )
     except KeyboardInterrupt:
         if last_records:
             print_scoreboard(last_records)
         return 0
+    finally:
+        watchdog.shutdown()
 
     return 0
 

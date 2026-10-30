@@ -599,6 +599,7 @@ class BinanceSignedTestnetClient:
                 )
             return result
 
+        safe_timeout = float(timeout_sec) if timeout_sec and float(timeout_sec) > 0 else 10.0
         query = build_query_string(payload)
         if method.upper() == "GET":
             full_url = f"{url}?{query}" if query else url
@@ -611,7 +612,7 @@ class BinanceSignedTestnetClient:
             full_url, data=body, headers=hdrs, method=method.upper()
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            with urllib.request.urlopen(req, timeout=safe_timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -1544,12 +1545,12 @@ class BinanceSignedTestnetClient:
         order_id = res.get("orderId")
         if order_id is None:
             return res
-        deadline = time.time() + max(0.0, float(max_wait_sec))
-        interval = max(0.0, float(poll_interval_sec))
+        interval = max(0.01, float(poll_interval_sec))
+        effective_max_wait = max(0.1, float(max_wait_sec))
+        start_mono = time.monotonic()
         last = res
-        while time.time() < deadline:
-            if interval:
-                time.sleep(interval)
+        while (time.monotonic() - start_mono) < effective_max_wait:
+            time.sleep(interval)
             try:
                 last = self.query_order(venue, symbol, order_id)
             except Exception as exc:  # noqa: BLE001 - khong lam hong luong chinh
@@ -1832,7 +1833,15 @@ class BinanceSignedTestnetClient:
     def place_futures_market_order(self, symbol: str, side: str, quantity: float, reduce_only: bool = False, timeout_sec: float = 10.0) -> dict[str, Any]:
         """Sprint 23: dat lenh MARKET tren USDS-M Futures (ho tro reduceOnly khi dong vi the)."""
         req = self.build_order_request(VENUE_FUTURES, symbol, str(side).upper(), float(quantity), order_type="MARKET", reduce_only=bool(reduce_only))
-        result = self.submit_signed_order(VENUE_FUTURES, req, timeout_sec=timeout_sec)
+        try:
+            result = self.submit_signed_order(VENUE_FUTURES, req, timeout_sec=timeout_sec)
+        except Exception as exc:
+            # Sprint 28: If reduce_only was rejected with -2022 on a shared/netted account, retry with reduce_only=False
+            if reduce_only and "-2022" in str(exc):
+                req_retry = self.build_order_request(VENUE_FUTURES, symbol, str(side).upper(), float(quantity), order_type="MARKET", reduce_only=False)
+                result = self.submit_signed_order(VENUE_FUTURES, req_retry, timeout_sec=timeout_sec)
+            else:
+                raise
         result.setdefault("executedQty", 0.0)
         result.setdefault("avgPrice", 0.0)
         return result

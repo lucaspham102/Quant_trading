@@ -2312,7 +2312,10 @@ class CarryLiveExecutor:
             for symbol, target, cur, qty_q in planned:
                 side = "BUY" if target > cur else "SELL"
                 sign = 1.0 if side == "BUY" else -1.0
-                reduce_only = abs(target) <= 1e-12
+                # Sprint 28: Never pass reduce_only on a shared cross-sleeve one-way account
+                # (Carry holds short perp, so a SELL overlay close would trigger Binance -2022 reject).
+                reduce_only = False
+                _pre_pos = _pos_now(symbol)
                 try:
                     resp = client.place_futures_market_order(symbol, side, qty_q, reduce_only=reduce_only)
                 except Exception as exc:  # noqa: BLE001
@@ -2322,17 +2325,18 @@ class CarryLiveExecutor:
                     # Sprint 24 FIX (audit MEDIUM): timeout co the DA khop. Doc lai vi the
                     # that; neu lech so voi truoc khi dat thi coi nhu da fill de rollback
                     # phu du (tranh gui lai lenh trung o chu ky sau).
-                    _actual = _pos_now(symbol)
-                    if _actual is not None and abs(_actual - cur) > 1e-12:
-                        _delta = abs(_actual - cur)
+                    # Sprint 24/28 FIX: Check if exchange position actually changed despite exception
+                    _post_pos = _pos_now(symbol)
+                    if _pre_pos is not None and _post_pos is not None and abs(_post_pos - _pre_pos) > 1e-12:
+                        _delta = abs(_post_pos - _pre_pos)
                         fills.append((symbol, side, _delta, abs(cur) <= 1e-12))
-                        new_positions[symbol] = float(_actual)
+                        new_positions[symbol] = cur + sign * _delta
                         turnover += _delta * float(prices.get(symbol, 0.0) or 0.0)
                         logger.warning(
-                            "event=OVERLAY_LEG_VERIFIED_FILLED symbol=%s expected_cur=%s actual_pos=%s",
-                            symbol, cur, _actual,
+                            "event=OVERLAY_LEG_VERIFIED_FILLED symbol=%s pre_pos=%s post_pos=%s delta=%s",
+                            symbol, _pre_pos, _post_pos, _delta,
                         )
-                    elif _actual is None:
+                    elif _post_pos is None:
                         # Sprint 24 FIX vong 2 (audit HIGH): khong doc duoc vi the that ->
                         # KHONG duoc coi la rollback an toan (co the da khop -> orphan).
                         unverified_symbols.append(symbol)
@@ -3571,13 +3575,14 @@ class CarryLiveExecutor:
                 v_i = qty * sp_curr + effective_margin
 
                 if self.mode in ("live", "testnet"):
-                    if (
-                        not self.spot_exchange
-                        or not hasattr(self.spot_exchange, "create_order")
-                        or not self.perp_exchange
-                        or not hasattr(self.perp_exchange, "create_order")
-                    ):
-                        raise RuntimeError("Live exchange does not support create_order for carry rebalance")
+                    if not (self.execute_real_orders and self.signed_client is not None):
+                        if (
+                            not self.spot_exchange
+                            or not hasattr(self.spot_exchange, "create_order")
+                            or not self.perp_exchange
+                            or not hasattr(self.perp_exchange, "create_order")
+                        ):
+                            raise RuntimeError("Live exchange does not support create_order for carry rebalance")
 
                 if v_i > 0:
                     new_notional = 0.75 * v_i
@@ -3594,6 +3599,9 @@ class CarryLiveExecutor:
                     pos["notional_usdt"] = float(new_notional)
                     pos["margin_allocated_usdt"] = float(0.25 * v_i - reb_fee)
                     self.state.current_equity -= reb_fee
+                    if self.execute_real_orders and self.signed_client is not None and delta_notional >= DEFAULT_MIN_NOTIONAL:
+                        delta_q = float(new_qty - qty)
+                        self._execute_atomic_carry_delta(sym, delta_q, -delta_q, float(pe_curr))
                 else:
                     del self.state.carry_positions[sym]
 

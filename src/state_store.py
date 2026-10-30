@@ -3,6 +3,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -195,7 +196,14 @@ class StateStore:
             f.flush()
             os.fsync(f.fileno())
 
-        os.replace(tmp_path, self.file_path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, self.file_path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
         return self.file_path
 
     def load(

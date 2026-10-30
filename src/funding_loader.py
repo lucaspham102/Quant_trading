@@ -6,6 +6,7 @@ Cung cấp:
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,7 @@ def fetch_funding_history(
     if exchange is None:
         import ccxt
 
-        exchange = ccxt.binanceusdm({"enableRateLimit": True})
+        exchange = ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
 
     now_ms = (
         int(exchange.milliseconds())
@@ -108,8 +109,15 @@ def fetch_funding_history(
     limit = 1000
     all_rows: list[dict[str, Any]] = []
     curr_since = fetch_start_ms
+    start_mono = time.monotonic()
+    max_elapsed_sec = 120.0
+    max_pages = 500
+    pages = 0
 
     while True:
+        pages += 1
+        if pages > max_pages or (time.monotonic() - start_mono) > max_elapsed_sec:
+            break
         records = exchange.fetch_funding_rate_history(symbol, since=curr_since, limit=limit)
         if not records:
             break
@@ -290,7 +298,7 @@ def fetch_spot_ohlcv(
     if exchange is None:
         import ccxt
 
-        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange = ccxt.binance({"enableRateLimit": True, "timeout": 20000})
 
     now_ms = (
         int(exchange.milliseconds())
@@ -329,8 +337,15 @@ def fetch_spot_ohlcv(
 
     all_rows: list[list[float | int]] = []
     curr_since = fetch_start_ms
+    start_mono = time.monotonic()
+    max_elapsed_sec = 120.0
+    max_pages = 500
+    pages = 0
 
     while True:
+        pages += 1
+        if pages > max_pages or (time.monotonic() - start_mono) > max_elapsed_sec:
+            break
         records = exchange.fetch_ohlcv(
             spot_symbol,
             timeframe=timeframe,

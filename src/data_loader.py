@@ -1,4 +1,5 @@
 """Tải, làm sạch và lưu trữ dữ liệu OHLCV (Binance USDT-M Futures)."""
+import time
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -150,7 +151,7 @@ class DataLoader:
         if exchange is None:
             import ccxt  # import trễ để unit test offline không cần ccxt
 
-            exchange = ccxt.binanceusdm({"enableRateLimit": True})
+            exchange = ccxt.binanceusdm({"enableRateLimit": True, "timeout": 20000})
         self.exchange = exchange
 
     @property
@@ -178,7 +179,14 @@ class DataLoader:
 
         all_rows: list[list[float | int]] = []
         since = int(since_ms)
+        start_mono = time.monotonic()
+        max_elapsed_sec = 60.0
+        max_pages = 500
+        pages = 0
         while since <= end_ms:
+            pages += 1
+            if pages > max_pages or (time.monotonic() - start_mono) > max_elapsed_sec:
+                break
             rows = self.exchange.fetch_ohlcv(
                 self.config.symbol,
                 timeframe=self.config.timeframe,
