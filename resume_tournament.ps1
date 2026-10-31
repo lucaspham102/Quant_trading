@@ -1,7 +1,7 @@
 # Resume 24/7 Quantitative Tournament from existing state with Active Heartbeat Watchdog
 # (No reset, No flatten - Preserves testnet positions & profile states)
 Set-Location D:\Quant_trading
-$profiles = "regime_omni_1k,flexible_regime_1k,hybrid_trend_conservative_1k,baseline_1k"
+$profiles = "regime_omni_1k,flexible_regime_1k,carry_max_eta_1k,baseline_1k"
 $liveProfile = "regime_omni_1k"
 $intervalSeconds = 3600
 $heartbeatPath = "data\state\tournament_heartbeat.json"

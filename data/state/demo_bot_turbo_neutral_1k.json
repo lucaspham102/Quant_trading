@@ -1,0 +1,105 @@
+{
+  "open_position": null,
+  "daily_realized_pnl": 0.0,
+  "daily_start_equity": 1000.0,
+  "current_equity": 1000.0,
+  "current_utc_date": null,
+  "consecutive_losses": 0,
+  "circuit_breaker_tripped": false,
+  "last_processed_candle_ts": null,
+  "trade_history": [],
+  "carry_positions": {},
+  "carry_last_reconcile_ts": "2026-10-19T10:00:00+00:00",
+  "carry_sleeve": {
+    "allocations": [
+      {
+        "symbol": "DOGE/USDT:USDT",
+        "side": "short_perp",
+        "venue": "binance",
+        "target_qty": 3859.0,
+        "notional": 305.59421,
+        "min_notional_ok": true
+      },
+      {
+        "symbol": "AVAX/USDT:USDT",
+        "side": "short_perp",
+        "venue": "binance",
+        "target_qty": 30.4,
+        "notional": 294.12,
+        "min_notional_ok": true
+      }
+    ],
+    "total_notional": 599.71421,
+    "overlay_active": true,
+    "raw_snr_dispersion": 0.6686584850347925,
+    "timestamp": "2026-10-19T10:00:00+00:00"
+  },
+  "momentum_overlay": {
+    "allocations": [
+      {
+        "symbol": "BTC/USDT:USDT",
+        "side": "long_perp",
+        "venue": "binance",
+        "target_qty": 0.001,
+        "notional": 82.26910000000001,
+        "min_notional_ok": true,
+        "target_weight": 0.10921071396823917
+      },
+      {
+        "symbol": "DOGE/USDT:USDT",
+        "side": "short_perp",
+        "venue": "binance",
+        "target_qty": 1038.0,
+        "notional": 82.19922,
+        "min_notional_ok": true,
+        "target_weight": -0.10921071396823917
+      }
+    ],
+    "total_notional": 164.46832,
+    "overlay_active": true,
+    "raw_snr_dispersion": 0.6686584850347925,
+    "timestamp": "2026-10-19T10:00:00+00:00"
+  },
+  "carry_orders": [],
+  "overlay_orders": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "side": "buy",
+      "qty": 0.001,
+      "notional": 82.26910000000001,
+      "status": "paper_filled",
+      "ts": "2026-10-19T10:00:00+00:00",
+      "reason": "delta_rebalance"
+    },
+    {
+      "symbol": "DOGE/USDT:USDT",
+      "side": "sell",
+      "qty": 1038.0,
+      "notional": 82.19922,
+      "status": "paper_filled",
+      "ts": "2026-10-19T10:00:00+00:00",
+      "reason": "delta_rebalance"
+    }
+  ],
+  "overlay_positions": {
+    "BTC/USDT:USDT": {
+      "qty": 0.001,
+      "side": "long",
+      "entry_price": 82269.1,
+      "ts": "2026-10-19T10:00:00+00:00"
+    },
+    "DOGE/USDT:USDT": {
+      "qty": -1038.0,
+      "side": "short",
+      "entry_price": 0.07919,
+      "ts": "2026-10-19T10:00:00+00:00"
+    }
+  },
+  "executor_functional": true,
+  "initial_capital": 1000.0,
+  "peak_equity": 1000.0,
+  "strategy": "barbell",
+  "kill_switch_triggered": false,
+  "kill_switch_pending_close": false,
+  "drift_unrepairable_symbols": {}
+}

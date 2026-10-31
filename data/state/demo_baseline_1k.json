@@ -1,0 +1,101 @@
+{
+  "basis_pnl_usd": 0.1137625761460217,
+  "carry_slots": 3,
+  "circuit_breaker_risk_scale": 1.0,
+  "circuit_breaker_state": "DISABLED",
+  "circuit_breaker_triggers": 0,
+  "cumulative_passive_yield_usd": 0.5864597818604305,
+  "cycle": 105,
+  "exchange_recon_equity_usd": null,
+  "fees_paid_usd": 1.2154478309108876,
+  "funding_pnl_usd": 0.06620846067924618,
+  "futures_leverage": 2.7351390229841006,
+  "last_funding_ts": "2026-10-31T08:00:00+00:00",
+  "last_prices": {
+    "AVAX/USDT:USDT": 8.4495,
+    "BNB/USDT:USDT": 705.285,
+    "BTC/USDT:USDT": 77537.15,
+    "DOGE/USDT:USDT": 0.07525499999999999,
+    "ETH/USDT:USDT": 2246.145,
+    "LINK/USDT:USDT": 11.5145,
+    "SOL/USDT:USDT": 95.85499999999999,
+    "XRP/USDT:USDT": 1.24925
+  },
+  "last_trend_rebalance_ts": null,
+  "max_dd_pct": 0.4986638839406624,
+  "mode": "SHADOW_LIVE",
+  "note": "",
+  "overlay_long_usd": 141.057,
+  "overlay_pnl_usd": -1.487007445827267,
+  "overlay_short_usd": 143.6415,
+  "peak_equity_usd": 1000.272460753345,
+  "perp_unrealized_pnl_usd": -4.221386335004738,
+  "positions_snapshot": {
+    "AVAX/USDT:USDT|overlay": {
+      "entry_price": 8.24977251392301,
+      "kind": "overlay",
+      "qty": -17.0,
+      "signed_usd": -143.6415,
+      "symbol": "AVAX/USDT:USDT"
+    },
+    "BNB/USDT:USDT|overlay": {
+      "entry_price": 698.8946955824887,
+      "kind": "overlay",
+      "qty": 0.19999999999999998,
+      "signed_usd": 141.057,
+      "symbol": "BNB/USDT:USDT"
+    },
+    "BTC/USDT:USDT": {
+      "entry_price": 77086.78775691144,
+      "kind": "carry",
+      "perp_entry": 77086.78775691144,
+      "perp_qty": -0.002305526472758362,
+      "qty": 0.002305526472758362,
+      "signed_usd": 178.76395194723602,
+      "spot_entry": 77130.1672941274,
+      "spot_qty": 0.002305526472758362,
+      "symbol": "BTC/USDT:USDT"
+    },
+    "SOL/USDT:USDT": {
+      "entry_price": 95.18352386564858,
+      "kind": "carry",
+      "perp_entry": 95.18352386564858,
+      "perp_qty": -2.5360472656218476,
+      "qty": 2.5360472656218476,
+      "signed_usd": 243.0928106461822,
+      "spot_entry": 95.24320707544922,
+      "spot_qty": 2.5360472656218476,
+      "symbol": "SOL/USDT:USDT"
+    },
+    "XRP/USDT:USDT": {
+      "entry_price": 1.2416122397542944,
+      "kind": "carry",
+      "perp_entry": 1.2416122397542944,
+      "perp_qty": -200.71514544808247,
+      "qty": 200.71514544808247,
+      "signed_usd": 250.74339545101702,
+      "spot_entry": 1.2419938744354426,
+      "spot_qty": 200.71514544808247,
+      "symbol": "XRP/USDT:USDT"
+    }
+  },
+  "profile": "baseline_1k",
+  "pure_trading_equity_usd": 995.2844632505635,
+  "realized_pnl_usd": -2.6414767791608083,
+  "recon_drift_usd": null,
+  "reconcile_status": "NOT_APPLICABLE",
+  "reversal_gross_usd": 0.0,
+  "reversal_pnl_usd": 0.0,
+  "spot_unrealized_pnl_usd": 4.33514891115076,
+  "status": "OK",
+  "trend_gross_usd": 0.0,
+  "trend_hard_lock_bars": null,
+  "trend_long_usd": 0.0,
+  "trend_pnl_usd": 0.0,
+  "trend_sleeve_state": {
+    "active": {},
+    "peak_close": {}
+  },
+  "updated_at": "2026-10-31T12:19:34.815505+00:00",
+  "yield_stacked_equity_usd": 995.8709230324239
+}

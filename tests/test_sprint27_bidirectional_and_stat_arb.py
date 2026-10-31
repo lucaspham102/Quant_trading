@@ -410,7 +410,7 @@ def test_new_profiles_feature_flags():
     assert arb.enable_reversal_sleeve and not arb.enable_trend_sleeve
     assert arb.reversal_gross_pct > 0.0
     omni = PROFILE_REGISTRY["regime_omni_1k"]
-    assert omni.enable_trend_sleeve and omni.allow_short_trend and omni.enable_reversal_sleeve
+    assert omni.enable_trend_sleeve and omni.allow_short_trend and not omni.enable_reversal_sleeve
     assert omni.dynamic_carry_to_alpha_margin
 
 

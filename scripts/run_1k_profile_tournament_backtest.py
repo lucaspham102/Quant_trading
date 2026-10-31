@@ -79,9 +79,9 @@ TOURNAMENT_LOT_STEPS: dict[str, float] = {
     "BTC/USDT:USDT": 0.001,
     "ETH/USDT:USDT": 0.001,
     "SOL/USDT:USDT": 0.01,
-    "BNB/USDT:USDT": 0.001,
+    "BNB/USDT:USDT": 0.01,
     "LINK/USDT:USDT": 0.01,
-    "AVAX/USDT:USDT": 0.01,
+    "AVAX/USDT:USDT": 1.0,
     "XRP/USDT:USDT": 1.0,
     "DOGE/USDT:USDT": 1.0,
 }

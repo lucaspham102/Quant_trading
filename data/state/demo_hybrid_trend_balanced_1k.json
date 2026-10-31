@@ -1,0 +1,67 @@
+{
+  "basis_pnl_usd": 0.0,
+  "carry_slots": 0,
+  "circuit_breaker_risk_scale": 1.0,
+  "circuit_breaker_state": "NORMAL",
+  "circuit_breaker_triggers": 0,
+  "cumulative_passive_yield_usd": 0.0,
+  "cycle": 1,
+  "exchange_recon_equity_usd": null,
+  "fees_paid_usd": 0.07993165,
+  "funding_pnl_usd": 0.0,
+  "futures_leverage": 0.4567522857142857,
+  "last_funding_ts": "2026-10-24T16:00:00+00:00",
+  "last_prices": {
+    "AVAX/USDT:USDT": 8.8525,
+    "BNB/USDT:USDT": 726.525,
+    "BTC/USDT:USDT": 80326.55,
+    "DOGE/USDT:USDT": 0.076625,
+    "ETH/USDT:USDT": 2325.4849999999997,
+    "LINK/USDT:USDT": 11.4585,
+    "SOL/USDT:USDT": 100.745,
+    "XRP/USDT:USDT": 1.28125
+  },
+  "last_trend_rebalance_ts": "2026-10-24T18:19:35.876942+00:00",
+  "max_dd_pct": 0.0,
+  "mode": "SHADOW_LIVE",
+  "note": "",
+  "overlay_long_usd": 80.32655000000001,
+  "overlay_pnl_usd": 0.0,
+  "overlay_short_usd": 79.53675,
+  "peak_equity_usd": 1000.5996175138964,
+  "perp_unrealized_pnl_usd": 0.0,
+  "positions_snapshot": {
+    "BTC/USDT:USDT|overlay": {
+      "entry_price": 82269.1,
+      "kind": "overlay",
+      "qty": 0.001,
+      "signed_usd": 80.32655000000001,
+      "symbol": "BTC/USDT:USDT"
+    },
+    "DOGE/USDT:USDT|overlay": {
+      "entry_price": 0.07919,
+      "kind": "overlay",
+      "qty": -1038.0,
+      "signed_usd": -79.53675,
+      "symbol": "DOGE/USDT:USDT"
+    }
+  },
+  "profile": "hybrid_trend_balanced_1k",
+  "pure_trading_equity_usd": 1000.5996175138964,
+  "realized_pnl_usd": -0.07993165,
+  "recon_drift_usd": null,
+  "reconcile_status": "NOT_APPLICABLE",
+  "spot_unrealized_pnl_usd": 0.0,
+  "status": "OK",
+  "trend_active_symbols": [],
+  "trend_gross_usd": 0.0,
+  "trend_hard_lock_bars": null,
+  "trend_long_usd": 0.0,
+  "trend_pnl_usd": 0.0,
+  "trend_sleeve_state": {
+    "active": {},
+    "peak_close": {}
+  },
+  "updated_at": "2026-10-24T18:19:35.876942+00:00",
+  "yield_stacked_equity_usd": 1000.5996175138964
+}
