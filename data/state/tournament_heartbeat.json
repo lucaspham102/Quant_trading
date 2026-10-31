@@ -1,9 +1,0 @@
-{
-  "pid": 13988,
-  "cycle": 105,
-  "phase": "SLEEPING",
-  "timestamp_utc": "2026-10-31T12:32:35.077391+00:00",
-  "epoch_sec": 1793449955.0774086,
-  "sleep_remaining_sec": 2819.83,
-  "sleep_total_sec": 3600.0
-}
