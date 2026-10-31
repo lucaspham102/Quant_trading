@@ -5,8 +5,9 @@
 > **Repository:** `d:\Quant_trading`  
 > **Ngôn ngữ & Thư viện:** Python 3.14+, NumPy, Pandas, CCXT, Pytest, Hypothesis.  
 > **Thị trường mục tiêu:** Binance Spot & USDⓈ-M Futures (Hỗ trợ mở rộng Bybit, OKX).  
-> **Trạng thái kiểm thử:** 842/842 Unit & Integration Tests đạt trạng thái PASS 100%.  
-> **Kiến trúc cốt lõi:** Multi-Sleeve Barbell Unified Margin Portfolio (Tier 1 Core Cash & Carry + Tier 2 XS Momentum Alpha Overlay + Tier 3 Directional Trend Sleeve + Tier 4 Stat-Arb Reversal Sleeve + Macro Regime Switcher + Yield Stacking).
+> **Trạng thái kiểm thử:** 859/859 Unit & Integration Tests đạt trạng thái PASS 100%.  
+> **Trạng thái vận hành:** Chu kỳ 105 (`SYNCED`), tích hợp chống đứt gãy 24/7 (Anti-Sleep, `.json.bak` Auto-Recovery, Network Outage Resilience, Smart HTML Telegram Reports).  
+> **Kiến trúc cốt lõi:** Multi-Sleeve Barbell Unified Margin Portfolio (Tier 1 Core Cash & Carry + Tier 2 XS Momentum Alpha Overlay + Tier 3 Long-Only Triple-Confirmed Trend Sleeve + Yield Stacking; đã tinh gọn tắt Reversal & Short Trend từ Chu kỳ 105).
 
 ---
 
