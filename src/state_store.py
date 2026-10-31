@@ -3,6 +3,7 @@ import dataclasses
 import json
 import logging
 import os
+import shutil
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -190,11 +191,22 @@ class StateStore:
             if "drift_unrepairable_symbols" not in payload:
                 payload["drift_unrepairable_symbols"] = {}
         tmp_path = self.file_path.with_suffix(self.file_path.suffix + ".tmp")
+        bak_path = self.file_path.with_suffix(self.file_path.suffix + ".bak")
 
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
+
+        if self.file_path.exists():
+            try:
+                if self.file_path.stat().st_size > 0:
+                    with open(self.file_path, "r", encoding="utf-8") as existing_f:
+                        existing_obj = json.load(existing_f)
+                    if isinstance(existing_obj, dict):
+                        shutil.copy2(self.file_path, bak_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Skip backing up existing state file %s: %s", self.file_path, exc)
 
         for attempt in range(5):
             try:
@@ -204,6 +216,13 @@ class StateStore:
                 if attempt == 4:
                     raise
                 time.sleep(0.05)
+
+        if not bak_path.exists() and self.file_path.exists():
+            try:
+                shutil.copy2(self.file_path, bak_path)
+            except Exception:  # noqa: BLE001
+                pass
+
         return self.file_path
 
     def load(
@@ -216,8 +235,9 @@ class StateStore:
     ) -> BotState:
         """Đọc trạng thái từ đĩa; nếu file chưa tồn tại thì trả về BotState mặc định."""
         cap = float(initial_capital) if initial_capital is not None else float(default_equity)
+        bak_path = self.file_path.with_suffix(self.file_path.suffix + ".bak")
 
-        if reset or not self.file_path.exists():
+        if reset or (not self.file_path.exists() and not bak_path.exists()):
             return BotState(
                 daily_start_equity=cap,
                 current_equity=cap,
@@ -229,8 +249,75 @@ class StateStore:
                 drift_unrepairable_symbols={},
             )
 
-        with open(self.file_path, "r", encoding="utf-8") as f:
-            raw: dict[str, Any] = json.load(f)
+        raw: Optional[dict[str, Any]] = None
+        if self.file_path.exists():
+            try:
+                if self.file_path.stat().st_size == 0:
+                    raise ValueError("Empty state file (0 bytes)")
+                with open(self.file_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError("State file root is not a JSON object")
+                raw = loaded
+            except (json.JSONDecodeError, ValueError, OSError) as exc:
+                logger.warning(
+                    "Primary state file %s is corrupted or unreadable (%s); checking backup %s",
+                    self.file_path,
+                    exc,
+                    bak_path,
+                )
+
+        if raw is None:
+            if bak_path.exists():
+                try:
+                    if bak_path.stat().st_size == 0:
+                        raise ValueError("Empty backup state file (0 bytes)")
+                    with open(bak_path, "r", encoding="utf-8") as f:
+                        loaded_bak = json.load(f)
+                    if not isinstance(loaded_bak, dict):
+                        raise ValueError("Backup state file root is not a JSON object")
+                    raw = loaded_bak
+                    logger.warning(
+                        "WARNING: RECOVERED_STATE_FROM_BACKUP (%s -> %s)",
+                        bak_path,
+                        self.file_path,
+                    )
+                    try:
+                        shutil.copy2(bak_path, self.file_path)
+                    except OSError:
+                        pass
+                except (json.JSONDecodeError, ValueError, OSError) as bak_exc:
+                    logger.error(
+                        "Backup state file %s is also corrupted (%s); returning default BotState",
+                        bak_path,
+                        bak_exc,
+                    )
+                    return BotState(
+                        daily_start_equity=cap,
+                        current_equity=cap,
+                        initial_capital=cap,
+                        peak_equity=cap,
+                        strategy=strategy,
+                        kill_switch_triggered=False,
+                        kill_switch_pending_close=False,
+                        drift_unrepairable_symbols={},
+                    )
+            else:
+                logger.warning(
+                    "No valid backup file %s found for corrupted %s; returning default BotState",
+                    bak_path,
+                    self.file_path,
+                )
+                return BotState(
+                    daily_start_equity=cap,
+                    current_equity=cap,
+                    initial_capital=cap,
+                    peak_equity=cap,
+                    strategy=strategy,
+                    kill_switch_triggered=False,
+                    kill_switch_pending_close=False,
+                    drift_unrepairable_symbols={},
+                )
 
         had_explicit_initial = "initial_capital" in raw
 

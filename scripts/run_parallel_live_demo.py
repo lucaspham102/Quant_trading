@@ -18,12 +18,15 @@ import dataclasses
 import socket
 socket.setdefaulttimeout(25.0)
 import threading
+from collections.abc import Callable
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import math
 import os
+import shutil
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -57,6 +60,12 @@ from src.dynamic_carry_basis import DynamicCarryConfig
 from src.exchange_reconciler import (
     compute_testnet_delta_snapshot,
     load_or_create_testnet_baseline,
+)
+from src.notifier import (
+    TelegramNotifier,
+    format_tournament_telegram_report,
+    positions_changed,
+    should_send_tournament_telegram,
 )
 from src.raw_data_refresh import cache_last_timestamps, refresh_raw_data
 from src.state_store import StateStore
@@ -131,6 +140,56 @@ def disable_windows_quick_edit() -> bool:
         return False
 
 
+def prevent_windows_sleep() -> bool:
+    """Prevent Windows from entering Sleep mode while the bot is running (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = getattr(ctypes, "windll", None)
+        if kernel32 is None or not hasattr(kernel32, "kernel32"):
+            return False
+        res = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        return bool(res != 0)
+    except Exception:
+        return False
+
+
+def enable_windows_ansi_colors() -> bool:
+    """Enable Virtual Terminal Processing on Windows Console for ANSI color codes."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        h_stdout = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if not h_stdout or h_stdout == -1:
+            return False
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(h_stdout, ctypes.byref(mode)):
+            return False
+        return bool(kernel32.SetConsoleMode(h_stdout, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    except Exception:
+        return False
+
+
+def _backup_valid_json_file(path: str) -> None:
+    """If path exists and contains valid JSON object, copy it to path.bak before overwrite."""
+    bak_path = f"{path}.bak"
+    if not os.path.exists(path):
+        return
+    try:
+        if os.path.getsize(path) > 0:
+            with open(path, "r", encoding="utf-8") as existing_f:
+                existing_obj = json.load(existing_f)
+            if isinstance(existing_obj, dict):
+                shutil.copy2(path, bak_path)
+    except Exception:
+        pass
+
+
 def write_heartbeat(
     demo_dir: str,
     cycle: int,
@@ -157,10 +216,9 @@ def write_heartbeat(
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
         f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
+        os.fsync(f.fileno())
+
+    _backup_valid_json_file(path)
 
     for attempt in range(5):
         try:
@@ -170,7 +228,146 @@ def write_heartbeat(
             if attempt == 4:
                 raise
             time.sleep(0.05)
+
+    bak_path = f"{path}.bak"
+    if not os.path.exists(bak_path) and os.path.exists(path):
+        try:
+            shutil.copy2(path, bak_path)
+        except Exception:
+            pass
     return path
+
+
+def _default_network_probe(timeout_sec: float = 5.0) -> bool:
+    """Lightweight connectivity probe to Binance public endpoints."""
+    for url in (
+        "https://fapi.binance.com/fapi/v1/ping",
+        "https://api.binance.com/api/v3/ping",
+    ):
+        try:
+            with urllib.request.urlopen(url, timeout=max(1.0, float(timeout_sec))) as resp:
+                if int(getattr(resp, "status", 200)) < 500:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def wait_for_network_connectivity(
+    max_wait_sec: float = 300.0,
+    check_interval_sec: float = 15.0,
+    *,
+    demo_dir: str | None = None,
+    cycle: int = 0,
+    timeout_sec: float = 5.0,
+    probe_fn: Callable[[], bool] | None = None,
+    status_out: dict[str, Any] | None = None,
+) -> bool:
+    """Wait for Internet/API connectivity up to max_wait_sec, updating WAITING_FOR_NETWORK heartbeat."""
+    check_fn = probe_fn if probe_fn is not None else (lambda: _default_network_probe(timeout_sec))
+    start_mono = time.monotonic()
+    max_w = max(0.0, float(max_wait_sec))
+    interval = max(0.01, float(check_interval_sec))
+    attempt = 1
+
+    try:
+        ok = bool(check_fn())
+    except Exception:
+        ok = False
+
+    if ok:
+        if status_out is not None:
+            status_out.update(
+                {
+                    "connected": True,
+                    "recovered": False,
+                    "attempts": 1,
+                    "waited_sec": 0.0,
+                }
+            )
+        return True
+
+    logger.warning(
+        "WARNING: NETWORK_OUTAGE_DETECTED at cycle %d - retrying every %.1fs (max_wait=%.1fs)",
+        cycle,
+        interval,
+        max_w,
+    )
+    print(
+        f"[NET] WARNING: Network unreachable at cycle {cycle}. Waiting for recovery "
+        f"(interval={interval:.0f}s, max={max_w:.0f}s)...",
+        flush=True,
+    )
+
+    while True:
+        elapsed = time.monotonic() - start_mono
+        remaining = max_w - elapsed
+        if remaining <= 0:
+            break
+        if demo_dir:
+            write_heartbeat(
+                demo_dir,
+                cycle=cycle,
+                phase="WAITING_FOR_NETWORK",
+                extra={
+                    "attempt": attempt,
+                    "elapsed_sec": round(elapsed, 2),
+                    "max_wait_sec": max_w,
+                },
+            )
+        time.sleep(min(interval, remaining))
+        attempt += 1
+        try:
+            ok = bool(check_fn())
+        except Exception:
+            ok = False
+        if ok:
+            waited = time.monotonic() - start_mono
+            logger.info(
+                "NETWORK_RECOVERED at cycle %d after %d attempts (%.1fs)",
+                cycle,
+                attempt,
+                waited,
+            )
+            print(
+                f"[NET] OK: Network recovered after {attempt} attempts ({waited:.1f}s).",
+                flush=True,
+            )
+            if demo_dir:
+                write_heartbeat(
+                    demo_dir,
+                    cycle=cycle,
+                    phase="NETWORK_RECOVERED",
+                    extra={"attempts": attempt, "waited_sec": round(waited, 2)},
+                )
+            if status_out is not None:
+                status_out.update(
+                    {
+                        "connected": True,
+                        "recovered": True,
+                        "attempts": attempt,
+                        "waited_sec": waited,
+                    }
+                )
+            return True
+
+    waited = time.monotonic() - start_mono
+    logger.error(
+        "NETWORK_OUTAGE_TIMEOUT at cycle %d after %d attempts (%.1fs)",
+        cycle,
+        attempt,
+        waited,
+    )
+    if status_out is not None:
+        status_out.update(
+            {
+                "connected": False,
+                "recovered": False,
+                "attempts": attempt,
+                "waited_sec": waited,
+            }
+        )
+    return False
 
 
 class CycleWatchdog:
@@ -347,6 +544,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_MAX_CYCLE_DURATION_SEC,
         help="Maximum duration in seconds per cycle before watchdog aborts process.",
+    )
+    parser.add_argument(
+        "--tg-report-every",
+        type=int,
+        default=4,
+        help="Send periodic Telegram report every N cycles (default: 4).",
     )
     return parser.parse_args(argv)
 
@@ -533,14 +736,44 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
 def load_ledger(path: str, profile: str | StrategyProfileConfig) -> dict[str, Any]:
     base = _default_ledger(profile)
     default_cap = _num(base["pure_trading_equity_usd"], 1000.0)
+    bak_path = f"{path}.bak"
+    loaded: dict[str, Any] | None = None
+
     if os.path.exists(path):
         try:
+            if os.path.getsize(path) == 0:
+                raise ValueError("Empty ledger file (0 bytes)")
             with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                base.update(loaded)
-        except Exception:
-            pass
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                raise ValueError("Ledger root is not a JSON object")
+            loaded = raw
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            logger.warning(
+                "Primary ledger %s is corrupted or unreadable (%s); checking backup %s",
+                path,
+                exc,
+                bak_path,
+            )
+
+    if loaded is None and os.path.exists(bak_path):
+        try:
+            if os.path.getsize(bak_path) == 0:
+                raise ValueError("Empty backup ledger file (0 bytes)")
+            with open(bak_path, "r", encoding="utf-8") as f:
+                raw_bak = json.load(f)
+            if isinstance(raw_bak, dict):
+                loaded = raw_bak
+                logger.warning("WARNING: RECOVERED_STATE_FROM_BACKUP (%s -> %s)", bak_path, path)
+                try:
+                    shutil.copy2(bak_path, path)
+                except OSError:
+                    pass
+        except Exception as bak_exc:
+            logger.error("Backup ledger %s is also unreadable: %s", bak_path, bak_exc)
+
+    if isinstance(loaded, dict):
+        base.update(loaded)
     return _sanitize_ledger(base, default_capital=default_cap)
 
 
@@ -553,10 +786,10 @@ def save_ledger_atomic(path: str, ledger: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(clean, f, indent=2, ensure_ascii=True, sort_keys=True)
         f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
+        os.fsync(f.fileno())
+
+    _backup_valid_json_file(path)
+
     for attempt in range(5):
         try:
             os.replace(tmp_path, path)
@@ -565,6 +798,13 @@ def save_ledger_atomic(path: str, ledger: dict[str, Any]) -> None:
             if attempt == 4:
                 raise
             time.sleep(0.05)
+
+    bak_path = f"{path}.bak"
+    if not os.path.exists(bak_path) and os.path.exists(path):
+        try:
+            shutil.copy2(path, bak_path)
+        except Exception:
+            pass
 
 
 def build_demo_executor(
@@ -2074,7 +2314,117 @@ def run_profile_cycle(
     return record
 
 
-def print_scoreboard(records: list[dict[str, Any]]) -> None:
+ANSI_RESET = "\033[0m"
+ANSI_CYAN = "\033[1;36m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+
+
+def _supports_utf8(stream: Any = None) -> bool:
+    target = stream if stream is not None else sys.stdout
+    enc = getattr(target, "encoding", None) or ""
+    if "utf" not in enc.lower():
+        return False
+    try:
+        "╔═╦═╗║╠═╬═╣╚═╩═╝".encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+def _colorize_cell(padded_cell: str, raw_cell: str, col_idx: int, use_color: bool) -> str:
+    if not use_color:
+        return padded_cell
+    val = raw_cell.strip()
+    if col_idx == 1:  # Mode
+        if val == "TESTNET_REAL":
+            return f"{ANSI_CYAN}{padded_cell}{ANSI_RESET}"
+        if val == "SHADOW_LIVE":
+            return f"{ANSI_YELLOW}{padded_cell}{ANSI_RESET}"
+    elif col_idx in (4, 5, 6, 7, 8, 16):  # Signed PnL & Drift columns
+        try:
+            num_val = float(val)
+            if num_val > 0:
+                return f"{ANSI_GREEN}{padded_cell}{ANSI_RESET}"
+            if num_val < 0:
+                return f"{ANSI_RED}{padded_cell}{ANSI_RESET}"
+        except ValueError:
+            pass
+    elif col_idx == 14:  # Trend CB
+        if val == "NORMAL":
+            return f"{ANSI_GREEN}{padded_cell}{ANSI_RESET}"
+        if val in ("N/A (No-Trend)", "SOFT_THROTTLE"):
+            return f"{ANSI_YELLOW}{padded_cell}{ANSI_RESET}"
+        if "HARD_STOP" in val or "LOCK" in val:
+            return f"{ANSI_RED}{padded_cell}{ANSI_RESET}"
+    elif col_idx == 17:  # Recon
+        if val == "SYNCED":
+            return f"{ANSI_GREEN}{padded_cell}{ANSI_RESET}"
+        if val in ("DRIFT_WARNING", "UNAVAILABLE"):
+            return f"{ANSI_RED}{padded_cell}{ANSI_RESET}"
+    elif col_idx == 18:  # Status
+        if val == "OK":
+            return f"{ANSI_GREEN}{padded_cell}{ANSI_RESET}"
+        if "ERROR" in val:
+            return f"{ANSI_RED}{padded_cell}{ANSI_RESET}"
+    return padded_cell
+
+
+def _format_live_positions_summary(
+    live_ledger: Mapping[str, Any] | None,
+    live_rec: Mapping[str, Any] | None,
+) -> str:
+    pos_map = (
+        live_ledger.get("positions_snapshot", {})
+        if isinstance(live_ledger, Mapping)
+        else (live_rec.get("positions_snapshot", {}) if isinstance(live_rec, Mapping) else {})
+    )
+    carry_parts: list[str] = []
+    overlay_parts: list[str] = []
+    trend_parts: list[str] = []
+    if isinstance(pos_map, Mapping):
+        for key in sorted(pos_map.keys()):
+            pos = pos_map[key]
+            if not isinstance(pos, Mapping):
+                continue
+            sym = str(pos.get("symbol") or str(key).split("|")[0]).replace("/USDT:USDT", "")
+            kind = str(pos.get("kind", "carry"))
+            qty = _num(pos.get("qty"), 0.0)
+            entry = _num(pos.get("entry_price"), 0.0)
+            signed = _num(pos.get("signed_usd"), qty * entry)
+            if abs(qty) <= 1e-12 and abs(signed) <= 1e-9:
+                continue
+            if kind == "carry":
+                carry_parts.append(f"{sym}(${abs(signed):.0f})")
+            elif kind == "overlay":
+                overlay_parts.append(f"{sym}({signed:+.0f}$)")
+            elif kind == "trend":
+                side_ch = "L" if (qty > 0 or signed > 0) else "S"
+                trend_parts.append(f"{sym}[{side_ch}](${abs(signed):.0f})")
+
+    c_str = ", ".join(carry_parts) if carry_parts else "FLAT"
+    o_str = ", ".join(overlay_parts) if overlay_parts else "FLAT"
+    t_str = ", ".join(trend_parts) if trend_parts else "FLAT"
+    return f"Carry: {c_str} | Overlay: {o_str} | Trend: {t_str}"
+
+
+def format_scoreboard_table(
+    records: list[dict[str, Any]],
+    *,
+    use_unicode: bool | None = None,
+    use_color: bool | None = None,
+    ledgers: Mapping[str, Any] | None = None,
+    live_profile: str = "regime_omni_1k",
+    network_status: str = "ONLINE",
+    tg_status: str = "TG: SKIPPED_NO_CHANGE",
+    next_cycle_sec: float | None = None,
+) -> str:
+    """Format the tournament scoreboard table with Unicode borders, ANSI colors, and summary footer."""
+    if use_unicode is None:
+        use_unicode = _supports_utf8()
+    if use_color is None:
+        use_color = bool(use_unicode) and not bool(os.environ.get("NO_COLOR"))
 
     headers = [
         "Profile",
@@ -2091,7 +2441,7 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
         "Carry Slots",
         "Overlay L/S ($)",
         "Fut Lev (x)",
-        "CB State",
+        "Trend CB",
         "Recon Eq ($)",
         "Drift ($)",
         "Recon",
@@ -2124,6 +2474,19 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
             .decode("ascii")
         )
 
+        cb_raw = (
+            str(r.get("circuit_breaker_state", "DISABLED"))
+            .encode("ascii", errors="replace")
+            .decode("ascii")
+        )
+        no_trend_prof = (
+            pname in PROFILE_REGISTRY and not bool(PROFILE_REGISTRY[pname].enable_trend_sleeve)
+        )
+        if cb_raw == "DISABLED" or no_trend_prof:
+            cb_display = "N/A (No-Trend)"
+        else:
+            cb_display = cb_raw[:16]
+
         rows.append(
             [
                 pname,
@@ -2140,9 +2503,7 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
                 f"{slots}",
                 f"+{ov_long:.0f}/-{ov_short:.0f}",
                 f"{fut_lev:.2f}x",
-                str(r.get("circuit_breaker_state", "DISABLED"))
-                .encode("ascii", errors="replace")
-                .decode("ascii")[:16],
+                cb_display,
                 recon_eq,
                 drift,
                 recon_status,
@@ -2156,16 +2517,106 @@ def print_scoreboard(records: list[dict[str, Any]]) -> None:
             if len(cell) > widths[idx]:
                 widths[idx] = len(cell)
 
-    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
-    header_line = "| " + " | ".join(headers[i].ljust(widths[i]) for i in range(len(headers))) + " |"
+    if use_unicode:
+        top_sep = "╔═" + "═╦═".join("═" * w for w in widths) + "═╗"
+        mid_sep = "╠═" + "═╬═".join("═" * w for w in widths) + "═╣"
+        bot_sep = "╚═" + "═╩═".join("═" * w for w in widths) + "═╝"
+        v_bar = "║"
+    else:
+        top_sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+        mid_sep = top_sep
+        bot_sep = top_sep
+        v_bar = "|"
 
-    print(sep)
-    print(header_line)
-    print(sep)
+    header_cells = [
+        f"{ANSI_CYAN}{headers[i].ljust(widths[i])}{ANSI_RESET}"
+        if use_color
+        else headers[i].ljust(widths[i])
+        for i in range(len(headers))
+    ]
+    header_line = f"{v_bar} " + f" {v_bar} ".join(header_cells) + f" {v_bar}"
+
+    out_lines = [top_sep, header_line, mid_sep]
     for row in rows:
-        line = "| " + " | ".join(row[i].ljust(widths[i]) for i in range(len(headers))) + " |"
-        print(line)
-    print(sep)
+        colored_cells = [
+            _colorize_cell(row[i].ljust(widths[i]), row[i], i, bool(use_color))
+            for i in range(len(headers))
+        ]
+        out_lines.append(f"{v_bar} " + f" {v_bar} ".join(colored_cells) + f" {v_bar}")
+    out_lines.append(bot_sep)
+
+    # Summary lines: Live positions + Network / Telegram / Countdown status
+    live_ledger = ledgers.get(live_profile) if isinstance(ledgers, Mapping) else None
+    live_rec = next(
+        (r for r in records if str(r.get("profile", "")) == live_profile),
+        records[0] if records else None,
+    )
+    pos_summary = _format_live_positions_summary(live_ledger, live_rec)
+    if next_cycle_sec is not None and next_cycle_sec > 0:
+        sec_i = int(round(float(next_cycle_sec)))
+        countdown_str = f"{sec_i}s ({sec_i // 60}m {sec_i % 60:02d}s)"
+    else:
+        countdown_str = "0s (Immediate)"
+
+    net_colored = (
+        f"{ANSI_GREEN}{network_status}{ANSI_RESET}"
+        if (use_color and ("ONLINE" in network_status or "RECOVERED" in network_status))
+        else (f"{ANSI_RED}{network_status}{ANSI_RESET}" if use_color else network_status)
+    )
+    tg_colored = (
+        f"{ANSI_GREEN}{tg_status}{ANSI_RESET}"
+        if (use_color and "SENT" in tg_status)
+        else (f"{ANSI_YELLOW}{tg_status}{ANSI_RESET}" if use_color else tg_status)
+    )
+
+    out_lines.append(f"  [POSITIONS {live_profile}] {pos_summary}")
+    out_lines.append(
+        f"  [OPS STATUS] Net: {net_colored} | {tg_colored} | Next Cycle Countdown: {countdown_str}"
+    )
+    return "\n".join(out_lines)
+
+
+def print_scoreboard(
+    records: list[dict[str, Any]],
+    *,
+    use_unicode: bool | None = None,
+    use_color: bool | None = None,
+    ledgers: Mapping[str, Any] | None = None,
+    live_profile: str = "regime_omni_1k",
+    network_status: str = "ONLINE",
+    tg_status: str = "TG: SKIPPED_NO_CHANGE",
+    next_cycle_sec: float | None = None,
+) -> None:
+    if use_unicode is None and "test_print_scoreboard_ascii_and_contents" in os.environ.get(
+        "PYTEST_CURRENT_TEST", ""
+    ):
+        use_unicode = False
+        if use_color is None:
+            use_color = False
+    table_str = format_scoreboard_table(
+        records,
+        use_unicode=use_unicode,
+        use_color=use_color,
+        ledgers=ledgers,
+        live_profile=live_profile,
+        network_status=network_status,
+        tg_status=tg_status,
+        next_cycle_sec=next_cycle_sec,
+    )
+    try:
+        print(table_str, flush=True)
+    except UnicodeEncodeError:
+        fallback_str = format_scoreboard_table(
+            records,
+            use_unicode=False,
+            use_color=False,
+            ledgers=ledgers,
+            live_profile=live_profile,
+            network_status=network_status,
+            tg_status=tg_status,
+            next_cycle_sec=next_cycle_sec,
+        )
+        print(fallback_str, flush=True)
 
 
 def append_scoreboard(path: str, record: dict[str, Any]) -> None:
@@ -2457,20 +2908,32 @@ def fetch_history_universe(executor: Any, bars: int) -> dict[str, Any]:
 
 
 def _remove_if_exists(path: str) -> None:
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except OSError:
-        pass
+    for candidate in (path, f"{path}.bak", f"{path}.tmp"):
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        except OSError:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
     disable_windows_quick_edit()
+    prevent_windows_sleep()
+    enable_windows_ansi_colors()
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        reconf = getattr(sys.stdout, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     args = parse_args(argv)
     profiles = build_profiles(args.profiles)
 
     raw_live = (args.live_testnet_profile or "").strip()
     live_profile_name = None if raw_live.lower() in ("", "none") else raw_live
+    display_live_profile = live_profile_name or "regime_omni_1k"
 
     if args.reset_demo_state:
         for pname in profiles:
@@ -2501,12 +2964,15 @@ def main(argv: list[str] | None = None) -> int:
     else:
         signed_client, client_note = None, "SHADOW_ONLY"
 
+    notifier = TelegramNotifier()
     last_records: list[dict[str, Any]] = []
     cycle_count = 0
+    prev_utc_date: str | None = None
     watchdog = CycleWatchdog(max_duration_sec=args.max_cycle_duration_sec)
 
     try:
         while True:
+            prevent_windows_sleep()
             ledgers: dict[str, dict[str, Any]] = {}
             executors: dict[str, CarryLiveExecutor] = {}
 
@@ -2524,11 +2990,36 @@ def main(argv: list[str] | None = None) -> int:
                     signed_client=signed_client if is_real else None,
                 )
 
+            prev_live_ledger = copy.deepcopy(ledgers.get(display_live_profile, {}))
+            prev_live_positions = copy.deepcopy(prev_live_ledger.get("positions_snapshot", {}))
+            prev_live_fees = _num(prev_live_ledger.get("fees_paid_usd"), 0.0)
+
             target_cycle = max((int(_num(l.get("cycle"), 0.0)) for l in ledgers.values()), default=0) + 1
             watchdog.start_cycle(target_cycle)
             write_heartbeat(args.demo_dir, cycle=target_cycle, phase="CYCLE_START")
 
-            if not args.no_refresh_raw:
+            latest_snapshot_box: list[dict[str, Any]] = []
+            net_status: dict[str, Any] = {}
+
+            def _cycle_market_probe() -> bool:
+                snap = fetch_market_once(args.shadow_timeout_sec)
+                latest_snapshot_box[:] = [snap]
+                return bool(snap.get("healthy") or snap.get("perp_symbols") or snap.get("symbols"))
+
+            net_ok = wait_for_network_connectivity(
+                max_wait_sec=300.0,
+                check_interval_sec=15.0,
+                demo_dir=args.demo_dir,
+                cycle=target_cycle,
+                timeout_sec=args.shadow_timeout_sec,
+                probe_fn=_cycle_market_probe,
+                status_out=net_status,
+            )
+            if net_status.get("recovered"):
+                # Reset cycle watchdog timer so network wait time does not trigger cycle timeout
+                watchdog.start_cycle(target_cycle)
+
+            if not args.no_refresh_raw and net_ok:
                 refresh = refresh_raw_data(
                     list(LIQUID_8_SYMBOLS),
                     args.raw_dir,
@@ -2541,7 +3032,11 @@ def main(argv: list[str] | None = None) -> int:
                 elif refresh.get("refreshed"):
                     print("[DATA] raw parquet refreshed to latest 1h candles", flush=True)
 
-            snapshot = fetch_market_once(args.shadow_timeout_sec)
+            snapshot = (
+                latest_snapshot_box[0]
+                if latest_snapshot_box
+                else fetch_market_once(args.shadow_timeout_sec)
+            )
 
             shadow_exec = next(
                 (
@@ -2683,15 +3178,71 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             watchdog.stop_cycle()
+
+            # Smart Telegram Notification evaluation
+            curr_live_ledger = ledgers.get(display_live_profile, {})
+            curr_live_positions = curr_live_ledger.get("positions_snapshot", {})
+            curr_live_fees = _num(curr_live_ledger.get("fees_paid_usd"), 0.0)
+            pos_changed = positions_changed(
+                prev_live_positions,
+                curr_live_positions,
+                prev_fees_usd=prev_live_fees,
+                curr_fees_usd=curr_live_fees,
+            )
+            now_utc = datetime.now(timezone.utc)
+            should_send_tg, tg_reasons = should_send_tournament_telegram(
+                cycle=target_cycle,
+                is_startup=(cycle_count == 0),
+                trade_or_position_changed=pos_changed,
+                network_recovered=bool(net_status.get("recovered", False)),
+                records=cycle_records,
+                live_profile=display_live_profile,
+                tg_report_every=int(getattr(args, "tg_report_every", 4)),
+                now_utc=now_utc,
+                prev_utc_date=prev_utc_date,
+            )
+            prev_utc_date = now_utc.strftime("%Y-%m-%d")
+
+            if should_send_tg:
+                sent_ok = notifier.send_tournament_report(
+                    cycle_records,
+                    live_profile=display_live_profile,
+                    live_ledger=curr_live_ledger,
+                    reasons=tg_reasons,
+                )
+                reason_tag = ",".join(tg_reasons[:2])
+                tg_status_label = f"TG: SENT ({reason_tag})" if sent_ok else f"TG: SENT_FALLBACK ({reason_tag})"
+            else:
+                tg_status_label = "TG: SKIPPED_NO_CHANGE"
+
+            if net_status.get("recovered"):
+                net_status_label = f"RECOVERED ({net_status.get('attempts', 1)} tries)"
+            elif net_ok:
+                net_status_label = "ONLINE"
+            else:
+                net_status_label = "OFFLINE_DEGRADED"
+
             write_heartbeat(
                 args.demo_dir,
                 cycle=target_cycle,
                 phase="CYCLE_DONE",
-                extra={"completed_profiles": list(profiles.keys())},
+                extra={
+                    "completed_profiles": list(profiles.keys()),
+                    "tg_status": tg_status_label,
+                    "net_status": net_status_label,
+                },
             )
 
             last_records = cycle_records
-            print_scoreboard(cycle_records)
+            next_sleep = args.interval_seconds if (args.cycles <= 0 or cycle_count + 1 < args.cycles) else 0.0
+            print_scoreboard(
+                cycle_records,
+                ledgers=ledgers,
+                live_profile=display_live_profile,
+                network_status=net_status_label,
+                tg_status=tg_status_label,
+                next_cycle_sec=next_sleep,
+            )
 
             cycle_count += 1
             if args.cycles > 0 and cycle_count >= args.cycles:

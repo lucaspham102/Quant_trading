@@ -984,6 +984,21 @@ def disable_windows_quick_edit() -> bool:
         return False
 
 
+def prevent_windows_sleep() -> bool:
+    """Prevent Windows from entering Sleep mode while the bot is running (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = getattr(ctypes, "windll", None)
+        if kernel32 is None or not hasattr(kernel32, "kernel32"):
+            return False
+        res = ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        return bool(res != 0)
+    except Exception:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         return _main_impl(argv)
@@ -1001,6 +1016,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main_impl(argv: list[str] | None = None) -> int:
     disable_windows_quick_edit()
+    prevent_windows_sleep()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1259,6 +1275,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             _run_testnet_order_pair(args, executor, barbell_symbols)
 
             def _barbell_cycle_hook(cycle_idx: int) -> None:
+                prevent_windows_sleep()
                 if cycle_idx > 1:
                     _run_reconcile_preflight(args, executor)
                     _run_signed_snapshot_preflight(args, executor)
@@ -1334,6 +1351,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         _run_testnet_order_pair(args, executor, [args.symbol])
 
         def _nonbarbell_cycle_hook(cycle_idx: int) -> None:
+            prevent_windows_sleep()
             if cycle_idx > 1:
                 _run_reconcile_preflight(args, executor)
                 _run_signed_snapshot_preflight(args, executor)

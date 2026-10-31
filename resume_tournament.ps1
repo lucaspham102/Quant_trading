@@ -1,9 +1,15 @@
 # Resume 24/7 Quantitative Tournament from existing state with Active Heartbeat Watchdog
 # (No reset, No flatten - Preserves testnet positions & profile states)
-Set-Location D:\Quant_trading
+$RepoRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+Set-Location $RepoRoot
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
 $profiles = "regime_omni_1k,flexible_regime_1k,carry_max_eta_1k,baseline_1k"
 $liveProfile = "regime_omni_1k"
 $intervalSeconds = 3600
+$tgReportEvery = 4
 $heartbeatPath = "data\state\tournament_heartbeat.json"
 $maxStaleSeconds = 300  # 5 minutes without heartbeat = zombie hang
 
@@ -11,12 +17,13 @@ $maxStaleSeconds = 300  # 5 minutes without heartbeat = zombie hang
 try {
     powercfg /change standby-timeout-ac 0
     powercfg /change hibernate-timeout-ac 0
+    powercfg /change standby-timeout-dc 0
 } catch {}
 
 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting 24/7 background tournament daemon with Active Heartbeat Watchdog..." -ForegroundColor Green
 Write-Host "Profiles: $profiles"
 Write-Host "Live Profile: $liveProfile (TESTNET_REAL)"
-Write-Host "Interval: $intervalSeconds seconds"
+Write-Host "Interval: $intervalSeconds seconds | Telegram Report Every: $tgReportEvery cycles"
 Write-Host "Heartbeat Check: every 60s (Stale Threshold: ${maxStaleSeconds}s)"
 
 while ($true) {
@@ -27,7 +34,8 @@ while ($true) {
         "scripts/run_parallel_live_demo.py",
         "--profiles", $profiles,
         "--live-testnet-profile", $liveProfile,
-        "--interval-seconds", $intervalSeconds
+        "--interval-seconds", $intervalSeconds,
+        "--tg-report-every", $tgReportEvery
     )
     
     $proc = Start-Process -FilePath "python.exe" -ArgumentList $pythonArgs -PassThru -NoNewWindow
