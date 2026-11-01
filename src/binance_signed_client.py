@@ -955,9 +955,23 @@ class BinanceSignedTestnetClient:
                 "filled": False,
             }
 
-        raw = self._http_request(
-            "POST", url, signed, headers, timeout_sec=float(timeout_sec)
-        )
+        raw = None
+        try:
+            raw = self._http_request(
+                "POST", url, signed, headers, timeout_sec=float(timeout_sec)
+            )
+        except BinanceHttpError as exc:
+            if exc.code == -1021 or "-1021" in str(exc):
+                self.sync_server_time(venue)
+                unsigned = {
+                    k: v for k, v in raw_params.items() if k not in ("signature", "timestamp")
+                }
+                signed = self.sign_params(unsigned, venue=venue)
+                raw = self._http_request(
+                    "POST", url, signed, headers, timeout_sec=float(timeout_sec)
+                )
+            else:
+                raise
         result = normalize_order_result(venue, raw)
         # KHONG tra ve headers: header chua X-MBX-APIKEY, rat de ro ri vao log.
         result.update({"dry_run": False, "submitted": True, "url": url})
@@ -974,14 +988,29 @@ class BinanceSignedTestnetClient:
         """Truy van trang thai 1 lenh da dat (GET /api/v3/order hoac /fapi/v1/order)."""
         venue = VENUE_FUTURES if venue == VENUE_FUTURES else VENUE_SPOT
         params = {"symbol": _binance_symbol(symbol), "orderId": order_id}
+        path = PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH
         req = self.build_signed_get_request(
-            PERP_ORDER_PATH if venue == VENUE_FUTURES else SPOT_ORDER_PATH,
+            path,
             params=params,
             futures=(venue == VENUE_FUTURES),
         )
-        raw = self._http_request(
-            "GET", req["url"], req["params"], req["headers"], timeout_sec=timeout_sec
-        )
+        try:
+            raw = self._http_request(
+                "GET", req["url"], req["params"], req["headers"], timeout_sec=timeout_sec
+            )
+        except BinanceHttpError as exc:
+            if exc.code == -1021 or "-1021" in str(exc):
+                self.sync_server_time(venue)
+                req = self.build_signed_get_request(
+                    path,
+                    params=params,
+                    futures=(venue == VENUE_FUTURES),
+                )
+                raw = self._http_request(
+                    "GET", req["url"], req["params"], req["headers"], timeout_sec=timeout_sec
+                )
+            else:
+                raise
         result = normalize_order_result(venue, raw)
         result["filled"] = _is_filled(result)
         return result
@@ -1007,6 +1036,17 @@ class BinanceSignedTestnetClient:
                 timeout_sec=timeout_sec,
             )
         except BinanceHttpError as exc:
+            if exc.code == -1021 or "-1021" in str(exc):
+                try:
+                    self.sync_server_time(venue)
+                    signed = self.sign_params(params, venue=venue)
+                    raw = self._http_request(
+                        "DELETE", f"{base}{path}", signed, self._headers(venue),
+                        timeout_sec=timeout_sec,
+                    )
+                    return {"canceled": True, "orderId": order_id, "raw": raw}
+                except BinanceHttpError as retry_exc:
+                    return {"canceled": False, "orderId": order_id, "error": str(retry_exc)}
             return {"canceled": False, "orderId": order_id, "error": str(exc)}
         return {"canceled": True, "orderId": order_id, "raw": raw}
 
@@ -1858,13 +1898,27 @@ class BinanceSignedTestnetClient:
             if self.dry_run or not base:
                 return None
             req = self.build_signed_get_request(SPOT_ACCOUNT_PATH, futures=False)
-            account = self._http_request(
-                "GET",
-                req["url"],
-                req.get("params", {}),
-                req.get("headers", {}),
-                timeout_sec=5.0,
-            )
+            try:
+                account = self._http_request(
+                    "GET",
+                    req["url"],
+                    req.get("params", {}),
+                    req.get("headers", {}),
+                    timeout_sec=5.0,
+                )
+            except BinanceHttpError as exc:
+                if exc.code == -1021 or "-1021" in str(exc):
+                    self.sync_server_time(VENUE_SPOT)
+                    req = self.build_signed_get_request(SPOT_ACCOUNT_PATH, futures=False)
+                    account = self._http_request(
+                        "GET",
+                        req["url"],
+                        req.get("params", {}),
+                        req.get("headers", {}),
+                        timeout_sec=5.0,
+                    )
+                else:
+                    raise
             for b in (account or {}).get("balances", []) or []:
                 if isinstance(b, dict) and str(b.get("asset", "")).strip().upper() == base:
                     return float(b.get("free", 0.0) or 0.0)
@@ -2024,41 +2078,65 @@ class BinanceSignedTestnetClient:
                     "exchange_equity_usd": 0.0,
                 }
 
-            # Real network calls
-            try:
-                spot_req = self.build_signed_get_request(SPOT_ACCOUNT_PATH, futures=False)
-                futures_req = self.build_signed_get_request(PERP_ACCOUNT_PATH, futures=True)
-                risk_req = self.build_signed_get_request(PERP_POSITION_RISK_PATH, futures=True)
+            # Real network calls (with -1021 time resync + transient retry)
+            def _do_get(req_dict: dict[str, Any]) -> Any:
+                return self._http_request(
+                    "GET",
+                    req_dict["url"],
+                    req_dict.get("params", {}),
+                    req_dict.get("headers", {}),
+                    timeout_sec=timeout_sec,
+                )
 
-                def _do_get(req_dict: dict[str, Any]) -> Any:
-                    return self._http_request(
-                        "GET",
-                        req_dict["url"],
-                        req_dict.get("params", {}),
-                        req_dict.get("headers", {}),
-                        timeout_sec=timeout_sec,
-                    )
-
-                spot_account = _do_get(spot_req)
+            spot_account: Any = None
+            futures_account: Any = None
+            position_risk: Any = None
+            last_exc: Exception | None = None
+            for _attempt in range(2):
                 try:
-                    futures_account = _do_get(futures_req)
-                    position_risk = _do_get(risk_req)
+                    spot_req = self.build_signed_get_request(SPOT_ACCOUNT_PATH, futures=False)
+                    futures_req = self.build_signed_get_request(PERP_ACCOUNT_PATH, futures=True)
+                    risk_req = self.build_signed_get_request(PERP_POSITION_RISK_PATH, futures=True)
+
+                    spot_account = _do_get(spot_req)
+                    try:
+                        futures_account = _do_get(futures_req)
+                        position_risk = _do_get(risk_req)
+                    except BinanceHttpError as exc:
+                        if exc.code in FUTURES_INVALID_ERROR_CODES:
+                            return {
+                                "snapshot_healthy": False,
+                                "error": FUTURES_KEY_INVALID_HINT,
+                                "futures_key_status": FUTURES_KEY_INVALID_CODE,
+                                "api_error_code": exc.code,
+                                "spot_balances": {},
+                                "perp_positions": {},
+                                "exchange_equity_usd": 0.0,
+                            }
+                        raise
+                    last_exc = None
+                    break
                 except BinanceHttpError as exc:
-                    if exc.code in FUTURES_INVALID_ERROR_CODES:
-                        return {
-                            "snapshot_healthy": False,
-                            "error": FUTURES_KEY_INVALID_HINT,
-                            "futures_key_status": FUTURES_KEY_INVALID_CODE,
-                            "api_error_code": exc.code,
-                            "spot_balances": {},
-                            "perp_positions": {},
-                            "exchange_equity_usd": 0.0,
-                        }
-                    raise
-            except Exception as exc:
+                    last_exc = exc
+                    if _attempt == 0 and (exc.code == -1021 or "-1021" in str(exc)):
+                        self.sync_server_time("both")
+                        continue
+                    if _attempt == 0:
+                        time.sleep(0.3)
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    if _attempt == 0:
+                        if "-1021" in str(exc):
+                            self.sync_server_time("both")
+                        else:
+                            time.sleep(0.3)
+                        continue
+            if last_exc is not None:
                 return {
                     "snapshot_healthy": False,
-                    "error": f"Network fetch failed: {exc}",
+                    "error": f"Network fetch failed: {last_exc}",
+                    "api_error_code": getattr(last_exc, "code", None),
                     "spot_balances": {},
                     "perp_positions": {},
                     "exchange_equity_usd": 0.0,

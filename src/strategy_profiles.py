@@ -103,7 +103,7 @@ class StrategyProfileConfig:
                 "carry_weighting_mode must be 'equal' or 'funding_tilted', "
                 f"got {self.carry_weighting_mode!r}"
             )
-        if not self.overlay_target_vol_ann > 0:
+        if not (self.overlay_target_vol_ann > 0 if self.overlay_gross_pct > 0 else self.overlay_target_vol_ann >= 0):
             raise ValueError(
                 f"overlay_target_vol_ann must be > 0, got {self.overlay_target_vol_ann!r}"
             )
@@ -223,8 +223,8 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         carry_weighting_mode="equal",
         carry_tilt_alpha=0.0,
         carry_max_single_weight=0.50,
-        overlay_target_vol_ann=0.075,
-        overlay_gross_pct=0.15,
+        overlay_target_vol_ann=0.0,
+        overlay_gross_pct=0.0,
         max_futures_leverage=2.8,
         enable_yield_stacking=True,
     ),

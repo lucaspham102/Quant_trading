@@ -357,11 +357,13 @@ class CarryLiveExecutor:
         self.spot_wallet_usd: float = float(
             getattr(self.strategy_profile, "spot_wallet_usd", 0.0) or 0.0
         )
+        _ov_gross_init = getattr(self.strategy_profile, "overlay_gross_pct", None)
         self.overlay_gross_pct: float = float(
-            getattr(self.strategy_profile, "overlay_gross_pct", 0.15) or 0.15
+            0.15 if _ov_gross_init is None else _ov_gross_init
         )
+        _ov_vol_init = getattr(self.strategy_profile, "overlay_target_vol_ann", None)
         self.overlay_target_vol_ann: float = float(
-            getattr(self.strategy_profile, "overlay_target_vol_ann", 0.075) or 0.075
+            0.075 if _ov_vol_init is None else _ov_vol_init
         )
         # Sprint 25: vet ngan sach carry / cap vi Futures cua chu ky gan nhat.
         self.last_carry_slot_notional: dict[str, float] = {}
@@ -498,18 +500,24 @@ class CarryLiveExecutor:
         self.max_futures_leverage = float(getattr(cfg, "max_futures_leverage", 3.0))
         self.spot_wallet_usd = float(getattr(cfg, "spot_wallet_usd", 0.0))
         self.futures_wallet_usd = float(getattr(cfg, "futures_wallet_usd", 0.0))
-        self.overlay_gross_pct = float(getattr(cfg, "overlay_gross_pct", 0.15))
-        self.overlay_target_vol_ann = float(getattr(cfg, "overlay_target_vol_ann", 0.075))
+        _prof_ov_gross = getattr(cfg, "overlay_gross_pct", None)
+        self.overlay_gross_pct = float(0.15 if _prof_ov_gross is None else _prof_ov_gross)
+        _prof_ov_vol = getattr(cfg, "overlay_target_vol_ann", None)
+        self.overlay_target_vol_ann = float(0.075 if _prof_ov_vol is None else _prof_ov_vol)
         if self.overlay_config is not None:
             try:
+                _ov_enabled = bool(self.overlay_gross_pct > 0.0 and self.overlay_target_vol_ann > 0.0)
                 self.overlay_config = dataclasses.replace(
                     self.overlay_config,
                     initial_capital=float(getattr(cfg, "capital_usd", self.capital)),
-                    overlay_target_vol_ann=float(
-                        getattr(cfg, "overlay_target_vol_ann", 0.075)
+                    enable_overlay=_ov_enabled,
+                    overlay_target_vol_ann=(
+                        float(self.overlay_target_vol_ann)
+                        if self.overlay_target_vol_ann > 0.0
+                        else 0.065
                     ),
                     overlay_gross_leverage=min(
-                        0.50, float(getattr(cfg, "overlay_gross_pct", 0.15))
+                        0.50, max(0.0, float(self.overlay_gross_pct))
                     ),
                 )
             except (TypeError, ValueError):
@@ -1454,7 +1462,12 @@ class CarryLiveExecutor:
             "net_delta_usd": 0.0,
         }
 
-        if self.overlay_config is not None and self.tier1b_gate:
+        _overlay_enabled = bool(
+            float(getattr(self, "overlay_gross_pct", 0.15)) > 0.0
+            and float(getattr(self, "overlay_target_vol_ann", 0.075)) > 0.0
+            and bool(getattr(self.overlay_config, "enable_overlay", True))
+        )
+        if self.overlay_config is not None and _overlay_enabled and self.tier1b_gate:
             # Sprint 15: overlay parity - dung dung cong thuc smooth_conviction Sprint 11.
             from src.barbell_portfolio import compute_live_overlay_targets  # noqa: F401
 
@@ -1594,7 +1607,7 @@ class CarryLiveExecutor:
             }
             if overlay_allocations:
                 overlay_active = True
-        elif self.overlay_config is not None:
+        elif self.overlay_config is not None and _overlay_enabled:
             lookback = int(getattr(self.overlay_config, "overlay_lookback_hours", 336))
             close_dict = {}
             for sym, df in aligned_universe.items():
@@ -1808,7 +1821,7 @@ class CarryLiveExecutor:
         skipped = 0
         turnover_notional = 0.0
         # Sprint 23: dinh tuyen lenh THAT qua BinanceSignedClient khi execute_real_orders=True.
-        if self.execute_real_orders and self.signed_client is not None and targets:
+        if self.execute_real_orders and self.signed_client is not None and (targets or current):
             _px_map: dict[str, float] = {}
             for _sym in set(targets.keys()) | set(current.keys()):
                 _df = aligned_universe.get(_sym) if aligned_universe else None
@@ -1818,6 +1831,12 @@ class CarryLiveExecutor:
                         _v = _df[_col].iloc[-1]
                         if pd.notna(_v) and np.isfinite(_v) and float(_v) > 0.0:
                             _px_map[_sym] = float(_v)
+                if _sym not in _px_map:
+                    _pos_obj = self.state.overlay_positions.get(_sym)
+                    if isinstance(_pos_obj, dict):
+                        _ep = float(_pos_obj.get("entry_price", 0.0) or _pos_obj.get("price", 0.0) or 0.0)
+                        if _ep > 0.0:
+                            _px_map[_sym] = _ep
             return self._execute_overlay_deltas_real(targets, current, _px_map, timestamp)
         all_symbols = sorted(set(targets.keys()) | set(current.keys()))
 
@@ -1827,6 +1846,8 @@ class CarryLiveExecutor:
             delta = target - cur
 
             if abs(delta) < 1e-12:
+                if abs(target) <= 1e-12 and symbol in self.state.overlay_positions:
+                    self.state.overlay_positions.pop(symbol, None)
                 continue
 
             price = 0.0
@@ -1840,23 +1861,34 @@ class CarryLiveExecutor:
                     val = None
                 if val is not None and pd.notna(val) and np.isfinite(val) and float(val) > 0:
                     price = float(val)
+            if price <= 0.0 and abs(target) <= 1e-12:
+                _pos_entry = self.state.overlay_positions.get(symbol)
+                if isinstance(_pos_entry, dict):
+                    price = float(_pos_entry.get("entry_price", 0.0) or _pos_entry.get("price", 0.0) or 0.0)
+                if price <= 0.0 and self.mode == "paper":
+                    price = 1.0
 
             if price <= 0.0:
                 skipped += 1
                 continue
 
             delta_notional = abs(delta) * price
-            if delta_notional < min_notional_usd:
+            is_full_close = abs(target) <= 1e-12
+            if delta_notional < min_notional_usd and not (is_full_close and self.mode == "paper"):
                 skipped += 1
                 continue
 
             qty_q, notional_q = self.quantize_leg(symbol, delta_notional, price)
             if qty_q <= 0.0:
-                skipped += 1
-                continue
+                if is_full_close and self.mode == "paper":
+                    qty_q = abs(cur)
+                    notional_q = abs(cur) * price
+                else:
+                    skipped += 1
+                    continue
 
             side = "buy" if delta > 0 else "sell"
-            if abs(target) <= 1e-12:
+            if is_full_close:
                 close_ok = self._close_overlay_position_emergency(symbol)
                 if close_ok:
                     self.state.overlay_positions.pop(symbol, None)
@@ -1864,7 +1896,8 @@ class CarryLiveExecutor:
                     turnover_notional += float(notional_q)
                 else:
                     status = "error"
-                    self.state.kill_switch_pending_close = True
+                    if getattr(self.state, "kill_switch_triggered", False):
+                        self.state.kill_switch_pending_close = True
                     logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
                 order_record = {
                     "symbol": symbol,
@@ -1908,7 +1941,8 @@ class CarryLiveExecutor:
                         if close_ok:
                             self.state.overlay_positions.pop(symbol, None)
                         else:
-                            self.state.kill_switch_pending_close = True
+                            if getattr(self.state, "kill_switch_triggered", False):
+                                self.state.kill_switch_pending_close = True
                             logger.error("Dong overlay that bai cho %s, giu nguyen vi the", symbol)
                 turnover_notional += float(notional_q)
 
@@ -2870,6 +2904,21 @@ class CarryLiveExecutor:
         if spot_qty <= 0.0 and perp_qty <= 0.0:
             return True
 
+        if self.execute_real_orders and self.signed_client is not None:
+            ref_px = float(
+                pos.get("entry_perp_price", 0.0)
+                or pos.get("entry_spot_price", 0.0)
+                or 1.0
+            )
+            try:
+                atomic_res = self._execute_atomic_carry_delta(
+                    symbol, -float(spot_qty), float(perp_qty), ref_px
+                )
+                return bool(atomic_res.get("ok", False))
+            except Exception as e_atomic:
+                logger.warning("Emergency atomic carry close failed for %s: %s", symbol, e_atomic)
+                return False
+
         spot_sym = pos.get("spot_symbol", symbol.split(":")[0])
         spot_ok = True
         perp_ok = True
@@ -2949,6 +2998,24 @@ class CarryLiveExecutor:
         q_close, _ = self.quantize_leg(symbol, abs(qty) * price, price)
         if q_close <= 0.0:
             q_close = abs(qty)
+
+        if self.execute_real_orders and self.signed_client is not None:
+            try:
+                res = self.signed_client.place_futures_market_order(
+                    symbol, side.upper(), q_close, reduce_only=False
+                )
+                if isinstance(res, dict):
+                    if (
+                        float(res.get("executedQty", 0.0) or 0.0) > 0.0
+                        or str(res.get("status", "")).upper() in {"FILLED", "CLOSED"}
+                        or bool(res.get("dry_run"))
+                    ):
+                        return True
+                logger.warning("Signed client overlay emergency close %s status: %s", symbol, res)
+                return False
+            except Exception as e_sc:
+                logger.warning("Signed client overlay emergency close failed for %s: %s", symbol, e_sc)
+                return False
 
         perp_ex = self.perp_exchange or self._get_exchange("binance")
         if perp_ex is None or not hasattr(perp_ex, "create_order") or not callable(perp_ex.create_order):
@@ -3150,6 +3217,12 @@ class CarryLiveExecutor:
     ) -> dict[str, Any]:
         """Thực hiện một chu kỳ đối soát hoàn chỉnh: tính điểm, kiểm tra ký quỹ, cân bằng danh mục và lưu state."""
         # PR-5 & R2-1: Kiem tra Kill-Switch va xu ly vi the ket truoc moi thao tac
+        if getattr(self.state, "kill_switch_pending_close", False) and not getattr(self.state, "kill_switch_triggered", False):
+            self.state.kill_switch_pending_close = False
+            logger.warning(
+                "Cleared orphan kill_switch_pending_close flag (kill_switch_triggered is False)"
+            )
+            self._persist_state_now()
         if getattr(self.state, "kill_switch_triggered", False) and getattr(self.state, "kill_switch_pending_close", False):
             self._flush_pending_emergency_close()
         current_equity = float(self.state.current_equity)
@@ -3257,6 +3330,7 @@ class CarryLiveExecutor:
             for sym, pos in self.state.carry_positions.items()
             if isinstance(pos, dict)
         }
+        cycle_exec_errors: list[str] = []
         overlay_trades_count = 0
         try:
             ov_res = self.execute_overlay_rebalance(
@@ -3271,8 +3345,24 @@ class CarryLiveExecutor:
                     if isinstance(_o, dict) and _o.get("status") in ("filled", "paper_filled")
                 )
             )
+            _ov_status = str(ov_res.get("status") or "")
+            _ov_err_orders = [
+                _o for _o in (ov_res.get("orders") or [])
+                if isinstance(_o, dict) and _o.get("status") in ("error", "unfilled")
+            ]
+            if _ov_status in ("ROLLED_BACK", "ROLLBACK_PARTIAL", "UNVERIFIED_POSITION") or _ov_err_orders:
+                cycle_exec_errors.append(
+                    f"OVERLAY_EXEC_ERROR:{_ov_status or 'ORDER_ERROR'}"
+                )
+                if isinstance(self.state.momentum_overlay, dict):
+                    self.state.momentum_overlay["execution_status"] = "ERROR"
+            elif isinstance(self.state.momentum_overlay, dict):
+                self.state.momentum_overlay["execution_status"] = "OK"
         except Exception as _ov_err:  # khong de overlay lam chet reconcile
             logger.warning("Overlay rebalance skipped: %s", _ov_err)
+            cycle_exec_errors.append(f"OVERLAY_EXCEPTION:{type(_ov_err).__name__}")
+            if isinstance(self.state.momentum_overlay, dict):
+                self.state.momentum_overlay["execution_status"] = "ERROR"
 
         # 3. MTM + An toàn ký quỹ cho các vị thế đang nắm giữ
         is_new_funding_bar = (
@@ -3438,7 +3528,7 @@ class CarryLiveExecutor:
                     self._persist_state_now()
                     continue
                 logger.error("Atomic carry close NOT filled for %s: %s", sym, _atomic_close.get("reason"))
-                self.state.kill_switch_pending_close = True
+                cycle_exec_errors.append(f"CARRY_CLOSE_FAILED:{sym}:{_atomic_close.get('reason')}")
                 resolved_actions[sym] = "HOLD"
         # a) Đóng vị thế CLOSE_DELTA_NEUTRAL trước
         for sym in self.symbols:
@@ -3601,7 +3691,11 @@ class CarryLiveExecutor:
                     self.state.current_equity -= reb_fee
                     if self.execute_real_orders and self.signed_client is not None and delta_notional >= DEFAULT_MIN_NOTIONAL:
                         delta_q = float(new_qty - qty)
-                        self._execute_atomic_carry_delta(sym, delta_q, -delta_q, float(pe_curr))
+                        _reb_res = self._execute_atomic_carry_delta(sym, delta_q, -delta_q, float(pe_curr))
+                        if not bool(_reb_res.get("ok", False)):
+                            cycle_exec_errors.append(
+                                f"CARRY_REB_FAILED:{sym}:{_reb_res.get('reason')}"
+                            )
                 else:
                     del self.state.carry_positions[sym]
 
@@ -3624,6 +3718,7 @@ class CarryLiveExecutor:
                     _atomic = self._execute_atomic_carry_delta(sym, float(spot_qty), -float(perp_qty), float(pe_curr))
                     if not bool(_atomic.get("ok", False)):
                         logger.warning("Atomic carry open NOT filled for %s: %s", sym, _atomic.get("reason"))
+                        cycle_exec_errors.append(f"CARRY_OPEN_FAILED:{sym}:{_atomic.get('reason')}")
                         continue
                     _real_qty = float(_atomic.get("spot_filled_qty", 0.0) or 0.0)
                     _real_perp_qty = float(_atomic.get("perp_filled_qty", 0.0) or 0.0)
@@ -3736,7 +3831,9 @@ class CarryLiveExecutor:
                         if cancel_ok:
                             self.state.carry_positions.pop(sym, None)
                         else:
-                            self.state.kill_switch_pending_close = True
+                            if getattr(self.state, "kill_switch_triggered", False):
+                                self.state.kill_switch_pending_close = True
+                            cycle_exec_errors.append(f"CARRY_CANCEL_FAILED:{sym}")
                             logger.error("Huy maker leg1 that bai cho %s, giu lai state", sym)
                         self.maker_no_fill_count += 1
                 else:
@@ -3777,6 +3874,15 @@ class CarryLiveExecutor:
                             "execution_state": "HEDGED",
                         }
                         self.state.current_equity -= fee
+
+        if isinstance(self.state.carry_sleeve, dict):
+            self.state.carry_sleeve["execution_status"] = (
+                "PARTIAL_ERROR"
+                if any(e.startswith("CARRY_") for e in cycle_exec_errors)
+                else "OK"
+            )
+        if isinstance(self.last_decision_diagnostics, dict):
+            self.last_decision_diagnostics["execution_errors"] = list(cycle_exec_errors)
 
         self.state.carry_last_reconcile_ts = timestamp_str
         self.state_store.save(self.state)

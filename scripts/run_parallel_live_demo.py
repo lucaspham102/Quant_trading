@@ -1667,6 +1667,20 @@ def _place_directional_order(
     return float(executed), float(avg), ("" if executed > 0.0 else f"NOT_FILLED:{status}")
 
 
+def _append_ledger_note(ledger: dict[str, Any], note_part: str, max_len: int = 200) -> None:
+    """Append a note token without duplicating existing tokens across or within cycles."""
+    part = str(note_part or "").strip()
+    if not part:
+        return
+    existing = str(ledger.get("note") or "").strip()
+    tokens = [t for t in existing.split(" ") if t] if existing else []
+    for tok in part.split(" "):
+        tok = tok.strip()
+        if tok and tok not in tokens:
+            tokens.append(tok)
+    ledger["note"] = " ".join(tokens)[:max_len]
+
+
 def _apply_directional_deltas(
     ledger: dict[str, Any],
     kind: str,
@@ -1764,7 +1778,7 @@ def _apply_directional_deltas(
         ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
     ledger["realized_pnl_usd"] = realized
     if errors:
-        ledger["note"] = ((ledger.get("note") or "")[:120] + f" {kind}_order_err:" + ",".join(errors)[:80]).strip()
+        _append_ledger_note(ledger, f"{kind}_order_err:" + ",".join(errors)[:80])
     return {
         "fees": float(fees),
         "turnover": float(turnover),
@@ -2165,6 +2179,7 @@ def run_profile_cycle(
     ledger["profile"] = profile.name
     ledger["mode"] = "TESTNET_REAL" if execute_real else "SHADOW_LIVE"
     ledger["cycle"] = int(_num(ledger.get("cycle"), 0.0)) + 1
+    ledger["note"] = ""
 
     accrue_cycle_accounting(
         ledger,
@@ -2181,6 +2196,14 @@ def run_profile_cycle(
             aligned_universe=_slice_universe(aligned_universe, CARRY_LOOKBACK_BARS)
         )
         ledger["status"] = "OK"
+        exec_diag = getattr(executor, "last_decision_diagnostics", None)
+        exec_errs = (
+            exec_diag.get("execution_errors") if isinstance(exec_diag, dict) else None
+        ) or []
+        if exec_errs:
+            _append_ledger_note(
+                ledger, "exec_err:" + ",".join(str(e) for e in exec_errs)[:80]
+            )
     except Exception as exc:
         reconcile_failed = True
         ledger["status"] = f"ERROR:{type(exc).__name__}"
@@ -2199,13 +2222,13 @@ def run_profile_cycle(
                 ledger, exec_state, snapshot, charge_fees=True
             )
             if fees > 0.0:
-                ledger["note"] = (ledger.get("note") or "")[:120] + " fees_estimated"
+                _append_ledger_note(ledger, "fees_estimated")
             _mark_to_market(ledger, profile, sym_map, last_prices, snapshot)
 
     # ---- Sprint 26: trend sleeve (long Perp on isolated "SYM|trend" ledger keys)
     stale, age_h, last_candle = compute_data_staleness(aligned_universe, now_utc)
     if aligned_universe is not None and stale:
-        ledger["note"] = ((ledger.get("note") or "")[:120] + f" STALE_DATA:age={age_h:.1f}h").strip()
+        _append_ledger_note(ledger, f"STALE_DATA:age={age_h:.1f}h")
     # Real orders need a clean state: no reconcile error and fresh candles, otherwise the
     # sleeves hold (the virtual ledger must never run ahead of the exchange).
     directional_real = bool(execute_real and real_directional_orders and signed_client is not None)
@@ -2269,9 +2292,7 @@ def run_profile_cycle(
             ledger["reconcile_status"] = str(recon.get("reconcile_status", "UNAVAILABLE"))
             recon_note = str(recon.get("note") or "")
             if recon_note:
-                ledger["note"] = (
-                    (ledger.get("note") or "")[:120] + " " + recon_note
-                ).strip()
+                _append_ledger_note(ledger, recon_note)
 
     _sanitize_ledger(ledger, default_capital=profile.capital_usd)
 
@@ -2814,7 +2835,14 @@ def compute_exchange_reconcile(
         result["note"] = f"recon_snapshot_error:{type(exc).__name__}"
         return result
     if not isinstance(snapshot, dict) or not snapshot.get("snapshot_healthy"):
-        result["note"] = "recon_snapshot_unhealthy"
+        err_detail = (
+            str(snapshot.get("error") or "").strip() if isinstance(snapshot, dict) else ""
+        )
+        result["note"] = (
+            f"recon_snapshot_unhealthy:{err_detail[:100]}"
+            if err_detail
+            else "recon_snapshot_unhealthy"
+        )
         return result
     result["snapshot_healthy"] = True
 
@@ -3018,6 +3046,14 @@ def main(argv: list[str] | None = None) -> int:
             if net_status.get("recovered"):
                 # Reset cycle watchdog timer so network wait time does not trigger cycle timeout
                 watchdog.start_cycle(target_cycle)
+
+            if signed_client is not None and net_ok:
+                sync_fn = getattr(signed_client, "sync_server_time", None)
+                if callable(sync_fn):
+                    try:
+                        sync_fn("both")
+                    except Exception as _sync_exc:  # noqa: BLE001
+                        logger.warning("Periodic server time sync failed: %s", _sync_exc)
 
             if not args.no_refresh_raw and net_ok:
                 refresh = refresh_raw_data(

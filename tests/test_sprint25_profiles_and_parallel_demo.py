@@ -774,3 +774,286 @@ def test_run_profile_cycle_records_reconciliation_fields(tmp_path, prof_1k):
     assert rec["recon_drift_usd"] == pytest.approx(3.0, **MONEY)
     assert rec["basis_pnl_usd"] == pytest.approx(0.0, abs=1e-12)
     assert ledger["reconcile_status"] == "SYNCED"
+
+
+# ---------------------------------------------------------------------------
+# Forensic Patch Tests: (a) -1021 resync, (b) recon detail & note dedup,
+# (c) baseline_1k overlay disable & auto-flatten, (d) orphan pending_close rescue
+# ---------------------------------------------------------------------------
+
+
+def _mock_universe(n_bars: int = 750) -> dict[str, pd.DataFrame]:
+    idx = pd.date_range("2025-11-01", periods=n_bars, freq="1h", tz="UTC")
+    out: dict[str, pd.DataFrame] = {}
+    for sym, px in ((BTC, 100.0), (ETH, 50.0), (SOL, 20.0)):
+        out[sym] = pd.DataFrame(
+            {
+                "close": px,
+                "spot_close": px,
+                "perp_close": px * 1.0005,
+                "funding_rate_event": 0.0001,
+                "last_known_funding_rate": 0.0001,
+                "basis_pct": 0.0005,
+            },
+            index=idx,
+        )
+    return out
+
+
+def test_signed_client_auto_resyncs_server_time_on_1021(monkeypatch):
+    from src.binance_signed_client import (
+        BinanceHttpError,
+        BinanceSignedTestnetClient,
+        PERP_ACCOUNT_PATH,
+        PERP_POSITION_RISK_PATH,
+        SPOT_ACCOUNT_PATH,
+        VENUE_FUTURES,
+    )
+
+    client = BinanceSignedTestnetClient(
+        api_key="test-key",
+        api_secret="test-secret",
+        dry_run=False,
+        autoload_dotenv=False,
+    )
+    sync_calls: list[str] = []
+
+    def _fake_sync(venue: str = "both") -> dict[str, int]:
+        sync_calls.append(venue)
+        client.futures_time_offset_ms = 2500
+        client.spot_time_offset_ms = 2500
+        return {"spot_offset_ms": 2500, "futures_offset_ms": 2500}
+
+    monkeypatch.setattr(client, "sync_server_time", _fake_sync)
+
+    # 1) submit_signed_order: first POST raises -1021, retry succeeds with new signature
+    post_timestamps: list[int] = []
+
+    def _fake_http_order(method, url, params=None, headers=None, timeout_sec=10.0):
+        post_timestamps.append(int((params or {}).get("timestamp", 0)))
+        if len(post_timestamps) == 1:
+            raise BinanceHttpError(
+                "Binance API loi -1021: Timestamp for this request is outside of the recvWindow.",
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow.",
+            )
+        return {
+            "orderId": 999,
+            "status": "FILLED",
+            "executedQty": "0.01",
+            "avgPrice": "50000.0",
+        }
+
+    monkeypatch.setattr(client, "_http_request", _fake_http_order)
+    req = client.build_order_request(VENUE_FUTURES, BTC, "BUY", 0.01, "MARKET")
+    res = client.submit_signed_order(VENUE_FUTURES, req)
+    assert res["filled"] is True
+    assert res["orderId"] == 999
+    assert len(post_timestamps) == 2
+    assert sync_calls == [VENUE_FUTURES]
+
+    # 2) fetch_exchange_reconcile_snapshot: first attempt raises -1021, retry succeeds
+    sync_calls.clear()
+    get_calls = {"n": 0}
+
+    def _fake_http_snap(method, url, params=None, headers=None, timeout_sec=5.0):
+        get_calls["n"] += 1
+        if get_calls["n"] == 1:
+            raise BinanceHttpError(
+                "Binance API loi -1021: Timestamp for this request is outside of the recvWindow.",
+                code=-1021,
+                msg="Timestamp for this request is outside of the recvWindow.",
+            )
+        if SPOT_ACCOUNT_PATH in url:
+            return {"balances": [{"asset": "USDT", "free": "650.0", "locked": "0.0"}]}
+        if PERP_ACCOUNT_PATH in url:
+            return {"totalWalletBalance": "350.0", "totalUnrealizedProfit": "0.0"}
+        if PERP_POSITION_RISK_PATH in url:
+            return []
+        return {}
+
+    monkeypatch.setattr(client, "_http_request", _fake_http_snap)
+    snap = client.fetch_exchange_reconcile_snapshot([BTC], {BTC: 50000.0})
+    assert snap["snapshot_healthy"] is True
+    assert snap["exchange_equity_usd"] == pytest.approx(1000.0, **MONEY)
+    assert "both" in sync_calls
+
+
+def test_recon_snapshot_unhealthy_preserves_detail_and_note_does_not_accumulate(tmp_path, prof_1k):
+    baseline_path = str(tmp_path / "demo_testnet_baseline.json")
+    unhealthy = demo.compute_exchange_reconcile(
+        _ReconClient({"snapshot_healthy": False, "error": "Network fetch failed: HTTP 400 [-1021]"}),
+        [BTC],
+        {BTC: 100.0},
+        baseline_path,
+        1000.0,
+        1000.0,
+    )
+    assert unhealthy["reconcile_status"] == "UNAVAILABLE"
+    assert "recon_snapshot_unhealthy:Network fetch failed: HTTP 400 [-1021]" in unhealthy["note"]
+
+    class _SteppingExecutor:
+        def __init__(self) -> None:
+            self.state = FakeExecState()
+            self.step = 0
+
+        def reconcile_once(self, aligned_universe=None):
+            self.step += 1
+            # Change position qty each cycle so refresh_position_ledger charges a fee every cycle
+            self.state.carry_positions = {
+                BTC: {
+                    "qty": float(self.step),
+                    "entry_spot_price": 100.0,
+                    "entry_perp_price": 100.0,
+                    "notional_usdt": 100.0 * self.step,
+                    "funding_collected_usdt": 0.0,
+                }
+            }
+            return None
+
+    ledger = _fresh_ledger(tmp_path / "cycle_note.json", prof_1k)
+    executor = _SteppingExecutor()
+    snap = {"symbols": {BTC: {"spot_mid": 100.0, "perp_mark": 100.0, "mid": 100.0}}}
+
+    for _ in range(4):
+        demo.run_profile_cycle(
+            prof_1k,
+            ledger,
+            snap,
+            None,
+            mode="TESTNET_REAL",
+            execute_real=True,
+            executor=executor,
+            reconcile_fn=lambda _l: unhealthy,
+        )
+
+    note_tokens = [t for t in ledger["note"].split(" ") if t]
+    assert note_tokens.count("fees_estimated") == 1
+    assert "recon_snapshot_unhealthy:Network" in ledger["note"]
+
+
+def test_baseline_1k_disables_overlay_and_flattens_existing_overlay_positions(tmp_path):
+    from src.carry_live_executor import CarryLiveExecutor
+
+    prof = get_strategy_profile("baseline_1k")
+    assert prof.overlay_gross_pct == 0.0
+    assert prof.overlay_target_vol_ann == 0.0
+
+    state_path = str(tmp_path / "demo_bot_baseline_1k.json")
+    executor = demo.build_demo_executor(
+        prof,
+        mode="paper",
+        bot_state_path=state_path,
+        raw_dir=str(tmp_path),
+        execute_real=False,
+        signed_client=None,
+    )
+    assert isinstance(executor, CarryLiveExecutor)
+    assert executor.overlay_gross_pct == 0.0
+    assert executor.overlay_target_vol_ann == 0.0
+    assert executor.overlay_config.enable_overlay is False
+
+    # Seed legacy overlay positions on baseline_1k (simulating Laptop live state before patch)
+    executor.state.overlay_positions = {
+        BTC: {"qty": 1.0, "side": "long", "entry_price": 91.72, "ts": "2026-01-01T00:00:00+00:00"},
+        ETH: {"qty": 2.0, "side": "short", "entry_price": 52.85, "ts": "2026-01-01T00:00:00+00:00"},
+    }
+    executor.state_store.save(executor.state)
+
+    universe = _mock_universe(n_bars=750)
+    ledger = _fresh_ledger(tmp_path / "ledger_baseline_1k.json", prof)
+    snap = {
+        "symbols": {
+            BTC: {"spot_mid": 100.0, "perp_mark": 100.0, "mid": 100.0},
+            ETH: {"spot_mid": 50.0, "perp_mark": 50.0, "mid": 50.0},
+            SOL: {"spot_mid": 20.0, "perp_mark": 20.0, "mid": 20.0},
+        }
+    }
+    rec = demo.run_profile_cycle(
+        prof,
+        ledger,
+        snap,
+        universe,
+        mode="SHADOW_LIVE",
+        execute_real=False,
+        executor=executor,
+    )
+    assert executor.state.overlay_positions == {}
+    assert executor.state.momentum_overlay.get("allocations") == []
+    assert executor.state.momentum_overlay.get("overlay_active") is False
+    assert ledger["overlay_long_usd"] == pytest.approx(0.0, abs=1e-9)
+    assert ledger["overlay_short_usd"] == pytest.approx(0.0, abs=1e-9)
+    assert rec["overlay_long_usd"] == pytest.approx(0.0, abs=1e-9)
+    assert rec["overlay_short_usd"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_orphan_kill_switch_pending_close_rescued_and_real_overlay_flattens_on_empty_targets(tmp_path):
+    prof = get_strategy_profile("regime_omni_1k")
+    state_path = str(tmp_path / "demo_bot_regime_omni_1k.json")
+
+    placed_orders: list[dict] = []
+
+    class _FakeRealSignedClient:
+        def place_futures_market_order(self, symbol, side, quantity, reduce_only=False, timeout_sec=10.0):
+            placed_orders.append(
+                {"symbol": symbol, "side": side, "qty": float(quantity), "reduce_only": bool(reduce_only)}
+            )
+            return {
+                "orderId": len(placed_orders),
+                "status": "FILLED",
+                "executedQty": float(quantity),
+                "avgPrice": 100.0,
+                "filled": True,
+            }
+
+        def place_spot_market_order(self, symbol, side, quantity, timeout_sec=10.0):
+            return {
+                "orderId": 100 + len(placed_orders),
+                "status": "FILLED",
+                "executedQty": float(quantity),
+                "avgPrice": 100.0,
+                "filled": True,
+            }
+
+        def get_spot_free_balance(self, symbol):
+            return 100.0
+
+        def fetch_exchange_reconcile_snapshot(self, symbols, prices=None):
+            return {"snapshot_healthy": True, "perp_positions": {}, "spot_balances": {}}
+
+    fake_client = _FakeRealSignedClient()
+    executor = demo.build_demo_executor(
+        prof,
+        mode="testnet",
+        bot_state_path=state_path,
+        raw_dir=str(tmp_path),
+        execute_real=True,
+        signed_client=fake_client,
+    )
+    # 1) Direct test: execute_overlay_rebalance with empty targets & existing overlay_positions
+    # routes through _execute_overlay_deltas_real (using signed_client) and does NOT set pending_close
+    executor.state.overlay_positions = {
+        BTC: {"qty": 0.5, "side": "long", "entry_price": 100.0},
+        ETH: {"qty": 1.0, "side": "short", "entry_price": 50.0},
+    }
+    universe = _mock_universe(n_bars=750)
+    ov_res = executor.execute_overlay_rebalance(
+        {"overlay_active": False, "allocations": []},
+        universe,
+    )
+    assert executor.state.overlay_positions == {}
+    assert executor.state.kill_switch_pending_close is False
+    assert len(placed_orders) == 2
+    assert ov_res["n_orders"] == 2
+
+    # 2) Full reconcile_once test: orphan kill_switch_pending_close=True (with kill_switch_triggered=False)
+    # is automatically cleared at the start of reconcile_once() so the bot is NOT deadlocked.
+    executor.state.kill_switch_triggered = False
+    executor.state.kill_switch_pending_close = True
+    executor.state_store.save(executor.state)
+
+    plan = executor.reconcile_once(universe)
+    assert not plan.get("kill_switch", False)
+    assert executor.state.kill_switch_pending_close is False
+    assert executor.state.kill_switch_triggered is False
+
