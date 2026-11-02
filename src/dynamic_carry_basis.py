@@ -39,6 +39,9 @@ class DynamicCarryConfig:
     entry_threshold: float = 0.00010
     exit_threshold: float = 0.00002
     min_hold_periods: int = 9
+    # Sprint 27 Champion Upgrade: U3 Emergency Negative Funding Exit
+    emergency_exit_min_periods: int = 12
+    emergency_exit_funding_threshold: float = -0.00010  # -1.0 bps/8h
     buffer_rank: int = 1
     min_switch_advantage_override: float | None = None
 
@@ -321,6 +324,15 @@ def select_portfolio(
 
     for h in sorted_holdings:
         held_p = periods_held.get(h, 0)
+        h_score_early = score_map.get(h, -float("inf"))
+        if (
+            config.emergency_exit_min_periods > 0
+            and held_p >= config.emergency_exit_min_periods
+            and float(h_score_early) < config.emergency_exit_funding_threshold
+        ):
+            actions[h] = "CLOSE"
+            reasons[h] = "EMERGENCY_NEGATIVE_FUNDING_EXIT"
+            continue
         # Điều kiện giữ bắt buộc theo thời gian nắm giữ tối thiểu
         if held_p < config.min_hold_periods:
             actions[h] = "HOLD"

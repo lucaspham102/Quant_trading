@@ -491,6 +491,8 @@ class CarryLiveExecutor:
                 buffer_rank=int(getattr(cfg, "carry_buffer_rank", 3)),
                 eta_override=float(getattr(cfg, "carry_eta", 0.80)),
                 initial_capital=float(getattr(cfg, "capital_usd", self.capital)),
+                emergency_exit_min_periods=int(getattr(cfg, "u3_emergency_exit_min_periods", 12)),
+                emergency_exit_funding_threshold=float(getattr(cfg, "u3_emergency_exit_funding_bps", -1.0)) * 1e-4,
             )
         except (TypeError, ValueError):
             logger.warning("Carry config khong ho tro replace(), giu nguyen cau hinh goc.")
@@ -2050,13 +2052,47 @@ class CarryLiveExecutor:
             return filled
 
 
+        def _place_spot_maker_or_market(side: str, quantity: float) -> tuple[Any, float]:
+            """Sprint 27 U4: Maker-First Limit-Chase on Spot with instant Market fallback."""
+            maker_fn = getattr(client, "place_maker_with_fallback", None)
+            ticker_fn = getattr(client, "fetch_book_ticker", None)
+            if callable(maker_fn) and callable(ticker_fn):
+                try:
+                    bt = ticker_fn(symbol, venue="spot", timeout_sec=2.0)
+                    bid = float(bt.get("bid", 0.0) or 0.0)
+                    ask = float(bt.get("ask", 0.0) or 0.0)
+                    if bid > 0 and ask > 0 and ask >= bid:
+                        mid = (bid + ask) / 2.0
+                        tick = 0.01 if mid >= 1.0 else 0.0001
+                        maker_res = maker_fn(
+                            symbol=symbol,
+                            qty=quantity,
+                            side=side,
+                            best_bid=bid,
+                            best_ask=ask,
+                            tick_size=tick,
+                            venue="spot",
+                            maker_ttl_sec=2.0,
+                            poll_interval_sec=0.2,
+                            timeout_sec=5.0,
+                        )
+                        order = maker_res.get("order") or maker_res
+                        f_qty = float(order.get("executedQty", 0.0) or 0.0)
+                        if f_qty > 1e-12:
+                            return order, f_qty
+                except Exception as m_exc:
+                    logger.warning("Maker-first Spot order exception for %s: %s; falling back to Market", symbol, m_exc)
+            resp = client.place_spot_market_order(symbol, side, quantity)
+            f_qty = _await_fill("spot", resp)
+            return resp, f_qty
+
         if spot_d > 0.0 and perp_d < 0.0:
             qty = self._floor_to_step(min(spot_d, abs(perp_d)), common_step)
             if qty <= 0.0:
                 result["reason"] = "QTY_BELOW_LOT_STEP"
                 return result
             try:
-                spot_resp = client.place_spot_market_order(symbol, "BUY", qty)
+                spot_resp, spot_filled = _place_spot_maker_or_market("BUY", qty)
             except Exception as exc:  # noqa: BLE001
                 logger.error("event=ATOMIC_OPEN_ABORTED symbol=%s spot_error=%s", symbol, exc)
                 result["event"] = "ATOMIC_OPEN_ABORTED"

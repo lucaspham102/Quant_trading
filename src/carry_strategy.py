@@ -46,7 +46,7 @@ class CarryConfig:
         if self.structure == "coinm_1leg":
             return self.perp_fee + self.slippage
         elif self.structure == "spot_perp_2leg":
-            return self.spot_fee + self.slippage + self.perp_fee + self.slippage
+            return 0.000925  # Sprint 27 U4: Maker-First Blended Cost 9.25 bps/chiều (18.5 bps khứ hồi)
         raise ValueError(f"Cấu trúc thực thi không hợp lệ: {self.structure}")
 
     def notional_eta(self) -> float:

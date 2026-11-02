@@ -1,12 +1,12 @@
 # BẢN KIẾN TRÚC TOÀN DIỆN HỆ THỐNG GIAO DỊCH ĐỊNH LƯỢNG (QUANT TRADING SYSTEM BLUEPRINT)
 ## TÀI LIỆU NẠP NGỮ CẢNH CHUYÊN SÂU DÀNH CHO GEMINI WEB (SYSTEM CONTEXT PROMPT & CODEBASE ARCHITECTURE)
 
-> **Mục đích tài liệu:** Nạp toàn bộ ngữ cảnh kiến trúc, tư duy định lượng, chi tiết module, định luật bất biến toán học, dòng chảy dữ liệu, cơ chế thực thi lệnh và hướng dẫn mở rộng cho Gemini Web / Large Language Models.  
-> **Repository:** `d:\Quant_trading`  
-> **Ngôn ngữ & Thư viện:** Python 3.14+, NumPy, Pandas, CCXT, Pytest, Hypothesis.  
-> **Thị trường mục tiêu:** Binance Spot & USDⓈ-M Futures (Hỗ trợ mở rộng Bybit, OKX).  
-> **Trạng thái kiểm thử:** 859/859 Unit & Integration Tests đạt trạng thái PASS 100%.  
-> **Trạng thái vận hành:** Chu kỳ 105 (`SYNCED`), tích hợp chống đứt gãy 24/7 (Anti-Sleep, `.json.bak` Auto-Recovery, Network Outage Resilience, Smart HTML Telegram Reports).  
+> **Mục đích tài liệu:** Nạp toàn bộ ngữ cảnh kiến trúc, tư duy định lượng, chi tiết module, định luật bất biến toán học, dòng chảy dữ liệu, cơ chế thực thi lệnh và hướng dẫn mở rộng cho Gemini Web / Large Language Models.
+> **Repository:** `d:\Quant_trading`
+> **Ngôn ngữ & Thư viện:** Python 3.14+, NumPy, Pandas, CCXT, Pytest, Hypothesis.
+> **Thị trường mục tiêu:** Binance Spot & USDⓈ-M Futures (Hỗ trợ mở rộng Bybit, OKX).
+> **Trạng thái kiểm thử:** 874/874 Unit & Integration Tests đạt trạng thái PASS 100%.
+> **Trạng thái vận hành:** Chu kỳ 105 (`SYNCED`), tích hợp chống đứt gãy 24/7 (Anti-Sleep, `.json.bak` Auto-Recovery, Network Outage Resilience, Smart HTML Telegram Reports).
 > **Kiến trúc cốt lõi:** Multi-Sleeve Barbell Unified Margin Portfolio (Tier 1 Core Cash & Carry + Tier 2 XS Momentum Alpha Overlay + Tier 3 Long-Only Triple-Confirmed Trend Sleeve + Yield Stacking; đã tinh gọn tắt Reversal & Short Trend từ Chu kỳ 105).
 
 ---
@@ -38,7 +38,7 @@ Hệ thống là một nền tảng giao dịch định lượng cấp tổ ch�
 ```mermaid
 flowchart TD
     NAV["Tổng Vốn Danh Mục (NAV)"] --> UM["Tài Khoản Ký Quỹ Thống Nhất (Unified Margin)"]
-    
+
     UM --> S1["Sleeve 1: Core Delta-Neutral Carry<br/>(80-90% Vốn: Spot Long + Perp Short)<br/>Thu Funding Rate 8h + Ăn Basis Convergence"]
     UM --> S2["Sleeve 2: Tactical Alpha Overlay<br/>(10-15% Hạn Mức Ký Quỹ Dư Thừa)<br/>Cross-Sectional Market-Neutral Momentum"]
     UM --> S3["Sleeve 3: Triple-Confirmed Trend Sleeve<br/>(Z-Score 14d/21d/30d Directional Futures)<br/>Kèm 2-Tier Drawdown Circuit Breaker"]
@@ -282,7 +282,10 @@ Mọi module trong `src/` đều tuân thủ nguyên tắc: **Pure Functions / D
 
 ### 5.21. `src/binance_signed_client.py` — HMAC-SHA256 Client & Smart Maker
 - Quản lý khóa kép độc lập Spot và Futures (`Dual-Venue Auth`), xác thực format khóa hex 64 ký tự.
-- Đồng bộ giờ máy chủ `sync_server_time()` triệt tiêu lỗi lệch giờ `-1021`.
+- **Cơ chế Tự phục hồi Đồng hồ & Khắc phục Lỗi `-1021`:**
+  - Định kỳ đầu mỗi chu kỳ trong `run_parallel_live_demo.py`, tự động gọi `sync_server_time("both")` sau khi xác nhận có mạng.
+  - Bắt lỗi `BinanceHttpError` mang mã `-1021 (Timestamp for this request is outside of the recvWindow)` trên tất cả các hàm ký lệnh: `submit_signed_order()`, `query_order()`, `cancel_order()`, `get_spot_free_balance()`, và `_fetch_exchange_reconcile_snapshot_raw()`. Khi dính lỗi, client tự động gọi `sync_server_time()`, ký lại tham số HMAC với `timestamp` mới và retry ngay lập tức.
+- **Snapshot Reconcile Resilience:** `_fetch_exchange_reconcile_snapshot_raw()` tích hợp vòng lặp retry 2 lần (nghỉ $0.3\text{s}$), bảo tồn nguyên vẹn `api_error_code` và thông điệp lỗi chi tiết thay vì nuốt lỗi.
 - **Inside-Spread Smart Maker:** Nếu spread $\ge 2\text{ ticks}$, đặt giá tại $best\_bid + 1\text{ tick}$ để tối ưu xác suất khớp lệnh Maker.
 - **Rollback Khẩn Cấp:** Nếu Chân 1 (Spot) đã khớp nhưng Chân 2 (Futures) bị sàn từ chối, lập tức bắn Market Sell bán sạch Spot để đưa trạng thái về Flat, không để lộ vị thế trần trụi.
 
@@ -290,9 +293,15 @@ Mọi module trong `src/` đều tuân thủ nguyên tắc: **Pure Functions / D
 - Đối soát trạng thái giữa sàn và sổ sách: `SYNCED`, `MISSING_ON_EXCHANGE`, `ORPHAN_ON_EXCHANGE`, `QTY_DRIFT`.
 - Đo lường sức khỏe ký quỹ: Duy trì Margin Health $\le 50\%$ và Liquidation Buffer $\ge 25\%$.
 - Phân lập số dư ban đầu (`testnet_baseline.json`), loại trừ coin rác Faucet gây báo động giả.
+- Bảo tồn chi tiết lỗi snapshot trong `compute_exchange_reconcile()` dưới dạng `recon_snapshot_unhealthy:<detail>`.
 
 ### 5.23. `src/carry_live_executor.py` — Live Daemon Engine 24/7
 - Điều phối toàn bộ vòng lặp vận hành: Tải nến $\rightarrow$ Kiểm tra cổng khởi động $720\text{h}$ $\rightarrow$ Đối soát sàn $\rightarrow$ Tính toán phân bổ Barbell $\rightarrow$ Thực thi Maker-Taker $\rightarrow$ Kiểm tra Lot Neutrality $\rightarrow$ Ghi log JSONL $\rightarrow$ Gửi cảnh báo Telegram.
+- **Tự động gỡ Deadlock cờ `kill_switch_pending_close` mồ côi:** Ở đầu `reconcile_once()`, nếu `kill_switch_pending_close == True` nhưng `kill_switch_triggered == False`, tự động xóa cờ `kill_switch_pending_close = False` và ghi warning log để giải cứu bot khỏi trạng thái treo rebalance.
+- **Tách biệt minh bạch giữa Lỗi Thực thi Thông thường và Kill-Switch:** Khi lệnh đóng Carry hoặc Overlay gặp lỗi tạm thời, vị thế được giữ nguyên ở `"HOLD"` để retry chu kỳ sau, ghi nhận vào `cycle_exec_errors` và gán trạng thái `execution_status` (`"OK"`, `"PARTIAL_ERROR"`, `"ERROR"`), tuyệt đối không kích hoạt nhầm cờ Kill-Switch.
+- **Định tuyến đóng vị thế Overlay thực tế về Flat qua `signed_client`:** Trong `execute_overlay_rebalance()`, sử dụng điều kiện `if self.execute_real_orders and self.signed_client is not None and (targets or current):` để đảm bảo khi `targets` rỗng mà `current` còn vị thế cũ, lệnh đóng về flat vẫn được định tuyến chính xác qua `_execute_overlay_deltas_real()` bằng `signed_client` (đồng thời hỗ trợ `signed_client` trong `_close_carry_position_emergency` / `_close_overlay_position_emergency`).
+- **Phân định rõ Target tức thời `carry_sleeve["allocations"]` vs Vị thế thực tế `carry_positions`:** Target tức thời phản ánh top-$k$ điểm số cao nhất tại chu kỳ, trong khi vị thế thực tế tuân thủ bộ lọc chống đảo (`min_hold_periods = 63h`, `buffer_rank = 3`). Do đó, việc giữ mã cũ khi chưa đủ 63 giờ (và funding rate dương) là hành vi chuẩn mực tối ưu chi phí theo thiết kế.
+- **Tự động dọn sạch Overlay của `baseline_1k`:** Loại bỏ bẫy falsy `or 0.15` / `or 0.075`, tắt `enable_overlay = False` trên `overlay_config` khi `overlay_gross_pct <= 0.0`, và tự động dọn sạch các vị thế `overlay_positions` cũ về `{}` khi `targets` rỗng.
 - Tự động phát hiện và sửa chữa lệch Delta (`audit_delta_drift` và `repair_delta_drift`).
 
 ---
@@ -319,7 +328,7 @@ Từ Sprint 25 đến Sprint 28, hệ thống nâng cấp lên kiến trúc **Mu
 |---|---|---|
 | `default` | Chuẩn Mainnet gốc 3,000 USDT (đóng băng, không sửa đổi). | Carry (Spot-Perp) + XS Momentum Overlay |
 | `canary_400` | Cấu hình Canary 400 USDT (Spot 280 / Futures 120). | Carry cơ bản |
-| `baseline_1k` | Cấu hình bảo thủ chuẩn 1,000 USDT (Spot 700 / Futures 300). | Carry Top-4 bằng trọng số |
+| `baseline_1k` | **Benchmark chuẩn Market-Neutral 100% Pure Carry + Passive Yield** (đã tắt hoàn toàn XS Momentum Overlay: `overlay_gross_pct = 0.0`, `overlay_target_vol_ann = 0.0`). | Pure Carry Top-3 (Eta 0.65, Spot 650 / Fut 350) + Passive Yield |
 | `alpha_boost_1k` | Tối ưu hóa lợi nhuận cân bằng, nghiêng trọng số theo funding. | Carry Funding-Tilted + XS Momentum Overlay |
 | `turbo_neutral_1k` | Tối đa hóa alpha trung tính thị trường với đòn bẩy cao. | Carry Funding-Tilted + XS Momentum Overlay ($20\%$) |
 | `carry_max_eta_1k` | Tối đa hóa hiệu suất vốn $\eta$, thu hẹp đệm tiền mặt. | 100% Carry hiệu suất vốn cao |
@@ -366,6 +375,9 @@ flowchart TD
    - Soft Drawdown ($6\%$): Giảm $50\%$ quy mô vị thế Trend.
    - Hard Drawdown ($10\%$): Đóng toàn bộ vị thế Trend, đưa về $0$ trong thời gian làm nguội $168\text{h}$.
 4. **Emergency Single-Leg Rollback:** Triệt tiêu hoàn toàn nguy cơ Naked Position khi mạng chập chờn.
+5. **Tách biệt Lỗi Thực thi Thông thường khỏi Kill-Switch & Chống Deadlock Mồ Côi:**
+   - Lỗi đặt lệnh/đóng lệnh do mạng hoặc API sàn chập chờn chỉ chuyển vị thế sang `"HOLD"` để retry chu kỳ sau và ghi nhận vào `cycle_exec_errors` / `execution_status`, tuyệt đối không bật cờ `kill_switch_pending_close`.
+   - Cơ chế tự động gỡ cờ mồ côi ở đầu `reconcile_once()` (`kill_switch_pending_close = False` khi `kill_switch_triggered == False`) đảm bảo hệ thống không bao giờ bị deadlock đóng băng vị thế.
 
 ---
 
@@ -385,31 +397,31 @@ sequenceDiagram
     participant S as StateStore (Atomic)
     participant N as Telegram Notifier
 
-    D->>C: 1. sync_server_time("both")
+    D->>C: 1. sync_server_time("both") (Định kỳ + Bắt lỗi -1021 tự resync & re-sign retry)
     C->>E: GET /api/v3/time & /fapi/v1/time
     E-->>C: server_time_ms
     C-->>D: time_offset_ms synced (triệt tiêu lỗi -1021)
 
     D->>F: 2. fetch_latest_aligned_universe()
     F-->>D: Data 12 coins (Spot + Perp + Funding)
-    
+
     D->>D: 3. compute_warmup_readiness() (Yêu cầu >= 720h)
-    
-    D->>C: 4. fetch_exchange_reconcile_snapshot()
+
+    D->>C: 4. fetch_exchange_reconcile_snapshot() (Retry 2 lần + Bảo tồn api_error_code)
     C->>E: Signed GET /account & /positionRisk
     E-->>C: Balances & Positions thực tế
     C-->>D: Exchange Snapshot
 
     D->>R: 5. reconcile_portfolio_state(local_state, snapshot)
     alt Đối soát phát hiện sai lệch (Status != SYNCED)
-        R-->>D: Cảnh báo DRIFT / MISSING / ORPHAN
+        R-->>D: Cảnh báo DRIFT / MISSING / ORPHAN / recon_snapshot_unhealthy:<detail>
         D->>D: Kích hoạt sửa lệch Delta hoặc đóng khẩn cấp
         D->>N: Bắn cảnh báo sự cố qua Telegram
     else Đối soát thành công (SYNCED & Margin Health OK)
         R-->>D: Xác nhận SYNCED
 
         D->>P: 6. build_allocations(NAV, Profiles, MarketRegime)
-        Note over P: Tính toán phân bổ 4 Sleeve<br/>Lọc SNR Gate & Kaufman ER<br/>Lượng hóa lot & Enforce Dollar Neutrality
+        Note over P: Phân bổ Barbell & Lõi Carry<br/>Tách biệt Target tức thời vs Vị thế thực tế (MinHold 63h)<br/>Tắt Overlay cho baseline_1k & Enforce Dollar Neutrality
         P-->>D: Target Portfolio Plan
 
         alt Cần tái cân bằng vị thế
@@ -427,7 +439,7 @@ sequenceDiagram
         end
 
         D->>S: 10. Ghi nguyên tử bot_state.json (.tmp -> fsync -> replace)
-        D->>D: 11. Ghi nhật ký kiểm toán vào audit.jsonl
+        D->>D: 11. Ghi nhật ký kiểm toán vào audit.jsonl & Reset ledger["note"] (Deduplicate)
         D->>N: 12. Gửi tóm tắt chu kỳ qua Telegram
     end
 ```
@@ -442,15 +454,21 @@ sequenceDiagram
 2. **Lệch Delta hàng chục USD do bước nhảy lot BTC:**
    - *Nguyên nhân:* Lot tối thiểu của BTC là $0.001 \approx \$96$, trong khi các coin khác chỉ $1 - 6$ USD. Làm tròn độc lập gây lệch Delta danh mục tới $\$50+$.
    - *Khắc phục:* `enforce_overlay_dollar_neutrality` áp dụng tối ưu hóa tổ hợp co chân và vi chỉnh trên coin có bước giá mịn hơn cho đến khi $|Long - Short| \le \$10.0$. Nếu không thể cân bằng, bot từ chối mở vị thế.
-3. **Lỗi lệch giờ sàn `-1021 Outside of recvWindow`:**
-   - *Nguyên nhân:* Đồng hồ Windows bị trôi vài giây so với server Binance Tokyo.
-   - *Khắc phục:* `sync_server_time()` đo `time_offset_ms` ở đầu mỗi chu kỳ và tự động cộng bù vào chữ ký HMAC.
+3. **Lỗi lệch giờ sàn `-1021 Outside of recvWindow` sau thời gian dài chạy liên tục:**
+   - *Nguyên nhân:* Khi client chạy suốt nhiều ngày, đồng hồ máy tính trôi dần so với máy chủ sàn vượt quá 5.0s.
+   - *Khắc phục:* 2 tầng phòng vệ: (a) Gọi `sync_server_time("both")` ở đầu mỗi chu kỳ trong `run_parallel_live_demo.py`, và (b) Bắt ngoại lệ `BinanceHttpError` mã `-1021` ở mọi phương thức ký lệnh (`submit_signed_order`, `query_order`, `cancel_order`, `get_spot_free_balance`, `_fetch_exchange_reconcile_snapshot_raw`), tự động resync giờ máy chủ, ký lại chữ ký HMAC với `timestamp` mới và retry ngay tại chỗ.
 4. **Lệnh Maker Post-Only bị từ chối (-2010 / -2021):**
    - *Nguyên nhân:* Đặt giá Maker chạm vào sổ lệnh đối ứng bị sàn reject ngay lập tức.
    - *Khắc phục:* `compute_maker_limit_price` kiểm tra spread: nếu $\ge 2\text{ ticks}$, đặt sâu bên trong spread ($best\_bid + 1\text{ tick}$).
 5. **Nhiễm bẩn coin rác Faucet trên Testnet:**
    - *Nguyên nhân:* Faucet Testnet tự động cấp hàng trăm token lạ khiến Reconciler báo động giả `ORPHAN_ON_EXCHANGE`.
    - *Khắc phục:* `reconcile_portfolio_state` phân tách danh mục chuẩn `CANONICAL_UNIVERSE_SYMBOLS`, đưa token lạ vào danh sách theo dõi thụ động `untracked_spot_assets`.
+6. **Deadlock cờ `kill_switch_pending_close` mồ côi (Chu kỳ 10–17):**
+   - *Nguyên nhân:* Lỗi lệnh đóng đơn lẻ thông thường gán nhầm `kill_switch_pending_close = True` trong khi `kill_switch_triggered = False`, làm toàn bộ chu kỳ sau bị khóa thoát sớm `KILL_SWITCH_ACTIVE`.
+   - *Khắc phục:* Tự động reset cờ mồ côi ở đầu `reconcile_once()`, giữ vị thế lỗi ở `"HOLD"` để retry, ghi nhận `execution_status`, định tuyến đóng Overlay thực tế qua `signed_client` khi `targets` rỗng `(targets or current)`, và bảo tồn chi tiết lỗi đối soát `recon_snapshot_unhealthy:<detail>`.
+7. **Profile `baseline_1k` bị dính Overlay do bẫy giá trị Falsy & Lỗi cộng dồn chuỗi ghi chú sổ cái:**
+   - *Nguyên nhân:* `val or 0.15` đánh giá `0.0` là falsy nên vô tình ghi đè lại giá trị mặc định. `ledger["note"]` không được reset đầu chu kỳ làm chuỗi `"fees_estimated"` lặp vô hạn.
+   - *Khắc phục:* Kiểm tra tường minh `None`, cho phép `overlay_target_vol_ann == 0.0` trong `StrategyProfileConfig.__post_init__`, tự động dọn sạch `overlay_positions` cũ về `{}`, reset `ledger["note"] = ""` đầu chu kỳ và khử trùng lặp qua helper `_append_ledger_note()`.
 
 ---
 
@@ -464,7 +482,10 @@ Khi tiếp nhận các yêu cầu lập trình, phân tích hoặc gỡ lỗi li
 4. **Xử lý số dư dấu phẩy động an toàn:** Luôn sử dụng dung sai `math.isclose` hoặc `np.isclose` ($10^{-6}$ đến $10^{-9}$) khi so sánh tiền tệ, không so sánh bằng tuyệt đối `==`.
 5. **Thực thi lệnh an toàn:** Mọi thao tác gửi lệnh hai chân phải luôn đi kèm cơ chế Rollback để không bao giờ để lộ vị thế một chân (Naked Leg).
 6. **Lệnh chạy kiểm thử chuẩn:**
-   - Chạy toàn bộ test suite: `pytest -q` (Yêu cầu toàn bộ tests phải PASS).
+   - Chạy toàn bộ test suite: `pytest -q` (Yêu cầu 874/874 tests đạt trạng thái PASS 100%).
+   - Chạy test profile tournament: `pytest tests/test_sprint25_profiles_and_parallel_demo.py tests/test_sprint27_bidirectional_and_stat_arb.py`
+   - Vận hành giả lập kiểm tra an toàn: `python run_live.py --mode shadow-live --strategy barbell --capital 3000 --once`
+   - Khởi động giải đấu 24/7: `powershell -ExecutionPolicy Bypass -File resume_tournament.ps1`
    - Chạy test profile tournament: `pytest tests/test_sprint25_profiles_and_parallel_demo.py tests/test_sprint27_bidirectional_and_stat_arb.py`
    - Vận hành giả lập kiểm tra an toàn: `python run_live.py --mode shadow-live --strategy barbell --capital 3000 --once`
    - Khởi động giải đấu 24/7: `powershell -ExecutionPolicy Bypass -File resume_tournament.ps1`

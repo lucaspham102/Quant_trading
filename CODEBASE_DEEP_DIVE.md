@@ -1,8 +1,8 @@
 # BÁO CÁO PHÂN TÍCH CHUYÊN SÂU HỆ THỐNG GIAO DỊCH ĐỊNH LƯỢNG (CODEBASE DEEP DIVE)
 
-> **Phiên bản kiến trúc**: Sprint 28 + Nâng cấp Vận hành 24/7 Chu kỳ 105 (Multi-Sleeve Barbell & 4-Profile 24/7 Live Tournament Engine)  
-> **Trạng thái kiểm thử**: **859 / 859 Unit & Integration Tests PASSED (100%)**  
-> **Trạng thái vận hành**: Chu kỳ 105 (`SYNCED`), sẵn sàng treo 24/7 trên PC / Laptop với cơ chế chống Sleep, chống sập nguồn (`.bak` + `fsync`), tự chờ mạng phục hồi và cảnh báo Telegram thông minh.  
+> **Phiên bản kiến trúc**: Sprint 28 + Nâng cấp Vận hành 24/7 Chu kỳ 105 & Bản vá Forensic Chu kỳ 17 (Multi-Sleeve Barbell & 4-Profile 24/7 Live Tournament Engine)
+> **Trạng thái kiểm thử**: **874 / 874 Unit & Integration Tests PASSED (100%)**
+> **Trạng thái vận hành**: Chu kỳ 105 (`SYNCED`), sẵn sàng treo 24/7 trên PC / Laptop với cơ chế chống Sleep, chống sập nguồn (`.bak` + `fsync`), tự chờ mạng phục hồi, tự bù lệch đồng hồ máy chủ (`-1021`), tự gỡ deadlock và cảnh báo Telegram thông minh.
 > ** Mục tiêu thiết kế**: Kiến trúc Giao dịch Định lượng Đa chiến lược (Multi-Sleeve Quantitative Portfolio) kết hợp thu hoạch **Delta-Neutral Cash & Carry**, **Cross-Sectional Relative-Value Overlay**, và **Long-Only Triple-Confirmed Trend Sleeve** trên rổ 12 tài sản thanh khoản cao nhất sàn Binance (Spot & USDⓈ-M Futures) cùng dữ liệu liên sàn Bybit & OKX.
 
 ---
@@ -153,7 +153,7 @@ d:\Quant_trading\
 │   ├── evaluate_recent_holdout.py        # Kiểm định Out-of-Sample trên dữ liệu 90-180 ngày gần nhất
 │   ├── run_testnet_preflight.py          # Kiểm tra 6 cổng an toàn trước khi giao dịch thật
 │   └── check_testnet_equity_breakdown.py # Kiểm tra nhanh số dư Spot/Futures Testnet (Read-only)
-├── tests/                                # 30 file kiểm thử tự động (859 test cases đạt 100% PASS)
+├── tests/                                # 30 file kiểm thử tự động (874 test cases đạt 100% PASS)
 ├── data/
 │   ├── raw/                              # Dữ liệu Parquet lịch sử 12 coin (tự động cập nhật mỗi giờ)
 │   └── state/                            # Trạng thái sống của giải đấu (Chu kỳ 105 SYNCED + .bak dự phòng)
@@ -183,14 +183,38 @@ d:\Quant_trading\
   1. `regime_omni_1k` (**TESTNET_REAL**): Đa nhánh thích ứng theo chế độ thị trường (Carry + XS Overlay + Long-Only Trend).
   2. `flexible_regime_1k` (**SHADOW_LIVE**): Đa nhánh linh hoạt với tỷ trọng co giãn mượt.
   3. `carry_max_eta_1k` (**SHADOW_LIVE**): Tập trung tối đa vào thu hoạch Carry + XS Overlay, không dùng Trend (`Trend CB = N/A (No-Trend)`).
-  4. `baseline_1k` (**SHADOW_LIVE**): Danh mục chuẩn đối chiếu (85% Carry / 15% Overlay cố định, `Trend CB = N/A (No-Trend)`).
+  4. `baseline_1k` (**SHADOW_LIVE**): **Benchmark chuẩn đối chiếu Market-Neutral 100% Pure Carry + Passive Yield**. Đã tắt hoàn toàn nhánh XS Momentum Overlay (`overlay_gross_pct = 0.0`, `overlay_target_vol_ann = 0.0`, `Trend CB = N/A (No-Trend)`).
+  - **Hỗ trợ cấu hình Pure Carry trong `StrategyProfileConfig.__post_init__`**: Cho phép `overlay_target_vol_ann == 0.0` khi `overlay_gross_pct == 0.0` (chỉ bắt buộc $> 0$ khi `overlay_gross_pct > 0`).
 
-### 4.3. Nhóm Thực thi, Đối soát & Lưu trữ Bền vững (`binance_signed_client.py`, `exchange_reconciler.py`, `state_store.py`, `notifier.py`)
+- **Phân định rõ Target tức thời vs Vị thế nắm giữ thực tế trong Lõi Carry**:
+  - `carry_sleeve["allocations"]`: Đại diện cho **Target tức thời** phản ánh top-$k$ cặp có điểm số (Score/Funding) cao nhất tại chu kỳ tính toán hiện tại.
+  - `carry_positions`: Đại diện cho **Vị thế thực tế** đang nắm giữ, tuân thủ nghiêm ngặt bộ lọc chống đảo danh mục của `select_portfolio()` gồm thời gian nắm giữ tối thiểu (`min_hold_periods = 63` giờ) và đệm thứ hạng (`buffer_rank = 3`). Vì vậy, việc vị thế thực tế tiếp tục giữ mã cũ khi chưa đủ 63 giờ (nếu funding rate vẫn dương và chưa rơi khỏi vùng đệm) là **hành vi chuẩn mực theo thiết kế**, giúp tiết kiệm đáng kể chi phí giao dịch hai chiều Spot-Perp thay vì đảo danh mục liên tục theo từng giờ.
+
+### 4.3. Nhóm Thực thi, Đối soát & Lưu trữ Bền vững (`binance_signed_client.py`, `carry_live_executor.py`, `exchange_reconciler.py`, `state_store.py`, `notifier.py`, `run_parallel_live_demo.py`)
 - **[`src/binance_signed_client.py`](file:///d:/Quant_trading/src/binance_signed_client.py)**:
-  - Ký xác thực HMAC-SHA256 cho cả Spot Testnet và USDⓈ-M Futures Testnet, tự động bù độ lệch đồng hồ server (`sync_server_time`) chống lỗi `-1021`.
+  - Ký xác thực HMAC-SHA256 cho cả Spot Testnet và USDⓈ-M Futures Testnet.
+  - **Cơ chế Tự phục hồi Đồng hồ & Khắc phục Lỗi `-1021 (Timestamp outside of recvWindow)`**:
+    - Trong mọi phương thức giao dịch và đối soát: [`submit_signed_order`](file:///d:/Quant_trading/src/binance_signed_client.py#L902-L980), [`query_order`](file:///d:/Quant_trading/src/binance_signed_client.py#L982-L1019), [`cancel_order`](file:///d:/Quant_trading/src/binance_signed_client.py#L1021-L1055), [`get_spot_free_balance`](file:///d:/Quant_trading/src/binance_signed_client.py#L1890-L1928), và [`_fetch_exchange_reconcile_snapshot_raw`](file:///d:/Quant_trading/src/binance_signed_client.py#L2081-L2140), nếu bắt được `BinanceHttpError` mang mã `-1021`, client tự động gọi [`sync_server_time(venue)`](file:///d:/Quant_trading/src/binance_signed_client.py#L641-L681), đo lại `time_offset_ms`, ký lại chữ ký HMAC với `timestamp` mới và gửi lại (retry) ngay lập tức.
+    - Được gọi tự động định kỳ `sync_server_time("both")` ở đầu mỗi chu kỳ trong vòng lặp `main()` của giải đấu (`scripts/run_parallel_live_demo.py`) ngay khi xác nhận có kết nối mạng.
+  - **Khả năng tự phục hồi của Snapshot đối soát sàn (`_fetch_exchange_reconcile_snapshot_raw`)**:
+    - Tích hợp vòng lặp retry (tối đa 2 lần thử) với thời gian nghỉ ngắn ($0.3\text{s}$) khi gặp lỗi mạng tạm thời hoặc tự động resync giờ nếu dính `-1021`.
+    - Bảo toàn nguyên vẹn mã lỗi `api_error_code` và thông điệp lỗi chi tiết trên snapshot thay vì trả về lỗi chung chung, giúp Reconciler chẩn đoán chính xác nguyên nhân mạng/khóa API.
   - Đặt lệnh **Inside-Spread Smart Maker** (`compute_maker_limit_price`) ưu tiên hưởng phí Maker thấp; tự động chuyển sang lệnh Market khi hết thời gian chờ.
   - **Chống treo vô hạn (Anti-Hang Monotonic Ceiling)**: Hàm [`wait_for_order_fill`](file:///d:/Quant_trading/src/binance_signed_client.py#L430-L510) sử dụng `time.monotonic()` với trần cứng `max_total_wait_sec = 45.0s`, ngăn chặn triệt để hiện tượng treo tiến trình nếu API Binance phản hồi chậm.
   - **Không dùng `reduceOnly` trên tài khoản Futures 1 chiều dùng chung**: Cho phép đảo chiều mượt mà giữa vị thế Carry (Short Perp) và vị thế Overlay/Trend (Long Perp) mà không bị sàn từ chối với lỗi `-2022 ReduceOnly Order is rejected`.
+
+- **[`src/carry_live_executor.py`](file:///d:/Quant_trading/src/carry_live_executor.py)**:
+  - **Tự động gỡ Deadlock cờ `kill_switch_pending_close` mồ côi**: Ở đầu mỗi chu kỳ [`reconcile_once()`](file:///d:/Quant_trading/src/carry_live_executor.py#L3219-L3225), nếu cờ `kill_switch_pending_close == True` trong khi cờ `kill_switch_triggered == False` (do lỗi đóng lệnh đơn lẻ chu kỳ trước để lại), hệ thống tự động reset `kill_switch_pending_close = False`, ghi log warning và lưu state ngay lập tức, giải phóng bot khỏi bẫy khóa thoát sớm.
+  - **Tách biệt minh bạch giữa Lỗi Thực thi Thông thường và Cầu chì Kill-Switch**: Khi lệnh đóng vị thế Carry hoặc Overlay gặp lỗi sàn/mạng tạm thời, hệ thống giữ nguyên vị thế ở trạng thái `"HOLD"` để chu kỳ sau tiếp tục thử lại, ghi nhận vào `cycle_exec_errors` và gán trạng thái `execution_status` (`"OK"`, `"PARTIAL_ERROR"`, `"ERROR"`), tuyệt đối không bật nhầm cờ `kill_switch_pending_close` (vốn chỉ dành riêng cho trường hợp sụt giảm tài khoản nghiêm trọng chạm ngưỡng thanh lý).
+  - **Định tuyến đóng vị thế Overlay thực tế về Flat qua `signed_client`**: Trong [`execute_overlay_rebalance()`](file:///d:/Quant_trading/src/carry_live_executor.py#L1823-L1840), sử dụng điều kiện `if self.execute_real_orders and self.signed_client is not None and (targets or current):` để đảm bảo khi `targets` rỗng mà `current` vẫn còn vị thế cũ, lệnh đóng về flat vẫn được định tuyến chính xác qua [`_execute_overlay_deltas_real()`](file:///d:/Quant_trading/src/carry_live_executor.py#L2280-L2530) bằng `signed_client` (đồng thời hỗ trợ `signed_client` trong [`_close_carry_position_emergency`](file:///d:/Quant_trading/src/carry_live_executor.py#L2904-L2920) và [`_close_overlay_position_emergency`](file:///d:/Quant_trading/src/carry_live_executor.py#L2998-L3016)) thay vì rơi xuống nhánh CCXT rỗng.
+  - **Loại bỏ bẫy Fallback Falsy & Tự động dọn sạch Overlay của `baseline_1k`**:
+    - Loại bỏ bẫy `or 0.15` / `or 0.075` trong khởi tạo và áp dụng tham số profile, thiết lập `enable_overlay = False` trên `overlay_config` khi `overlay_gross_pct <= 0.0`.
+    - Khi `targets` rỗng mà `self.state.overlay_positions` còn vị thế cũ (cả ở chế độ `SHADOW_LIVE` lẫn `TESTNET_REAL`), hệ thống tự động đóng sạch và xóa khỏi state về `{}`, giúp `baseline_1k` đưa `Overlay Long/Short` về đúng `$0.0 / $0.0` ngay ở chu kỳ đầu tiên.
+
+- **[`scripts/run_parallel_live_demo.py`](file:///d:/Quant_trading/scripts/run_parallel_live_demo.py)**:
+  - **Minh bạch hóa lỗi đối soát sàn**: Trong [`compute_exchange_reconcile`](file:///d:/Quant_trading/scripts/run_parallel_live_demo.py#L2837-L2846), bảo tồn chi tiết lỗi dưới dạng `recon_snapshot_unhealthy:<chi_tiết_lỗi>` thay vì nuốt mất thông tin.
+  - **Làm sạch và Chống tích lũy ghi chú sổ cái (`ledger["note"]`)**: Ở đầu mỗi chu kỳ trong [`run_profile_cycle`](file:///d:/Quant_trading/scripts/run_parallel_live_demo.py#L2164-L2296), `ledger["note"]` được reset về `""` và cập nhật thông qua hàm trợ giúp [`_append_ledger_note`](file:///d:/Quant_trading/scripts/run_parallel_live_demo.py#L1670-L1681) có cơ chế deduplicate, triệt tiêu hoàn toàn hiện tượng cộng dồn chuỗi lặp vô tận `"fees_estimated fees_estimated..."` qua nhiều ngày.
+
 - **[`src/exchange_reconciler.py`](file:///d:/Quant_trading/src/exchange_reconciler.py)**:
   - Đối soát toàn diện vị thế và số dư giữa sổ cái nội bộ và sàn Binance.
   - **Hạch toán cô lập (`compute_isolated_testnet_equity`)**: Lưu trữ ảnh chụp tài khoản ban đầu vào `testnet_baseline.json` và tính toán PnL thực tế của bot dựa trên độ chênh lệch vị thế và tiền mặt ($\Delta \text{Cash} + \Delta \text{Position}$), tách biệt hoàn toàn gói vốn `$1,000` của bot khỏi số dư 10,000 USDT mặc định của sàn Testnet.
@@ -247,6 +271,23 @@ Script [`scripts/run_parallel_live_demo.py`](file:///d:/Quant_trading/scripts/ru
 4. **Cạm bẫy hỏng file JSON khi mất điện đột ngột**:
    - *Hiện tượng*: Sập nguồn đúng lúc đang ghi file trạng thái có thể tạo ra file JSON 0-byte hoặc mất dấu đóng ngoặc, làm bot không thể khởi động lại.
    - *Giải pháp*: Cơ chế Atomic Write kết hợp `os.fsync()` và tự động fallback sang file `.json.bak` (`WARNING: RECOVERED_STATE_FROM_BACKUP`).
+5. **Cạm bẫy Deadlock cờ `kill_switch_pending_close` mồ côi (Chu kỳ 10–17)**:
+   - *Hiện tượng*: Khi một lệnh đóng vị thế thông thường (Carry hoặc Overlay) gặp lỗi sàn/mạng tạm thời, việc gán `self.state.kill_switch_pending_close = True` trong khi `kill_switch_triggered = False` khiến toàn bộ các chu kỳ tiếp theo bị chặn đứng ngay ở đầu hàm `reconcile_once()` (`KILL_SWITCH_ACTIVE`), làm vị thế thực tế trên sàn bị đóng băng vĩnh viễn dù thị trường không hề có biến động sụt giảm vốn.
+   - *Giải pháp*:
+     - Tự động phát hiện và xóa cờ mồ côi ở đầu `reconcile_once()`: `if self.state.kill_switch_pending_close and not self.state.kill_switch_triggered: self.state.kill_switch_pending_close = False`.
+     - Tách biệt hoàn toàn lỗi thực thi thông thường khỏi Kill-Switch khẩn cấp: Giữ nguyên vị thế ở `"HOLD"` để retry chu kỳ sau, ghi nhận danh sách lỗi vào `cycle_exec_errors` và gán `execution_status` (`"OK"`, `"PARTIAL_ERROR"`, `"ERROR"`), tuyệt đối không kích hoạt nhầm cờ Kill-Switch.
+     - Sửa điều kiện định tuyến đóng Overlay thực tế qua `signed_client` khi `targets` rỗng: `if self.execute_real_orders and self.signed_client is not None and (targets or current):` (và hỗ trợ `signed_client` trong `_close_carry_position_emergency` / `_close_overlay_position_emergency`).
+6. **Cạm bẫy trôi đồng hồ sàn `-1021 Outside of recvWindow` và nuốt lỗi đối soát sau 9–10 giờ chạy liên tục**:
+   - *Hiện tượng*: Khi `signed_client` được khởi tạo 1 lần duy nhất ở đầu `main()` và giữ sống liên tục nhiều ngày, độ lệch đồng hồ máy chủ (`time_offset_ms`) bị trôi dần vượt quá ngưỡng `recvWindow` ($5.0\text{s}$), khiến mọi request ký HMAC và truy vấn snapshot thất bại hàng loạt; hàm `compute_exchange_reconcile` trước đây lại nuốt chi tiết lỗi và chỉ trả về chuỗi cụt `"recon_snapshot_unhealthy"`.
+   - *Giải pháp*:
+     - Tự động gọi `signed_client.sync_server_time("both")` ở đầu mỗi chu kỳ trong `main()` của `run_parallel_live_demo.py` sau khi mạng thông suốt.
+     - Tự động bắt lỗi `-1021`, resync giờ máy chủ, ký lại chữ ký HMAC với `timestamp` mới và retry ngay lập tức tại chỗ trong `submit_signed_order()`, `query_order()`, `cancel_order()`, `get_spot_free_balance()`, và `_fetch_exchange_reconcile_snapshot_raw()`.
+     - Bổ sung retry 2 lần cho snapshot đối soát và bảo tồn chi tiết lỗi dưới dạng `recon_snapshot_unhealthy:<chi_tiết_lỗi>`.
+7. **Cạm bẫy profile `baseline_1k` bị dính Overlay do bẫy giá trị falsy và lỗi cộng dồn chuỗi ghi chú sổ cái**:
+   - *Hiện tượng*: Khi cấu hình `baseline_1k` với `overlay_gross_pct = 0.0, overlay_target_vol_ann = 0.0`, biểu thức Python `val or 0.15` đánh giá số `0.0` là falsy nên vô tình ghi đè lại giá trị mặc định `0.15` và `0.075`. Đồng thời, `ledger["note"]` không được làm sạch đầu chu kỳ khiến chuỗi `"fees_estimated fees_estimated..."` cộng dồn vô hạn qua từng giờ.
+   - *Giải pháp*:
+     - Khử bẫy falsy bằng kiểm tra tường minh `None` (`0.15 if val is None else val`), cho phép `overlay_target_vol_ann == 0.0` trong `StrategyProfileConfig.__post_init__` khi `overlay_gross_pct == 0.0`, và tự động dọn sạch `overlay_positions` cũ về `{}` khi `targets` rỗng.
+     - Reset `ledger["note"] = ""` ở đầu chu kỳ và bổ sung helper `_append_ledger_note()` khử trùng lặp token.
 
 ---
 
@@ -267,7 +308,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_laptop_autostart.ps1
 python scripts/run_parallel_live_demo.py --interval-sec 3600 --tg-report-every 4
 ```
 
-### 8.4. Chạy toàn bộ 859 bài kiểm thử tự động (Unit & Integration Tests)
+### 8.4. Chạy toàn bộ 863 bài kiểm thử tự động (Unit & Integration Tests)
 ```powershell
 pytest -q
 ```

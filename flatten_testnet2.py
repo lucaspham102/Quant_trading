@@ -1,4 +1,4 @@
-﻿import sys, time, hmac, hashlib, urllib.parse, requests
+import sys, time, hmac, hashlib, urllib.parse, requests
 sys.path.insert(0, r"D:\Quant_trading")
 from src.binance_signed_client import BinanceSignedTestnetClient
 

@@ -67,6 +67,11 @@ class StrategyProfileConfig:
     hard_dd_threshold_pct: float = 0.10
     bfusd_apy: float = 0.045
     idle_spot_earn_apy: float = 0.035
+    # ---- Sprint 27 Champion Upgrade: U3 (Emergency Exit), U4 (Blended Cost), U5 (Flat Transfer)
+    u5_dynamic_transfer_flat: bool = True
+    u3_emergency_exit_min_periods: int = 12
+    u3_emergency_exit_funding_bps: float = -1.0
+    u4_blended_carry_cost_bps: float = 9.25
     liquid_staking_apy_map: dict[str, float] = field(
         default_factory=lambda: {"ETH": 0.032, "SOL": 0.062}
     )
@@ -269,8 +274,8 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
     "carry_max_eta_1k": StrategyProfileConfig(
         name="carry_max_eta_1k",
         capital_usd=1000.0,
-        spot_wallet_usd=780.0,
-        futures_wallet_usd=220.0,
+        spot_wallet_usd=700.0,
+        futures_wallet_usd=300.0,
         carry_eta=0.78,
         carry_top_k=2,
         carry_min_hold_bars=63,

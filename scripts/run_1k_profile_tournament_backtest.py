@@ -30,6 +30,7 @@ from src.barbell_portfolio import (  # noqa: E402
     enforce_overlay_dollar_neutrality,
 )
 from src.cross_exchange_carry import LIQUID_8_SYMBOLS  # noqa: E402
+from src.upgrade_variants import LIQUID_12_SYMBOLS  # noqa: E402
 from src.dynamic_carry_basis import DynamicCarryConfig, build_carry_basis_scores  # noqa: E402
 from src.sprint7_eval import segment_metrics  # noqa: E402
 from src.directional_trend_sleeve import (  # noqa: E402
@@ -51,6 +52,10 @@ from src.strategy_profiles import (  # noqa: E402
     compute_funding_tilted_weights,
     compute_step_passive_yield_usd,
     enforce_split_wallet_futures_cap,
+)
+from src.upgrade_variants import (  # noqa: E402
+    SMALL_LOT_SWEEP_SYMBOLS,
+    UpgradeFlags,
 )
 
 LOGGER = logging.getLogger("sprint25_tournament")
@@ -84,6 +89,10 @@ TOURNAMENT_LOT_STEPS: dict[str, float] = {
     "AVAX/USDT:USDT": 1.0,
     "XRP/USDT:USDT": 1.0,
     "DOGE/USDT:USDT": 1.0,
+    "SUI/USDT:USDT": 0.1,
+    "ADA/USDT:USDT": 1.0,
+    "NEAR/USDT:USDT": 0.1,
+    "DOT/USDT:USDT": 0.1,
 }
 
 _MIN_CARRY_NOTIONAL_USD = 10.0
@@ -106,8 +115,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out-json", type=str, default="logs/sprint26_high_return_evidence.json")
     p.add_argument("--holdout-days", type=int, default=181)
     p.add_argument("--warmup-hours", type=int, default=720)
-    p.add_argument("--carry-cost-bps", type=float, default=12.5)
-    p.add_argument("--spot-cost-bps", type=float, default=7.5)
+    p.add_argument("--carry-cost-bps", type=float, default=9.25)
+    p.add_argument("--spot-cost-bps", type=float, default=4.25)
     p.add_argument("--perp-cost-bps", type=float, default=5.0)
     # Sprint 25.1: secondary sensitivity run under BNB/maker-optimised fees (15 bps roundtrip)
     # so the operator guide can compare strict taker (25 bps) vs real-world maker execution.
@@ -138,7 +147,18 @@ def build_tournament_profiles() -> dict[str, StrategyProfileConfig]:
     return out
 
 
-def build_market_matrices(aligned: dict[str, pd.DataFrame]) -> dict[str, Any]:
+def build_market_matrices(
+    aligned: dict[str, pd.DataFrame],
+    *,
+    w_basis: float = 0.0,
+    basis_clip_bps: float | None = None,
+) -> dict[str, Any]:
+    """Build causal market matrices.
+
+    ``w_basis=0.0`` and ``basis_clip_bps=None`` reproduce the historical
+    Baseline score exactly.  The Sprint 27 U2 study passes a positive
+    ``w_basis`` together with a symmetric clip on ``basis_dev``.
+    """
     symbols = sorted(s for s, df in aligned.items() if df is not None and not df.empty)
     if not symbols:
         raise ValueError("aligned data rong: khong co symbol hop le")
@@ -165,7 +185,7 @@ def build_market_matrices(aligned: dict[str, pd.DataFrame]) -> dict[str, Any]:
 
     cfg = DynamicCarryConfig(
         initial_capital=3000.0, ema_span=42, top_k=4, entry_threshold=0.0,
-        exit_threshold=0.0, min_hold_periods=63, buffer_rank=3, w_basis=0.0,
+        exit_threshold=0.0, min_hold_periods=63, buffer_rank=3, w_basis=float(w_basis),
         basis_ema_hours=168, expected_hold_periods=63,
         switch_rule="tier1b_buffer_rank", eta_override=0.80,
     )
@@ -189,8 +209,22 @@ def build_market_matrices(aligned: dict[str, pd.DataFrame]) -> dict[str, Any]:
                 df_bridge["last_known_funding_rate"] = 0.0
         score_input[s] = df_bridge
     scores = build_carry_basis_scores(score_input, cfg)
+    if abs(float(w_basis)) > 1e-12 and basis_clip_bps is not None:
+        clip = abs(float(basis_clip_bps)) / 10000.0
+        for s in symbols:
+            if s not in scores:
+                continue
+            base = scores[s]
+            clipped_dev = base["basis_dev"].clip(lower=-clip, upper=clip)
+            scores[s]["score"] = (
+                base["f_ewma"] + float(w_basis) * (clipped_dev / float(cfg.expected_hold_periods))
+            )
     score_df = pd.DataFrame(
         {s: scores[s]["score"].reindex(index) if s in scores else np.nan for s in symbols},
+        index=index,
+    )[symbols].astype("float64")
+    basis_dev_df = pd.DataFrame(
+        {s: scores[s]["basis_dev"].reindex(index) if s in scores else np.nan for s in symbols},
         index=index,
     )[symbols].astype("float64")
 
@@ -201,6 +235,7 @@ def build_market_matrices(aligned: dict[str, pd.DataFrame]) -> dict[str, Any]:
         "spot_close": spot_df,
         "funding_event": fund_df,
         "carry_score": score_df,
+        "basis_dev": basis_dev_df,
         "funding_bps": fund_df * 10000.0,
         "snr": snr_full[symbols],
         "snr_dispersion": snr_full["raw_snr_dispersion"],
@@ -215,6 +250,56 @@ def _nan0(x: float) -> float:
     return float(x) if np.isfinite(x) else 0.0
 
 
+def _apply_smart_lot_sweep(
+    qty_map: dict[str, float],
+    candidates: list[str],
+    perp_row: np.ndarray,
+    sidx: dict[str, int],
+    lot_steps: dict[str, float],
+    budget_usd: float,
+    per_cap_usd: float,
+    min_sweep_usd: float = 25.0,
+    allowed_symbols: tuple[str, ...] = SMALL_LOT_SWEEP_SYMBOLS,
+) -> tuple[dict[str, float], float]:
+    """U1: sweep residual equal-weight carry budget into small-lot symbols.
+
+    The sweep never opens a symbol outside the selected active set and never
+    exceeds the profile's single-symbol cap.  It only re-allocates the cash
+    that equal-weight + floor-to-lot left idle.  A minimum sweep size avoids
+    dust-level churn whose round-trip fees would exceed the extra funding.
+    """
+    used = sum(float(q) * float(perp_row[sidx[s]]) for s, q in qty_map.items())
+    residual = max(0.0, float(budget_usd) - used)
+    if residual <= max(1e-9, float(min_sweep_usd)):
+        return qty_map, 0.0
+
+    ordered = sorted(
+        [
+            s for s in candidates
+            if s in qty_map and s in set(allowed_symbols) and np.isfinite(perp_row[sidx[s]])
+        ],
+        key=lambda s: lot_steps.get(s, 0.001) * float(perp_row[sidx[s]]),
+    )
+    swept = 0.0
+    for s in ordered:
+        px = float(perp_row[sidx[s]])
+        step = float(lot_steps.get(s, 0.001))
+        if px <= 0.0 or step <= 0.0:
+            continue
+        cap_qty = _floor_to_step(float(per_cap_usd) / px, step)
+        room = max(0.0, cap_qty - float(qty_map[s]))
+        add_qty = min(_floor_to_step(residual / px, step), room)
+        if add_qty <= 0.0:
+            continue
+        qty_map[s] = float(qty_map[s]) + add_qty
+        notional = add_qty * px
+        residual -= notional
+        swept += notional
+        if residual <= 1e-9:
+            break
+    return qty_map, float(swept)
+
+
 def simulate_profile(
     profile: StrategyProfileConfig,
     market: dict[str, Any],
@@ -223,6 +308,7 @@ def simulate_profile(
     end_idx: int | None = None,
     trade_start_idx: int | None = None,
     overlay_lot_specs: dict | None = None,
+    upgrade: UpgradeFlags | None = None,
 ) -> dict[str, Any]:
     index = market["index"]
     n = len(index)
@@ -241,23 +327,44 @@ def simulate_profile(
     score = market["carry_score"].to_numpy(dtype=float)
     snr = market["snr"].to_numpy(dtype=float)
     disp = market["snr_dispersion"].to_numpy(dtype=float)
+    _basis_dev_frame = market.get("basis_dev")
+    basis_dev = (
+        _basis_dev_frame.to_numpy(dtype=float)
+        if _basis_dev_frame is not None
+        else np.zeros_like(score)
+    )
     is_fund = np.isin(index.hour, [0, 8, 16]) & (index.minute == 0)
+    up = upgrade if upgrade is not None else UpgradeFlags(
+        u4_blended_carry_cost_bps=float(getattr(profile, "u4_blended_carry_cost_bps", 9.25)),
+        u5_dynamic_transfer_flat=bool(getattr(profile, "u5_dynamic_transfer_flat", True)),
+        u3_emergency_exit_min_periods=int(getattr(profile, "u3_emergency_exit_min_periods", 12)),
+        u3_emergency_exit_funding_bps=float(getattr(profile, "u3_emergency_exit_funding_bps", -1.0)),
+    )
 
     _carry_cost_bps = market.get("carry_cost_bps")
-    cost_carry = (
+    effective_carry_cost_bps = (
         float(_carry_cost_bps)
         if _carry_cost_bps is not None
-        else float(market.get("spot_cost_bps", 7.5)) + float(market.get("perp_cost_bps", 5.0))
-    ) / 10000.0
+        else float(market.get("spot_cost_bps", 4.25)) + float(market.get("perp_cost_bps", 5.0))
+    )
+    if up.u4_blended_carry_cost_bps > 0.0:
+        effective_carry_cost_bps = min(
+            effective_carry_cost_bps, float(up.u4_blended_carry_cost_bps)
+        )
+    cost_carry = effective_carry_cost_bps / 10000.0
     cost_perp = float(market.get("perp_cost_bps", 5.0)) / 10000.0
     lot_specs = overlay_lot_specs or {
-        s: {"step_size": TOURNAMENT_LOT_STEPS.get(s, 0.001), "min_notional": 10.0} for s in syms
+        s: {"step_size": TOURNAMENT_LOT_STEPS.get(s, 0.001), "min_notional": 5.0 if s in ("SUI/USDT:USDT", "ADA/USDT:USDT", "NEAR/USDT:USDT", "DOT/USDT:USDT") else 10.0} for s in syms
     }
     cap_usd = float(profile.capital_usd)
     top_k = int(profile.carry_top_k)
     entry_frac = profile.carry_entry_bps * 1e-4
+    if up.u4_entry_threshold_bps > 0.0:
+        entry_frac = float(up.u4_entry_threshold_bps) * 1e-4
     exit_frac = profile.carry_exit_bps * 1e-4
     min_viable = compute_adaptive_min_viable_leg_usd(cap_usd)
+    futures_wallet_equity = float(profile.futures_wallet_usd)
+    spot_wallet_equity = float(profile.spot_wallet_usd)
 
     carry: dict[str, dict[str, float]] = {}
     overlay: dict[str, dict[str, float]] = {}
@@ -320,7 +427,21 @@ def simulate_profile(
     max_lev = 0.0
     cap_binds = 0
     slots_sum = 0
+    carry_spot_deployed_sum = 0.0
     n_open = n_close = n_resize = n_ov_rebal = 0
+    # Sprint 27 research telemetry (zero effect when upgrade is None)
+    emergency_exits = 0
+    smart_sweep_usd = 0.0
+    wallet_transfer_usd = 0.0
+    max_carry_delta_usd = 0.0
+    rebalance_timestamps: list[int] = []
+
+    # Dynamic active universe: track cumulative valid price bars per symbol
+    cum_valid = np.cumsum(
+        np.isfinite(perp) & (perp > 0.0) & np.isfinite(spot) & (spot > 0.0),
+        axis=0,
+    )
+    min_warmup_bars = min(1440, max(1, tstart))
 
     m = end - start
     eq = np.full(m, cap_usd, dtype=float)
@@ -391,22 +512,38 @@ def simulate_profile(
                     reversal_pnl += -pos["qty"] * perp[t, i] * f
 
         if traded and is_fund[t]:
-            valid = [s for s in syms if _ok(perp[t, sidx[s]]) and _ok(spot[t, sidx[s]])]
+            valid = [
+                s for s in syms
+                if _ok(perp[t, sidx[s]]) and _ok(spot[t, sidx[s]]) and cum_valid[t, sidx[s]] >= min_warmup_bars
+            ]
             sc = {s: _nan0(score[t, sidx[s]]) for s in syms}
             fb = {s: _nan0(fbps[t, sidx[s]]) for s in syms}
             ranked = sorted(valid, key=lambda s: (-sc[s], s))
             cand = ranked[: top_k + int(profile.carry_buffer_rank)]
             set_changed = False
+            if traded:
+                rebalance_timestamps.append(int(index[t].value // 1_000_000_000))
             for s in sorted(carry):
                 if s not in valid:
                     continue
                 pos = carry[s]
                 held_bars = (t - int(pos["entry_bar"])) // 8
-                if sc[s] < exit_frac or (s not in cand and held_bars >= profile.carry_min_hold_bars):
+                normal_exit = (
+                    sc[s] < exit_frac
+                    or (s not in cand and held_bars >= profile.carry_min_hold_bars)
+                )
+                emergency_exit = (
+                    up.u3_emergency_exit_min_periods > 0
+                    and held_bars >= int(up.u3_emergency_exit_min_periods)
+                    and float(f_ewma[sidx[s]]) < float(up.u3_emergency_exit_funding_bps)
+                )
+                if normal_exit or emergency_exit:
                     fees += pos["qty"] * perp[t, sidx[s]] * cost_carry
                     del carry[s]
                     set_changed = True
                     n_close += 1
+                    if emergency_exit and not normal_exit:
+                        emergency_exits += 1
             new = []
             for s in cand:
                 if s in carry:
@@ -414,6 +551,11 @@ def simulate_profile(
                 if len(carry) + len(new) >= top_k:
                     break
                 if sc[s] >= entry_frac:
+                    # U2: never open when the perp is in a deep discount versus spot.
+                    if up.u2_discount_veto_bps > 0.0:
+                        bdev_bps = float(basis_dev[t, sidx[s]]) * 10000.0
+                        if np.isfinite(bdev_bps) and bdev_bps < -float(up.u2_discount_veto_bps):
+                            continue
                     new.append(s)
             active = sorted(list(carry) + new)
             if active:
@@ -425,14 +567,39 @@ def simulate_profile(
                 budget = cap_usd * profile.carry_eta * min(len(active) / top_k, 1.0) * carry_scale
                 per_cap = max(cap_usd / top_k, budget * profile.carry_max_single_weight)
                 set_changed = set_changed or bool(new)
+
+                qty_map: dict[str, float] = {}
                 for s in active:
                     if s not in valid:
                         continue
                     i = sidx[s]
                     px = perp[t, i]
                     target = min(budget * w.get(s, 0.0), per_cap)
-                    qty = _floor_to_step(target / px, TOURNAMENT_LOT_STEPS.get(s, 0.001))
-                    if qty * px < _MIN_CARRY_NOTIONAL_USD:
+                    qty_map[s] = _floor_to_step(
+                        target / px, TOURNAMENT_LOT_STEPS.get(s, 0.001)
+                    )
+                if up.u1_smart_lot_sweep and qty_map:
+                    qty_map, swept_now = _apply_smart_lot_sweep(
+                        qty_map=qty_map,
+                        candidates=active,
+                        perp_row=perp[t],
+                        sidx=sidx,
+                        lot_steps=TOURNAMENT_LOT_STEPS,
+                        budget_usd=budget,
+                        per_cap_usd=per_cap,
+                        min_sweep_usd=float(up.u1_min_sweep_usd),
+                        allowed_symbols=SMALL_LOT_SWEEP_SYMBOLS,
+                    )
+                    smart_sweep_usd += swept_now
+
+                for s in active:
+                    if s not in valid or s not in qty_map:
+                        continue
+                    i = sidx[s]
+                    px = perp[t, i]
+                    qty = float(qty_map[s])
+                    _min_notional_s = 5.0 if s in ("SUI/USDT:USDT", "ADA/USDT:USDT", "NEAR/USDT:USDT", "DOT/USDT:USDT") else _MIN_CARRY_NOTIONAL_USD
+                    if qty * px < _min_notional_s:
                         if s in carry:
                             fees += carry[s]["qty"] * px * cost_carry
                             del carry[s]
@@ -455,10 +622,21 @@ def simulate_profile(
                             carry[s]["qty"] = qty
                             n_resize += 1
 
+                for s, pos in carry.items():
+                    i = sidx[s]
+                    if np.isfinite(spot[t, i]) and np.isfinite(perp[t, i]):
+                        max_carry_delta_usd = max(
+                            max_carry_delta_usd,
+                            abs(float(pos["qty"]) * (float(spot[t, i]) - float(perp[t, i]))),
+                        )
+
         if traded and t % _OVERLAY_STEP_BARS == 0:
             n_ov_rebal += 1
             row = snr[t]
-            vo = [i for i in range(len(syms)) if np.isfinite(row[i]) and _ok(perp[t, i])]
+            vo = [
+                i for i in range(len(syms))
+                if np.isfinite(row[i]) and _ok(perp[t, i]) and cum_valid[t, i] >= min_warmup_bars
+            ]
             desired = 0.0
             li = si = -1
             if np.isfinite(disp[t]) and disp[t] >= _SNR_GATE and len(vo) >= 2:
@@ -474,10 +652,41 @@ def simulate_profile(
             carry_notional = sum(
                 p["qty"] * perp[t, sidx[s]] for s, p in carry.items() if np.isfinite(perp[t, sidx[s]])
             )
+            if not up.u5_dynamic_transfer_flat:
+                futures_wallet_equity = float(profile.futures_wallet_usd)
+                spot_wallet_equity = float(profile.spot_wallet_usd)
+            if up.u5_dynamic_transfer_flat and trend_enabled and not trend:
+                probe = enforce_split_wallet_futures_cap(
+                    carry_perp_notional_usd=carry_notional,
+                    desired_overlay_gross_usd=desired,
+                    futures_wallet_equity_usd=futures_wallet_equity,
+                    max_futures_leverage=profile.max_futures_leverage,
+                )
+                if probe["clamped"]:
+                    carry_spot_notional = sum(
+                        p["qty"] * spot[t, sidx[s]]
+                        for s, p in carry.items()
+                        if np.isfinite(spot[t, sidx[s]])
+                    )
+                    idle_spot = max(
+                        0.0,
+                        spot_wallet_equity - carry_spot_notional - 25.0,
+                    )
+                    required = max(
+                        0.0,
+                        (carry_notional + desired)
+                        / max(1e-9, float(profile.max_futures_leverage))
+                        - futures_wallet_equity,
+                    )
+                    transfer = min(idle_spot, required)
+                    if transfer > 0.0:
+                        futures_wallet_equity += transfer
+                        spot_wallet_equity -= transfer
+                        wallet_transfer_usd += transfer
             cap = enforce_split_wallet_futures_cap(
                 carry_perp_notional_usd=carry_notional,
                 desired_overlay_gross_usd=desired,
-                futures_wallet_equity_usd=profile.futures_wallet_usd,
+                futures_wallet_equity_usd=futures_wallet_equity,
                 max_futures_leverage=profile.max_futures_leverage,
             )
             max_lev = max(max_lev, cap["effective_futures_leverage"])
@@ -492,7 +701,8 @@ def simulate_profile(
                         continue
                     q_new = _floor_to_step(carry[s]["qty"] * factor, TOURNAMENT_LOT_STEPS.get(s, 0.001))
                     fees += abs(carry[s]["qty"] - q_new) * px * cost_carry
-                    if q_new * px < _MIN_CARRY_NOTIONAL_USD:
+                    _min_notional_s = 5.0 if s in ("SUI/USDT:USDT", "ADA/USDT:USDT", "NEAR/USDT:USDT", "DOT/USDT:USDT") else _MIN_CARRY_NOTIONAL_USD
+                    if q_new * px < _min_notional_s:
                         # Sprint 25 fix: the residual lot is fully closed below, so charge
                         # the closing fee on it too (previously it vanished fee-free).
                         fees += q_new * px * cost_carry
@@ -596,14 +806,29 @@ def simulate_profile(
                 )
                 fut_capacity = max(
                     0.0,
-                    float(profile.futures_wallet_usd) * float(profile.max_futures_leverage)
+                    futures_wallet_equity * float(profile.max_futures_leverage)
                     - carry_notional_now
                     - overlay_gross_now
                     - reversal_gross_now,
                 )
                 desired_gross = float(sum(abs(w) for w in weights.values())) * cap_usd
                 if desired_gross > 0.0 and desired_gross > fut_capacity:
-                    scale = fut_capacity / desired_gross
+                    if up.u5_dynamic_transfer_flat and not trend:
+                        carry_spot_notional = sum(
+                            p["qty"] * spot[t, sidx[s]]
+                            for s, p in carry.items()
+                            if np.isfinite(spot[t, sidx[s]])
+                        )
+                        idle_spot = max(0.0, spot_wallet_equity - carry_spot_notional - 25.0)
+                        needed_equity = (desired_gross - fut_capacity) / max(1e-9, float(profile.max_futures_leverage))
+                        transfer = min(idle_spot, needed_equity)
+                        if transfer > 0.0:
+                            futures_wallet_equity += transfer
+                            spot_wallet_equity -= transfer
+                            wallet_transfer_usd += transfer
+                            fut_capacity += transfer * float(profile.max_futures_leverage)
+                    if desired_gross > fut_capacity:
+                        scale = fut_capacity / desired_gross
                     weights = {s: float(w) * scale for s, w in weights.items()}
                 targets = trend_weights_to_target_qty(
                     weights, prices_now, cap_usd, TOURNAMENT_LOT_STEPS, min_notional_usd=10.0
@@ -667,7 +892,7 @@ def simulate_profile(
                 )
                 cap_r = max(
                     0.0,
-                    float(profile.futures_wallet_usd) * float(profile.max_futures_leverage)
+                    futures_wallet_equity * float(profile.max_futures_leverage)
                     - carry_n - ov_n - tr_n,
                 )
                 want_r = float(sum(abs(w) for w in rev_w.values())) * cap_usd
@@ -721,12 +946,23 @@ def simulate_profile(
             }
             cum_yield += compute_step_passive_yield_usd(profile, 1.0, deployed)["total_passive_yield_usd"]
             slots_sum += len(carry)
+            carry_spot_deployed_sum += sum(deployed.values())
         cy[k] = cum_yield
 
     idx_slice = index[start:end]
     equity_pure = pd.Series(eq, index=idx_slice)
     cum_series = pd.Series(cy, index=idx_slice)
     n_traded = end - tstart
+    carry_spot_leg_end = sum(
+        float(p["qty"]) * float(spot[end - 1, sidx[s]])
+        for s, p in carry.items()
+        if np.isfinite(spot[end - 1, sidx[s]])
+    )
+    carry_perp_leg_end = sum(
+        float(p["qty"]) * float(perp[end - 1, sidx[s]])
+        for s, p in carry.items()
+        if np.isfinite(perp[end - 1, sidx[s]])
+    )
     return {
         "equity_pure": equity_pure,
         "cumulative_passive_yield_usd": cum_series,
@@ -764,6 +1000,23 @@ def simulate_profile(
         "max_observed_futures_leverage": float(max_lev),
         "cap_bind_count": int(cap_binds),
         "avg_carry_slots": float(slots_sum / n_traded) if n_traded > 0 else 0.0,
+        "avg_carry_spot_deployed_usd": float(carry_spot_deployed_sum / n_traded) if n_traded > 0 else 0.0,
+        "capital_deployment_efficiency_pct": (
+            float(carry_spot_deployed_sum / (n_traded * cap_usd * profile.carry_eta) * 100.0)
+            if n_traded > 0 and profile.carry_eta > 0 else 0.0
+        ),
+        # Sprint 27 research telemetry; all zero/neutral when upgrade is None.
+        "upgrade_ids": up.active_ids(),
+        "effective_carry_cost_bps": float(effective_carry_cost_bps),
+        "emergency_exit_count": int(emergency_exits),
+        "smart_lot_sweep_usd": float(smart_sweep_usd),
+        "wallet_transfer_usd": float(wallet_transfer_usd),
+        "max_carry_delta_usd": float(max_carry_delta_usd),
+        "carry_spot_leg_usd_end": float(carry_spot_leg_end),
+        "carry_perp_leg_usd_end": float(carry_perp_leg_end),
+        "sizing_capital_std": 0.0,
+        "rebalance_timestamps": list(rebalance_timestamps),
+        "trade_start": index[tstart],
         "diagnostics": {
             "trade_start_idx": tstart,
             "n_carry_opens": n_open,
@@ -805,9 +1058,12 @@ def evaluate_window(
     start_idx: int,
     end_idx: int,
     trade_start_idx: int,
+    *,
+    upgrade: UpgradeFlags | None = None,
 ) -> dict[str, Any]:
     sim = simulate_profile(
-        profile, market, start_idx=start_idx, end_idx=end_idx, trade_start_idx=trade_start_idx,
+        profile, market, start_idx=start_idx, end_idx=end_idx,
+        trade_start_idx=trade_start_idx, upgrade=upgrade,
     )
     off = int(trade_start_idx) - int(start_idx)
     # Sprint 25 fix: start one bar BEFORE the first trade so the initial entry costs are
@@ -854,6 +1110,17 @@ def evaluate_window(
         "max_observed_futures_leverage": sim["max_observed_futures_leverage"],
         "cap_bind_count": sim["cap_bind_count"],
         "avg_carry_slots": sim["avg_carry_slots"],
+        "upgrade_ids": sim["upgrade_ids"],
+        "effective_carry_cost_bps": sim["effective_carry_cost_bps"],
+        "emergency_exit_count": sim["emergency_exit_count"],
+        "smart_lot_sweep_usd": sim["smart_lot_sweep_usd"],
+        "wallet_transfer_usd": sim["wallet_transfer_usd"],
+        "max_carry_delta_usd": sim["max_carry_delta_usd"],
+        "carry_spot_leg_usd_end": sim["carry_spot_leg_usd_end"],
+        "carry_perp_leg_usd_end": sim["carry_perp_leg_usd_end"],
+        "sizing_capital_std": sim["sizing_capital_std"],
+        "rebalance_timestamps": sim["rebalance_timestamps"],
+        "trade_start": sim["trade_start"],
         "start": pure_eq.index[0],
         "end": pure_eq.index[-1],
         "n_bars": int(len(pure_eq)),
