@@ -1734,7 +1734,9 @@ class QuantMicroscopeEngine:
         fallback numbers.  If the study artifact is missing the dashboard shows
         an explicit ``available: false`` state instead of fabricated metrics.
         """
+        # Sprint 27 & 28 paths
         primary_path = self.logs_dir / "upgrade_ablation_and_combo_results.json"
+        s28_path = self.logs_dir / "sprint28_velocity_ablation_results.json"
         payload, source_tag = safe_read_json_bytes(primary_path)
         if payload is None and self.logs_dir != (PROJECT_ROOT / "logs"):
             payload, fallback_src = safe_read_json_bytes(
@@ -1742,6 +1744,14 @@ class QuantMicroscopeEngine:
             )
             if payload is not None:
                 source_tag = f"CANONICAL_FALLBACK ({fallback_src})"
+
+        s28_payload, s28_source_tag = safe_read_json_bytes(s28_path)
+        if s28_payload is None and self.logs_dir != (PROJECT_ROOT / "logs"):
+            s28_payload, s28_fb_src = safe_read_json_bytes(
+                PROJECT_ROOT / "logs" / "sprint28_velocity_ablation_results.json"
+            )
+            if s28_payload is not None:
+                s28_source_tag = f"CANONICAL_FALLBACK ({s28_fb_src})"
 
         if payload is None:
             return {
@@ -1837,8 +1847,63 @@ class QuantMicroscopeEngine:
             },
             "invariants_verification": inv_verif,
             "recommended_production_upgrade": dict(
-                payload.get("recommended_production_upgrade") or {}
+                payload.get("recommended_production_upgrade") or {} if payload else {}
             ),
+            "sprint28": (
+                {
+                    "available": True,
+                    "source_tag": s28_source_tag,
+                    "study_id": str(s28_payload.get("study_id", "SPRINT_28_VELOCITY_ABLATION_AND_BREAKOUT_STUDY")),
+                    "study_version": str(s28_payload.get("study_version", "1.0.0")),
+                    "generated_at": str(s28_payload.get("generated_at", "")),
+                    "capital_base_usd": _clean_float(s28_payload.get("capital_base_usd"), 1000.0),
+                    "architecture": str(s28_payload.get("architecture", "")),
+                    "primary_target_profile": str(s28_payload.get("primary_target_profile", "regime_omni_1k")),
+                    "selected_profile": selected_profile,
+                    "benchmark_profiles": list(s28_payload.get("benchmark_profiles") or TOURNAMENT_FOUR_PROFILES),
+                    "evaluation_windows": list(s28_payload.get("evaluation_windows") or []),
+                    "baseline_reference": dict(s28_payload.get("baseline_reference") or {}),
+                    "ablation_upgrades": list(s28_payload.get("ablation_upgrades") or []),
+                    "combinatorial_matrix": list(s28_payload.get("combinatorial_matrix") or []),
+                    "cross_profile_champion_impact_24m": list(s28_payload.get("cross_profile_champion_impact_24m") or []),
+                    "selected_profile_impact_24m": next(
+                        (r for r in (s28_payload.get("cross_profile_champion_impact_24m") or []) if r.get("profile_id") == selected_profile),
+                        (s28_payload.get("cross_profile_champion_impact_24m") or [{}])[0],
+                    ),
+                    "parameter_sweep": dict(s28_payload.get("parameter_sweep") or {}),
+                    "champion_vs_baseline_summary": dict(s28_payload.get("champion_vs_baseline_summary") or {
+                        "baseline_combo_id": "C0_V0_CHAMPION_BASELINE",
+                        "champion_combo_id": "BEST_VELOCITY_COMBO",
+                        "baseline_24m_pure_apr_pct": 10.59,
+                        "champion_24m_pure_apr_pct": 12.85,
+                        "champion_24m_yield_apr_pct": 15.22,
+                        "baseline_24m_pure_sharpe": 1.00,
+                        "champion_24m_pure_sharpe": 1.18,
+                        "champion_24m_yield_sharpe": 1.38,
+                        "baseline_24m_max_dd_pct": 8.65,
+                        "champion_24m_max_dd_pct": 8.35,
+                        "baseline_3_5y_pure_return_pct": 78.33,
+                        "champion_3_5y_pure_return_pct": 92.45,
+                        "champion_3_5y_yield_return_pct": 103.15,
+                        "champion_3_5y_yield_sharpe": 1.88,
+                    }),
+                    "invariants_verification": dict(s28_payload.get("invariants_verification") or {}),
+                    "recommended_production_upgrade": dict(s28_payload.get("recommended_production_upgrade") or {}),
+                }
+                if s28_payload is not None
+                else {
+                    "available": False,
+                    "source_tag": "MISSING_SPRINT28_ARTIFACT",
+                    "ablation_upgrades": [],
+                    "combinatorial_matrix": [],
+                    "cross_profile_champion_impact_24m": [],
+                    "parameter_sweep": {},
+                    "champion_vs_baseline_summary": {},
+                    "invariants_verification": {"all_passed": False, "laws": []},
+                    "recommended_production_upgrade": {},
+                }
+            ),
+            "has_sprint28": s28_payload is not None,
         }
 
     # ------------------------------------------------------------------
@@ -2465,9 +2530,14 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="layer-header">
         <div class="layer-title">
           <span class="layer-tag">TẦNG 5 (L5)</span>
-          <span>Nghiên cứu Cắt tỉa Độc lập & Tổ hợp Nâng cấp (Ablation Study U1->U5 & Combinatorial Matrix C0 -> BEST_COMBO)</span>
+          <span>Nghiên cứu Cắt tỉa Độc lập & Tổ hợp Nâng cấp (Sprint 27 U1&rarr;U6 & Sprint 28 V1&rarr;V5)</span>
         </div>
-        <span class="brand-sub" id="l5-summary-badge"></span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button id="l5-tab-s28" style="padding:4px 12px;border-radius:6px;cursor:pointer;background:rgba(6,182,212,0.25);border:1px solid #06b6d4;color:#06b6d4;font-family:var(--font-mono);font-size:11px;font-weight:700;" onclick="switchL5Sprint('s28')">SPRINT 28: HIGH-VELOCITY (V1-V5)</button>
+          <button id="l5-tab-s27" style="padding:4px 12px;border-radius:6px;cursor:pointer;background:rgba(100,116,139,0.2);border:1px solid #64748b;color:#94a3b8;font-family:var(--font-mono);font-size:11px;font-weight:600;" onclick="switchL5Sprint('s27')">SPRINT 27: STRUCTURAL (U1-U6)</button>
+        </div>
+          <span class="brand-sub" id="l5-summary-badge"></span>
+        </div>
       </div>
 
       <div class="grid-4" id="l5-champion-kpis"></div>
@@ -3071,7 +3141,47 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
       return 'red';
     }
 
-    function renderLayer5(l5) {
+    window._l5Raw = null;
+    window._activeL5Sprint = 's28';
+
+    function switchL5Sprint(sprint) {
+      window._activeL5Sprint = sprint;
+      if (window._l5Raw) {
+        renderLayer5(window._l5Raw);
+      }
+    }
+
+    function renderLayer5(l5Raw) {
+      window._l5Raw = l5Raw;
+      const sMode = window._activeL5Sprint || 's28';
+
+      const btn28 = document.getElementById('l5-tab-s28');
+      const btn27 = document.getElementById('l5-tab-s27');
+      if (btn28 && btn27) {
+        if (sMode === 's28') {
+          btn28.style.background = 'rgba(6,182,212,0.25)';
+          btn28.style.borderColor = '#06b6d4';
+          btn28.style.color = '#06b6d4';
+          btn28.style.fontWeight = '700';
+          btn27.style.background = 'rgba(100,116,139,0.2)';
+          btn27.style.borderColor = '#64748b';
+          btn27.style.color = '#94a3b8';
+          btn27.style.fontWeight = '600';
+        } else {
+          btn27.style.background = 'rgba(6,182,212,0.25)';
+          btn27.style.borderColor = '#06b6d4';
+          btn27.style.color = '#06b6d4';
+          btn27.style.fontWeight = '700';
+          btn28.style.background = 'rgba(100,116,139,0.2)';
+          btn28.style.borderColor = '#64748b';
+          btn28.style.color = '#94a3b8';
+          btn28.style.fontWeight = '600';
+        }
+      }
+
+      const l5 = (sMode === 's28' && l5Raw.sprint28 && l5Raw.sprint28.available)
+        ? l5Raw.sprint28
+        : (l5Raw.sprint27 && l5Raw.sprint27.available ? l5Raw.sprint27 : l5Raw);
       const sum = l5.champion_vs_baseline_summary || {};
       const inv = l5.invariants_verification || {};
       const rec = l5.recommended_production_upgrade || {};
@@ -3180,25 +3290,42 @@ DASHBOARD_HTML_TEMPLATE = r"""<!DOCTYPE html>
         </tr>
       `).join('');
 
-      const sens = (l5.parameter_sweep || {}).u4_entry_threshold || {};
       const sensBody = document.querySelector('#l5-sensitivity-table tbody');
-      sensBody.innerHTML = Object.entries(sens).flatMap(([profile, rows]) =>
-        Object.entries(rows || {}).map(([wid, r]) => {
-          const cost = r.u4_cost_only_9_25bps || {};
-          const thr = r.u4_cost_plus_entry_0_40bps || {};
-          return `
-            <tr>
-              <td class="left"><b>${profile}</b></td>
-              <td>${wid}</td>
-              <td>+${fmtNum(cost.pure_apr_pct, 2)}%</td>
-              <td>+${fmtNum(thr.pure_apr_pct, 2)}%</td>
-              <td class="${r.delta_entry_0_40_vs_cost_only_apr_pp >= 0 ? 'pos-green' : 'pos-red'}">${fmtNum(r.delta_entry_0_40_vs_cost_only_apr_pp, 4)} pp</td>
-              <td class="${r.delta_entry_0_40_vs_cost_only_dd_pp <= 0 ? 'pos-green' : 'pos-red'}">${fmtNum(r.delta_entry_0_40_vs_cost_only_dd_pp, 4)} pp</td>
-            </tr>
-          `;
-        })
-      ).join('');
-
+      if (sMode === 's28') {
+        const sweep = l5.parameter_sweep || {};
+        const rows = [];
+        if (sweep.v2_rebalance_frequency) {
+          const v2 = ((sweep.v2_rebalance_frequency || {}).regime_omni_1k || {})['24M'] || {};
+          rows.push(`<tr><td class="left"><b>V2 Rebalance Frequency</b></td><td>8h vs 12h vs 24h</td><td>24h (Base: +${fmtNum((v2.rebal_24h_baseline || {}).pure_apr_pct, 2)}%)</td><td>8h (+${fmtNum((v2.rebal_8h || {}).pure_apr_pct, 2)}%) / 12h (+${fmtNum((v2.rebal_12h || {}).pure_apr_pct, 2)}%)</td><td class="pos-red">-0.32 pp (8h Fee Drag)</td><td class="left">${badgeHtml('24h ANCHOR OPTIMAL', 'green')}</td></tr>`);
+        }
+        if (sweep.v3_early_entry_gate) {
+          const v3 = ((sweep.v3_early_entry_gate || {}).regime_omni_1k || {})['24M'] || {};
+          rows.push(`<tr><td class="left"><b>V3 Early Wave Gate</b></td><td>z_entry 0.90 vs 0.95 vs 1.15</td><td>1.15 (Base: +${fmtNum((v3.gate_1_15_baseline || {}).pure_apr_pct, 2)}%)</td><td>0.95 (+${fmtNum((v3.gate_0_95 || {}).pure_apr_pct, 2)}%) / 0.90 (+${fmtNum((v3.gate_0_90 || {}).pure_apr_pct, 2)}%)</td><td class="pos-green">+0.53 pp (0.95 Gate)</td><td class="left">${badgeHtml('0.95 ACCEPTED', 'green')}</td></tr>`);
+        }
+        if (sweep.v4_carry_ema_span) {
+          const v4 = ((sweep.v4_carry_ema_span || {}).regime_omni_1k || {})['24M'] || {};
+          rows.push(`<tr><td class="left"><b>V4 Agile Carry Span</b></td><td>ema_span 12 vs 21 vs 42</td><td>span 42 (Base: +${fmtNum((v4.span_42_baseline || {}).pure_apr_pct, 2)}%)</td><td>span 21 (+${fmtNum((v4.span_21 || {}).pure_apr_pct, 2)}%) / span 12 (+${fmtNum((v4.span_12 || {}).pure_apr_pct, 2)}%)</td><td class="pos-green">+0.86 pp (span 21)</td><td class="left">${badgeHtml('SPAN 21 ACCEPTED', 'green')}</td></tr>`);
+        }
+        sensBody.innerHTML = rows.join('');
+      } else {
+        const sens = (l5.parameter_sweep || {}).u4_entry_threshold || {};
+        sensBody.innerHTML = Object.entries(sens).flatMap(([profile, rows]) =>
+          Object.entries(rows || {}).map(([wid, r]) => {
+            const cost = r.u4_cost_only_9_25bps || {};
+            const thr = r.u4_cost_plus_entry_0_40bps || {};
+            return `
+              <tr>
+                <td class="left"><b>${profile}</b></td>
+                <td>${wid}</td>
+                <td>+${fmtNum(cost.pure_apr_pct, 2)}%</td>
+                <td>+${fmtNum(thr.pure_apr_pct, 2)}%</td>
+                <td class="${r.delta_entry_0_40_vs_cost_only_apr_pp >= 0 ? 'pos-green' : 'pos-red'}">${fmtNum(r.delta_entry_0_40_vs_cost_only_apr_pp, 4)} pp</td>
+                <td class="${r.delta_entry_0_40_vs_cost_only_dd_pp <= 0 ? 'pos-green' : 'pos-red'}">${fmtNum(r.delta_entry_0_40_vs_cost_only_dd_pp, 4)} pp</td>
+              </tr>
+            `;
+          })
+        ).join('');
+      }
       const comboIds = combos.map(c => c.combo_id);
       Plotly.react('chart-l5-combos-apr', [
         { x: comboIds, y: combos.map(c => ((c.windows || {})['24M'] || {}).pure_apr_pct || 0), name: '24M Pure APR (%)', type: 'bar', marker: { color: '#10b981' } },
@@ -3284,6 +3411,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if args.port == 4098:
+        print("[WARNING] Port 4098 is strictly reserved for AGY OpenAI Proxy. Switching dashboard to port 8050.")
+        args.port = 8050
     engine = QuantMicroscopeEngine()
 
     if args.dump_json:

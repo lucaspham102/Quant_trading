@@ -1,9 +1,9 @@
 # BÁO CÁO PHÂN TÍCH CHUYÊN SÂU HỆ THỐNG GIAO DỊCH ĐỊNH LƯỢNG (CODEBASE DEEP DIVE)
 
-> **Phiên bản kiến trúc**: Sprint 28 + Nâng cấp Vận hành 24/7 Chu kỳ 105 & Bản vá Forensic Chu kỳ 17 (Multi-Sleeve Barbell & 4-Profile 24/7 Live Tournament Engine)
-> **Trạng thái kiểm thử**: **874 / 874 Unit & Integration Tests PASSED (100%)**
-> **Trạng thái vận hành**: Chu kỳ 105 (`SYNCED`), sẵn sàng treo 24/7 trên PC / Laptop với cơ chế chống Sleep, chống sập nguồn (`.bak` + `fsync`), tự chờ mạng phục hồi, tự bù lệch đồng hồ máy chủ (`-1021`), tự gỡ deadlock và cảnh báo Telegram thông minh.
-> ** Mục tiêu thiết kế**: Kiến trúc Giao dịch Định lượng Đa chiến lược (Multi-Sleeve Quantitative Portfolio) kết hợp thu hoạch **Delta-Neutral Cash & Carry**, **Cross-Sectional Relative-Value Overlay**, và **Long-Only Triple-Confirmed Trend Sleeve** trên rổ 12 tài sản thanh khoản cao nhất sàn Binance (Spot & USDⓈ-M Futures) cùng dữ liệu liên sàn Bybit & OKX.
+> **Phiên bản kiến trúc**: Post-Sprint 28 Ultimate Champion (U3 + U4 + U5 + F4 Dual-Horizon Trend 72/336/1440h) & Vận hành 24/7 (Multi-Sleeve Barbell & 4-Profile 24/7 Live Tournament Engine)
+> **Trạng thái kiểm thử**: **876 / 876 Unit & Integration Tests PASSED (100%)**
+> **Trạng thái vận hành**: Chu kỳ 105+ (`SYNCED`), sẵn sàng treo 24/7 trên PC / Laptop với cơ chế chống Sleep, chống sập nguồn (`.bak` + `fsync`), tự chờ mạng phục hồi, tự bù lệch đồng hồ máy chủ (`-1021`), tự gỡ deadlock và cảnh báo Telegram thông minh.
+> ** Mục tiêu thiết kế**: Kiến trúc Giao dịch Định lượng Đa chiến lược (Multi-Sleeve Quantitative Portfolio) kết hợp thu hoạch **Delta-Neutral Cash & Carry**, **Cross-Sectional Relative-Value Overlay**, và **Directional Trend Sleeve (Long + Short với F4 Dual-Horizon)** trên rổ 8 tài sản thanh khoản cao nhất sàn Binance (`LIQUID_8_SYMBOLS`) cùng dữ liệu liên sàn Bybit & OKX (loại bỏ U6 mở rộng 12 đồng sau kiểm chứng Falsification).
 
 ---
 
@@ -37,8 +37,15 @@ Hệ thống không phải là một bot chỉ báo kỹ thuật đơn lẻ, mà
    - Xây dựng hệ thống đăng ký cấu hình chiến lược (`src/strategy_profiles.py` với 12 profiles) và động cơ giải đấu song song 4 cấu hình `$1,000` (`scripts/run_parallel_live_demo.py`): 1 profile bắn lệnh thật trên Binance Testnet (`regime_omni_1k`) đấu trực tiếp với 3 profile chạy giả lập thời gian thực (`flexible_regime_1k`, `carry_max_eta_1k`, `baseline_1k`).
    - Thiết lập cơ chế **Isolated Baseline Delta Accounting (`testnet_baseline.json`)** để bóc tách chính xác PnL của riêng giải đấu khỏi số dư 10,000 USDT mặc định và các vị thế có sẵn trên ví Testnet.
 
-4. **Giai đoạn IV (Chu kỳ 105): Tinh Gọn Alpha Thực Chiến & Chống Đứt Gãy Toàn Diện (24/7 Laptop/PC Hardening)**
-   - **Tinh gọn Alpha (Alpha Pruning)**: Sau 104 giờ chạy thực tế và kiểm chứng dữ liệu lịch sử 2022–2026, hệ thống đã tắt hoàn toàn nhánh Reversal (`enable_reversal_sleeve = False`) và tắt chiều Short của nhánh Trend (`allow_short_trend = False`), giảm vòng quay danh mục (`carry_min_hold_bars = 96`, `carry_buffer_rank = 4`, `overlay_rebalance_hours = 72`, `trend_z_entry = 1.25`). Kết quả backtest đạt **+41.78% Pure Alpha (+72.52% kèm lãi tiền nhàn rỗi), Sharpe 1.24, MaxDD -6.68%**.
+4. **Giai đoạn IV (Sprint 27 & 28): Nâng cấp Champion (U3, U4, U5) & Ultimate Trend Champion F4 Dual-Horizon**
+   - **Gói nâng cấp Champion Sprint 27 (U3 + U4 + U5)**:
+     - **`U4` Blended Cost (9.25 bps)**: Tối ưu phí thực tế cho dòng lệnh Maker-first trên Binance, giữ nguyên `entry_threshold = 0.45 bps`.
+     - **`U5` Split-Wallet Optimization**: Tái cơ cấu `carry_max_eta_1k` sang `$700/$300` (`carry_eta = 0.78`) giải phóng kẹp trần Futures, kèm `dynamic_transfer_flat = True`.
+     - **`U3` Emergency Negative Funding Exit**: Tự động thoát sớm sau 12 kỳ nếu $f_{ewma} < -1.0 \text{ bps/8h}$.
+   - **Nhà Vô Địch Toàn Diện Sprint 28 (`F4_DUAL_72_336_1440`)**:
+     - Phát hiện và giải quyết triệt để điểm nghẽn 2023–2024 của EMA nhanh thông qua **Dual-Horizon Composite Momentum** ($Z_{\text{comp}} = \max(Z_{\text{fast}}, Z_{\text{slow}})$) kết hợp bộ ba EMA $72\text{h}/336\text{h}/1440\text{h}$, khung $168\text{h}/504\text{h}$ & $504\text{h}/1440\text{h}$, và biến động $\sigma_{240\text{h}}$.
+     - Chuẩn hóa tham số: `carry_min_hold_bars = 63`, `carry_buffer_rank = 3`, `overlay_rebalance_hours = 48`, `allow_short_trend = True` (`short_gross_scale = 0.75 / 0.65`).
+     - Đưa 24M Pure APR lên **+18.51%** (Sharpe 1.56, MaxDD 7.10%), 3.5Y Return đạt **+77.54%** (Sharpe 1.70), PnL dương vững chắc ở cả 4 năm (2023: +$66.1, 2024: +$380.5, 2025: +$136.7, 2026: +$191.1).
    - **Chống đứt gãy 24/7**: Bổ sung ngăn Windows tự Sleep (`prevent_windows_sleep`), sao lưu & tự phục hồi trạng thái từ `.json.bak` khi sập nguồn, tự chờ mạng Wi-Fi/Internet phục hồi (`wait_for_network_connectivity`), báo cáo Telegram HTML thông minh theo 5 mốc sự kiện và bảng điểm Terminal Unicode/ANSI trực quan.
 
 ---
@@ -172,13 +179,14 @@ d:\Quant_trading\
 - **[`src/multi_exchange_loader.py`](file:///d:/Quant_trading/src/multi_exchange_loader.py)**: Đồng bộ hóa dữ liệu từ 3 sàn **Binance, Bybit, OKX** về cùng lưới thời gian 1 giờ UTC, chuẩn hóa Funding Rate từ chu kỳ 8h về tỷ lệ hàng giờ để so sánh công bằng.
 
 ### 4.2. Nhóm Chiến lược Đa Nhánh (`dynamic_carry_basis.py`, `barbell_portfolio.py`, `directional_trend_sleeve.py`, `strategy_profiles.py`)
-- **[`src/dynamic_carry_basis.py`](file:///d:/Quant_trading/src/dynamic_carry_basis.py) & [`src/cross_exchange_carry.py`](file:///d:/Quant_trading/src/cross_exchange_carry.py)**: Tính toán lợi suất kỳ vọng của vị thế Cash & Carry từ trung bình trượt Funding Rate (72h/168h) kết hợp tốc độ hội tụ Basis. Áp dụng cơ chế **Hysteresis Buffer (`carry_buffer_rank = 4`)** và thời gian nắm giữ tối thiểu (`carry_min_hold_bars = 96` giờ) để tránh đảo danh mục khi thứ hạng chênh lệch nhỏ.
+- **[`src/dynamic_carry_basis.py`](file:///d:/Quant_trading/src/dynamic_carry_basis.py) & [`src/cross_exchange_carry.py`](file:///d:/Quant_trading/src/cross_exchange_carry.py)**: Tính toán lợi suất kỳ vọng của vị thế Cash & Carry từ trung bình trượt Funding Rate (72h/168h) kết hợp tốc độ hội tụ Basis. Áp dụng cơ chế **Hysteresis Buffer (`carry_buffer_rank = 3`)** và thời gian nắm giữ tối thiểu (`carry_min_hold_bars = 63` giờ / kỳ funding) để tránh đảo danh mục khi thứ hạng chênh lệch nhỏ, kết hợp U3 Emergency Exit khi funding sập âm (< -1.0 bps).
 - **[`src/barbell_portfolio.py`](file:///d:/Quant_trading/src/barbell_portfolio.py)**: Điều phối phân bổ vốn giữa Lõi Carry và Nhánh **Cross-Sectional Momentum Overlay**. Tích hợp bộ lọc **Dispersion SNR Gate** (chỉ bật Overlay khi độ phân tán lợi suất giữa các đồng coin đủ lớn) và hàm [`enforce_overlay_dollar_neutrality`](file:///d:/Quant_trading/src/barbell_portfolio.py#L430-L510) để ép độ lệch Long/Short sau khi làm tròn lô xuống dưới $\$10$.
 - **[`src/directional_trend_sleeve.py`](file:///d:/Quant_trading/src/directional_trend_sleeve.py)**:
   - Tính điểm xu hướng chuẩn hóa biến động trên 3 khung thời gian: Ngắn hạn ($336\text{h} = 14\text{d}$), Trung hạn ($504\text{h} = 21\text{d}$) và Dài hạn ($720\text{h} = 30\text{d}$).
   - **Cổng đồng thuận 3 tầng (Triple Confirmation)**: Chỉ mở vị thế khi cả 3 khung thời gian cùng dương và điểm tổng hợp vượt ngưỡng `trend_z_entry = 1.25`.
-  - **Chế độ Long-Only (`allow_short_trend = False`)**: Chỉ bắt sóng tăng giá thực sự của thị trường Crypto, loại bỏ rủi ro Short Squeeze.
-  - **Cầu chì sụt giảm 2 tầng (`compute_trend_sleeve_circuit_breaker`)**: Tự động giảm nửa quy mô khi nhánh Trend sụt giảm chạm ngưỡng Tier 1 ($2.5\%$) và đóng băng nghỉ ngơi (`COOLDOWN`) khi chạm ngưỡng Tier 2 ($4.5\%$).
+  - **Cơ chế Động lượng Kép Dual-Horizon (`enable_dual_horizon = True` — F4)**: Kết hợp nhạy bén sóng ngắn $168\text{h}/504\text{h}$ và sóng dài vĩ mô $504\text{h}/1440\text{h}$ qua $Z_{\text{comp}} = \max(Z_{\text{fast}}, Z_{\text{slow}})$, triệt tiêu hiện tượng rớt hàng non trong bull run và bắt trọn nhịp hồi phân hóa 2025–2026.
+  - **Hỗ trợ 2 chiều Long & Short (`allow_short_trend = True`)**: Chiều Short kích hoạt khi Bear Breadth $\ge 0.75$ và BTC sập gãy vĩ mô, thu hẹp quy mô qua `short_gross_scale = 0.75 / 0.65` và bảo vệ bởi Anti-Squeeze Funding Guard.
+  - **Cầu dao sụt giảm 2 tầng (`DrawdownCircuitBreaker`)**: Tự động giảm 50% quy mô khi Soft DD chạm 6.0% và khóa 168h khi Hard DD chạm 10.0%.
 - **[`src/strategy_profiles.py`](file:///d:/Quant_trading/src/strategy_profiles.py)**: Quản lý 12 cấu hình chiến lược trong `PROFILE_REGISTRY`, nổi bật là 4 cấu hình đang thi đấu trực tiếp:
   1. `regime_omni_1k` (**TESTNET_REAL**): Đa nhánh thích ứng theo chế độ thị trường (Carry + XS Overlay + Long-Only Trend).
   2. `flexible_regime_1k` (**SHADOW_LIVE**): Đa nhánh linh hoạt với tỷ trọng co giãn mượt.
@@ -237,11 +245,11 @@ $$\text{Total Equity Return} = \underbrace{R_{\text{Carry}}}_{\text{Funding + Ba
 | Thành phần | Trước Chu kỳ 105 | Sau Chu kỳ 105 (Hiện tại) | Lý do Định lượng & Thực nghiệm |
 | :--- | :--- | :--- | :--- |
 | **Nhánh Reversal (`enable_reversal_sleeve`)** | Bật (`True`) | **Tắt (`False`)** | Giao dịch đảo chiều ngắn hạn bị phí giao dịch ăn mòn âm PnL trong cả thực tế lẫn backtest. |
-| **Chiều Short của Trend (`allow_short_trend`)** | Cho phép Short | **Chỉ đánh Long (`False`)** | Crypto có độ lệch dương (positive skew); Short xu hướng dễ dính bẫy Short Squeeze khi thị trường hồi phục chữ V. |
-| **Ngưỡng vào lệnh Trend (`trend_z_entry`)** | $0.85 - 1.00$ | **$1.25$** | Chỉ giải ngân khi xu hướng tăng thực sự mạnh trên cả 3 khung 14d/21d/30d. |
-| **Số cặp Carry (`carry_top_k`) & Đệm (`buffer_rank`)** | Top 2, Buffer 3 | **Top 3, Buffer 4** | Đa dạng hóa thu hoạch Funding trên 3 đồng coin tốt nhất, chỉ đảo vị thế khi văng khỏi Top 4. |
-| **Chu kỳ giữ Carry (`carry_min_hold_bars`)** | 48 giờ | **96 giờ (4 ngày)** | Giảm một nửa chi phí đảo chân Spot/Perp, giữ trọn vẹn chuỗi Funding dương. |
-| **Chu kỳ tái cân bằng Overlay (`overlay_rebalance_hours`)** | 24 – 48 giờ | **72 giờ (3 ngày)** | Giảm nhiễu giao dịch thiết diện ngang, tối ưu hóa tỷ lệ Alpha / Chi phí. |
+| **Chiều Short của Trend (`allow_short_trend`)** | Long-Only cũ | **BẬT (`True`, scale 0.75 / 0.65)** | Bổ sung nguồn thu trong thị trường giá xuống, được bảo vệ nghiêm ngặt bởi Anti-Squeeze Funding Guard ($\ge -0.25$ bps) và Macro Bear Breadth ($\ge 0.75$). |
+| **Khung thời gian Trend (`trend_ema_fast/med/slow`)** | $168\text{h}/504\text{h}/1440\text{h}$ | **$72\text{h}/336\text{h}/1440\text{h}$ + Dual-Horizon F4** | Bắt nhịp bứt phá sớm qua EMA 72h và Dual-Horizon $168\text{h}/504\text{h}$, đồng thời neo giữ sóng lớn qua EMA 1440h và $504\text{h}/1440\text{h}$. |
+| **Số cặp Carry (`carry_top_k`) & Đệm (`buffer_rank`)** | Top 3, Buffer 2 | **Top 3, Buffer 3** (`Top 2` trên `carry_max_eta_1k`) | Thu hoạch Funding ổn định trên rổ `LIQUID_8_SYMBOLS`, chỉ đảo vị thế khi rơi khỏi Top 6. |
+| **Chu kỳ giữ Carry (`carry_min_hold_bars`)** | 24 - 48 giờ | **63 giờ / kỳ** | Tối ưu hóa chu kỳ luân chuyển vốn, đảm bảo thu đủ tiền funding bù đắp phí giao dịch 2 chiều. |
+| **Chu kỳ tái cân bằng Overlay (`overlay_rebalance_hours`)** | 24 - 72 giờ | **48 giờ (2 ngày)** | Khớp nhịp phân tán biến động Cross-Sectional, cân bằng hoàn hảo giữa tính nhạy bén và chi phí giao dịch. |
 
 ---
 

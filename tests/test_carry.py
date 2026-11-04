@@ -239,7 +239,8 @@ def test_carry_config_costs_and_eta() -> None:
         perp_fee=0.0005,
         slippage=0.0002,
     )
-    assert cfg_2leg.one_way_cost() == pytest.approx(0.00165)
+    # Sprint 27 U4: Maker-First Blended Cost 9.25 bps/chiều (18.5 bps khứ hồi)
+    assert cfg_2leg.one_way_cost() == pytest.approx(0.000925)
     assert cfg_2leg.notional_eta() == pytest.approx(2.0 / 3.0)
 
     # Cấu trúc không hợp lệ

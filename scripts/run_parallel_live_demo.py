@@ -1890,6 +1890,16 @@ def apply_trend_sleeve(
         short_gross_scale=(
             float(raw_short_scale) if allow_short and raw_short_scale is not None else 0.65
         ),
+        ema_fast_hours=int(getattr(profile, "trend_ema_fast_hours", 168)),
+        ema_med_hours=int(getattr(profile, "trend_ema_med_hours", 504)),
+        ema_slow_hours=int(getattr(profile, "trend_ema_slow_hours", 1440)),
+        vol_window_hours=int(getattr(profile, "trend_vol_window_hours", 336)),
+        short_horizon_hours=int(getattr(profile, "trend_short_horizon_hours", 504)),
+        long_horizon_hours=int(getattr(profile, "trend_long_horizon_hours", 1440)),
+        trail_k_sigma=float(getattr(profile, "trend_trail_k_sigma", 3.0)),
+        min_long_er=float(getattr(profile, "trend_min_long_er", 0.16)),
+        min_bull_breadth=float(getattr(profile, "trend_min_bull_breadth", 0.375)),
+        enable_dual_horizon=bool(getattr(profile, "trend_enable_dual_horizon", False)),
     )
     state = TrendSleeveState.from_snapshot(ledger.get("trend_sleeve_state"))
     if funding_bps is None:

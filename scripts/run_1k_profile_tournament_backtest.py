@@ -152,6 +152,7 @@ def build_market_matrices(
     *,
     w_basis: float = 0.0,
     basis_clip_bps: float | None = None,
+    carry_ema_span: int = 42,
 ) -> dict[str, Any]:
     """Build causal market matrices.
 
@@ -184,7 +185,7 @@ def build_market_matrices(
     fund_df = pd.DataFrame(fund, index=index)[symbols].fillna(0.0)
 
     cfg = DynamicCarryConfig(
-        initial_capital=3000.0, ema_span=42, top_k=4, entry_threshold=0.0,
+        initial_capital=3000.0, ema_span=int(carry_ema_span), top_k=4, entry_threshold=0.0,
         exit_threshold=0.0, min_hold_periods=63, buffer_rank=3, w_basis=float(w_basis),
         basis_ema_hours=168, expected_hold_periods=63,
         switch_rule="tier1b_buffer_rank", eta_override=0.80,
@@ -386,6 +387,16 @@ def simulate_profile(
                 getattr(profile, "require_macro_regime_filter", False)
             ),
             short_gross_scale=float(getattr(profile, "short_gross_scale", 1.0)),
+            ema_fast_hours=int(getattr(profile, "trend_ema_fast_hours", 168)),
+            ema_med_hours=int(getattr(profile, "trend_ema_med_hours", 504)),
+            ema_slow_hours=int(getattr(profile, "trend_ema_slow_hours", 1440)),
+            vol_window_hours=int(getattr(profile, "trend_vol_window_hours", 336)),
+            short_horizon_hours=int(getattr(profile, "trend_short_horizon_hours", 504)),
+            long_horizon_hours=int(getattr(profile, "trend_long_horizon_hours", 1440)),
+            trail_k_sigma=float(getattr(profile, "trend_trail_k_sigma", 3.0)),
+            min_long_er=float(getattr(profile, "trend_min_long_er", 0.16)),
+            min_bull_breadth=float(getattr(profile, "trend_min_bull_breadth", 0.375)),
+            enable_dual_horizon=bool(getattr(profile, "trend_enable_dual_horizon", False)),
         )
         breaker_cfg = DrawdownCircuitBreakerConfig(
             soft_dd_threshold_pct=float(profile.soft_dd_threshold_pct),
@@ -421,9 +432,15 @@ def simulate_profile(
     trend_rebalance_bars = max(1, int(getattr(profile, "trend_rebalance_hours", 24) or 24))
     # Rolling window: 3x slow EMA la du de EMA(1440) hoi tu, dong thoi giu chi phi tinh toan
     # trong tam kiem soat (moi lan tai can bang chi doc ~4,320 bar gan nhat).
-    trend_window = 3 * int(TrendSleeveConfig().ema_slow_hours)
+    trend_window = 3 * int(trend_cfg.ema_slow_hours if trend_cfg else TrendSleeveConfig().ema_slow_hours)
     perp_frame = market["perp_close"]
     funding_pnl = basis_pnl = overlay_pnl = fees = cum_yield = 0.0
+    breakout_enabled = bool(getattr(profile, "enable_tactical_breakout", False)) and bool(getattr(profile, "enable_trend_sleeve", False))
+    breakout: dict[str, dict[str, float]] = {}
+    breakout_pnl = 0.0
+    breakout_lookback = int(getattr(profile, "tactical_breakout_lookback_hours", 168) or 168)
+    breakout_max_gross = float(getattr(profile, "tactical_breakout_max_gross_pct", 0.25) or 0.25)
+    breakout_trail_sigma = float(getattr(profile, "tactical_breakout_trail_k_sigma", 2.0) or 2.0)
     max_lev = 0.0
     cap_binds = 0
     slots_sum = 0
@@ -474,6 +491,12 @@ def simulate_profile(
                 d_pp = perp[t, i_r] - perp[t - 1, i_r]
                 if np.isfinite(d_pp):
                     reversal_pnl += pos["qty"] * d_pp
+            if breakout_enabled:
+                for s, pos in list(breakout.items()):
+                    d_pp = perp[t, sidx[s]] - perp[t - 1, sidx[s]]
+                    if np.isfinite(d_pp):
+                        breakout_pnl += pos["qty"] * d_pp
+                        pos["peak"] = max(pos["peak"], float(perp[t, sidx[s]]))
 
         # Sprint 27: EWMA funding (causal, cap nhat tai moi su kien funding, ke ca warmup).
         if is_fund[t]:
@@ -510,6 +533,12 @@ def simulate_profile(
                 f = fund[t, i]
                 if np.isfinite(f) and np.isfinite(perp[t, i]):
                     reversal_pnl += -pos["qty"] * perp[t, i] * f
+            if breakout_enabled:
+                for s, pos in breakout.items():
+                    i = sidx[s]
+                    f = fund[t, i]
+                    if np.isfinite(f) and np.isfinite(perp[t, i]):
+                        breakout_pnl += -pos["qty"] * perp[t, i] * f
 
         if traded and is_fund[t]:
             valid = [
@@ -630,7 +659,8 @@ def simulate_profile(
                             abs(float(pos["qty"]) * (float(spot[t, i]) - float(perp[t, i]))),
                         )
 
-        if traded and t % _OVERLAY_STEP_BARS == 0:
+        ov_step_bars = max(1, int(getattr(profile, "overlay_rebalance_hours", _OVERLAY_STEP_BARS) or _OVERLAY_STEP_BARS))
+        if traded and t % ov_step_bars == 0:
             n_ov_rebal += 1
             row = snr[t]
             vo = [
@@ -736,7 +766,7 @@ def simulate_profile(
 
         # ---- Sprint 26: 2-tier circuit breaker tren equity mark-to-market, roi moi tai can bang trend
         if trend_enabled:
-            eq_now = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl - fees
+            eq_now = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl + breakout_pnl - fees
             trend_peak_equity = max(trend_peak_equity, eq_now)
             pending_bars = None if trend_hard_lock_bars is None else trend_hard_lock_bars + 1
             cb = evaluate_drawdown_circuit_breaker(
@@ -938,9 +968,51 @@ def simulate_profile(
                                 (carry_n + ov_n + tr_n + rev_gross) / float(profile.futures_wallet_usd),
                             )
 
+        # ---- Sprint 28: tactical breakout sub-sleeve (168h Donchian + Vol Squeeze when macro trend is FLAT)
+        if breakout_enabled and traded:
+            # Check trailing stop and trend conflict for existing breakout positions
+            for s in list(breakout):
+                px = float(perp[t, sidx[s]])
+                pos = breakout[s]
+                lo_b = max(0, t - breakout_lookback)
+                diffs = np.diff(perp[lo_b : t + 1, sidx[s]])
+                std_168 = float(np.nanstd(diffs)) if len(diffs) > 10 else 0.0
+                trailing_hit = (pos["peak"] - px) >= (breakout_trail_sigma * std_168) if std_168 > 0 else False
+                trend_active = bool(trend and s in trend)
+                if trailing_hit or trend_active:
+                    fees += abs(pos["qty"]) * px * cost_perp
+                    del breakout[s]
+
+            # Enter when macro trend is FLAT (no active trend positions)
+            if not trend and (t - tstart) % 8 == 0:
+                btc_ok = True
+                btc_idx = sidx.get("BTC/USDT:USDT")
+                if btc_idx is not None and t >= 168:
+                    btc_ma = float(np.nanmean(perp[t - 168 : t, btc_idx]))
+                    btc_ok = float(perp[t, btc_idx]) >= btc_ma
+
+                if btc_ok and len(breakout) < 2:
+                    for s in syms:
+                        if s in breakout or not _ok(perp[t, sidx[s]]) or cum_valid[t, sidx[s]] < min_warmup_bars:
+                            continue
+                        if t < breakout_lookback + 5:
+                            continue
+                        donchian_h = float(np.nanmax(perp[t - breakout_lookback : t, sidx[s]]))
+                        px_now = float(perp[t, sidx[s]])
+                        px_prev = float(perp[t - 1, sidx[s]])
+                        if px_now > donchian_h and px_prev <= donchian_h:
+                            bo_budget = (cap_usd * breakout_max_gross) / 2.0
+                            step_sz = TOURNAMENT_LOT_STEPS.get(s, 0.001)
+                            q = _floor_to_step(bo_budget / px_now, step_sz)
+                            if q * px_now >= 10.0:
+                                fees += q * px_now * cost_perp
+                                breakout[s] = {"qty": q, "entry": px_now, "peak": px_now, "bar": float(t)}
+                                if len(breakout) >= 2:
+                                    break
+
         k = t - start
         if traded:
-            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl - fees
+            eq[k] = cap_usd + funding_pnl + basis_pnl + overlay_pnl + trend_pnl + reversal_pnl + breakout_pnl - fees
             deployed = {
                 s: p["qty"] * spot[t, sidx[s]] for s, p in carry.items() if np.isfinite(spot[t, sidx[s]])
             }
@@ -974,12 +1046,13 @@ def simulate_profile(
         "short_trend_pnl_usd": float(short_trend_pnl),
         "long_trend_pnl_usd": float(long_trend_pnl),
         "reversal_pnl_usd": float(reversal_pnl),
+        "breakout_pnl_usd": float(breakout_pnl),
         "accounting_delta_usd": float(
             round(
                 (float(eq[-1]) - cap_usd)
                 - (
                     funding_pnl + basis_pnl + overlay_pnl
-                    + long_trend_pnl + short_trend_pnl + reversal_pnl - fees
+                    + long_trend_pnl + short_trend_pnl + reversal_pnl + breakout_pnl - fees
                 ),
                 6,
             )
@@ -1096,6 +1169,7 @@ def evaluate_window(
         "short_trend_pnl_usd": sim["short_trend_pnl_usd"],
         "long_trend_pnl_usd": sim["long_trend_pnl_usd"],
         "reversal_pnl_usd": sim["reversal_pnl_usd"],
+        "breakout_pnl_usd": sim.get("breakout_pnl_usd", 0.0),
         "accounting_delta_usd": sim["accounting_delta_usd"],
         "reversal_rebalances": sim["reversal_rebalances"],
         "reversal_skipped_imbalance": sim["reversal_skipped_imbalance"],

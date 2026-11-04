@@ -75,6 +75,22 @@ class StrategyProfileConfig:
     liquid_staking_apy_map: dict[str, float] = field(
         default_factory=lambda: {"ETH": 0.032, "SOL": 0.062}
     )
+    # ---- Sprint 28 Velocity Ablation (V1..V5)
+    trend_ema_fast_hours: int = 168
+    trend_ema_med_hours: int = 504
+    trend_ema_slow_hours: int = 1440
+    trend_vol_window_hours: int = 336
+    trend_short_horizon_hours: int = 504
+    trend_long_horizon_hours: int = 1440
+    trend_trail_k_sigma: float = 3.0
+    trend_min_long_er: float = 0.16
+    trend_min_bull_breadth: float = 0.375
+    trend_enable_dual_horizon: bool = False
+    enable_tactical_breakout: bool = False
+    tactical_breakout_lookback_hours: int = 168
+    tactical_breakout_max_gross_pct: float = 0.25
+    tactical_breakout_trail_k_sigma: float = 2.0
+    overlay_rebalance_hours: int = 48
 
     def __post_init__(self) -> None:
         if not self.capital_usd > 0:
@@ -191,8 +207,6 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         overlay_target_vol_ann=0.075,
         overlay_gross_pct=0.15,
         max_futures_leverage=3.0,
-        # Sprint 25.1: yield stacking is tracked but never folded into `pure_trading_*`,
-        # so reporting it costs nothing and gives the operator full visibility.
         enable_yield_stacking=True,
     ),
     "canary_400": StrategyProfileConfig(
@@ -289,7 +303,6 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         overlay_gross_pct=0.15,
         max_futures_leverage=3.0,
         enable_yield_stacking=True,
-        # Sprint 26: 100% market-neutral high-utilization carry (khong co trend sleeve).
     ),
     "hybrid_trend_conservative_1k": StrategyProfileConfig(
         name="hybrid_trend_conservative_1k",
@@ -343,7 +356,6 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         soft_dd_threshold_pct=0.06,
         hard_dd_threshold_pct=0.10,
     ),
-    # ---- Sprint 27: 550/450 split -> cong suat futures 1,350 USD (3.0x) thay vi 1,050 USD.
     "bi_trend_carry_1k": StrategyProfileConfig(
         name="bi_trend_carry_1k",
         capital_usd=1000.0,
@@ -427,8 +439,15 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         dynamic_carry_to_alpha_margin=True,
         soft_dd_threshold_pct=0.06,
         hard_dd_threshold_pct=0.10,
+        trend_ema_fast_hours=72,
+        trend_ema_med_hours=336,
+        trend_ema_slow_hours=1440,
+        trend_vol_window_hours=240,
+        trend_short_horizon_hours=168,
+        trend_long_horizon_hours=504,
+        trend_trail_k_sigma=3.0,
+        trend_enable_dual_horizon=True,
     ),
-    # ---- Sprint 28: Market-Structure & Macro Regime Switcher (600 Spot / 400 Futures)
     "flexible_regime_1k": StrategyProfileConfig(
         name="flexible_regime_1k",
         capital_usd=1000.0,
@@ -461,6 +480,14 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         dynamic_carry_to_alpha_margin=True,
         soft_dd_threshold_pct=0.06,
         hard_dd_threshold_pct=0.10,
+        trend_ema_fast_hours=72,
+        trend_ema_med_hours=336,
+        trend_ema_slow_hours=1440,
+        trend_vol_window_hours=240,
+        trend_short_horizon_hours=168,
+        trend_long_horizon_hours=504,
+        trend_trail_k_sigma=3.0,
+        trend_enable_dual_horizon=True,
     ),
 }
 

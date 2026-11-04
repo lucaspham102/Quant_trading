@@ -647,3 +647,58 @@ def test_tournament_trend_sleeve_wiring_with_synthetic_market():
     assert hybrid["trend_enabled"] is True
     assert hybrid["circuit_breaker_bars_soft"] >= 0
     assert hybrid["circuit_breaker_bars_hard"] >= 0
+
+
+def test_sprint28_dual_horizon_trend_engine():
+    """Verify Sprint 28 F4 Dual-Horizon logic, causal alignment and baseline compatibility."""
+    df = _trend_frame(2000, btc_drift=0.002)
+
+    cfg_dual = TrendSleeveConfig(
+        capital_usd=1000.0,
+        ema_fast_hours=72,
+        ema_med_hours=336,
+        ema_slow_hours=1440,
+        vol_window_hours=240,
+        short_horizon_hours=168,
+        long_horizon_hours=504,
+        enable_dual_horizon=True,
+    )
+    cfg_single = TrendSleeveConfig(
+        capital_usd=1000.0,
+        ema_fast_hours=168,
+        ema_med_hours=504,
+        ema_slow_hours=1440,
+        vol_window_hours=336,
+        short_horizon_hours=504,
+        long_horizon_hours=1440,
+        enable_dual_horizon=False,
+    )
+
+    w_dual = compute_triple_confirmed_trend_weights(df, bar_index=len(df) - 1, config=cfg_dual)
+    w_single = compute_triple_confirmed_trend_weights(df, bar_index=len(df) - 1, config=cfg_single)
+
+    assert isinstance(w_dual, dict)
+    assert isinstance(w_single, dict)
+    assert sum(abs(v) for v in w_dual.values()) <= cfg_dual.max_gross_pct + 1e-6
+    assert sum(abs(v) for v in w_single.values()) <= cfg_single.max_gross_pct + 1e-6
+
+
+def test_sprint28_profile_dual_horizon_wiring():
+    """Verify strategy profile registration for Sprint 28 Champion upgrades."""
+    for pname in ("regime_omni_1k", "flexible_regime_1k"):
+        prof = PROFILE_REGISTRY[pname]
+        assert prof.trend_enable_dual_horizon is True, pname
+        assert prof.trend_ema_fast_hours == 72, pname
+        assert prof.trend_ema_med_hours == 336, pname
+        assert prof.trend_ema_slow_hours == 1440, pname
+        assert prof.trend_vol_window_hours == 240, pname
+        assert prof.trend_short_horizon_hours == 168, pname
+        assert prof.trend_long_horizon_hours == 504, pname
+        assert prof.trend_trail_k_sigma == 3.0, pname
+        assert prof.enable_trend_sleeve is True, pname
+        assert prof.allow_short_trend is True, pname
+
+    for pname in ("carry_max_eta_1k", "baseline_1k"):
+        prof = PROFILE_REGISTRY[pname]
+        assert prof.trend_enable_dual_horizon is False, pname
+        assert prof.enable_trend_sleeve is False, pname

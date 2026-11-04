@@ -139,6 +139,7 @@ class TrendSleeveConfig:
     min_long_er: float = 0.16
     min_btc_bear_er: float = 0.20
     min_btc_bear_er_slow: float = 0.20
+    enable_dual_horizon: bool = False
 
     def __post_init__(self) -> None:
         if not self.capital_usd > 0:
@@ -588,22 +589,51 @@ def compute_triple_confirmed_trend_weights(
         sigma_hourly = sigma_vol / math.sqrt(YEAR_HOURS)
         sigma_daily = sigma_hourly * math.sqrt(24.0)
 
-        z_s = r_short / sigma_short if sigma_short > 0.0 else 0.0
-        z_l = r_long / sigma_long if sigma_long > 0.0 else 0.0
-        z_comp = cfg.z_short_weight * z_s + cfg.z_long_weight * z_l
+        if cfg.enable_dual_horizon:
+            # Dual-horizon momentum alignment (Sprint 28 Step 1):
+            # Horizon Pair 1 (Tactical Short-Term): 168h (7d) / 504h (21d)
+            # Horizon Pair 2 (Macro Long-Term): 504h (21d) / 1440h (60d)
+            r_168 = _log_return(series, 168)
+            r_504 = _log_return(series, 504)
+            r_1440 = _log_return(series, 1440)
+            sig_168 = annualized_realized_vol(series, 168) * math.sqrt(168.0 / YEAR_HOURS)
+            sig_504 = annualized_realized_vol(series, 504) * math.sqrt(504.0 / YEAR_HOURS)
+            sig_1440 = annualized_realized_vol(series, 1440) * math.sqrt(1440.0 / YEAR_HOURS)
+            z_168 = r_168 / sig_168 if sig_168 > 0.0 else 0.0
+            z_504 = r_504 / sig_504 if sig_504 > 0.0 else 0.0
+            z_1440 = r_1440 / sig_1440 if sig_1440 > 0.0 else 0.0
+            z_comp_fast = cfg.z_short_weight * z_168 + cfg.z_long_weight * z_504
+            z_comp_slow = cfg.z_short_weight * z_504 + cfg.z_long_weight * z_1440
+            z_comp = max(z_comp_fast, z_comp_slow)
+            z_s = z_168
+            mom_aligned = (r_168 > 0.0 and r_504 > 0.0) or (r_504 > 0.0 and r_1440 > 0.0)
+            emas_ok = (
+                math.isfinite(ema_f) and math.isfinite(ema_m) and math.isfinite(ema_s)
+            )
+            aligned = bool(
+                emas_ok
+                and (px_now > ema_f)
+                and (ema_f > ema_m)
+                and (ema_m > ema_s)
+                and mom_aligned
+            )
+        else:
+            z_s = r_short / sigma_short if sigma_short > 0.0 else 0.0
+            z_l = r_long / sigma_long if sigma_long > 0.0 else 0.0
+            z_comp = cfg.z_short_weight * z_s + cfg.z_long_weight * z_l
 
-        # Evidence 1: multi-horizon alignment
-        emas_ok = (
-            math.isfinite(ema_f) and math.isfinite(ema_m) and math.isfinite(ema_s)
-        )
-        aligned = bool(
-            emas_ok
-            and (px_now > ema_f)
-            and (ema_f > ema_m)
-            and (ema_m > ema_s)
-            and (r_short > 0.0)
-            and (r_long > 0.0)
-        )
+            # Evidence 1: multi-horizon alignment
+            emas_ok = (
+                math.isfinite(ema_f) and math.isfinite(ema_m) and math.isfinite(ema_s)
+            )
+            aligned = bool(
+                emas_ok
+                and (px_now > ema_f)
+                and (ema_f > ema_m)
+                and (ema_m > ema_s)
+                and (r_short > 0.0)
+                and (r_long > 0.0)
+            )
 
         # Evidence 2: risk-adjusted momentum conviction
         conviction = bool(math.isfinite(z_comp) and (z_comp >= cfg.z_entry))
@@ -636,9 +666,14 @@ def compute_triple_confirmed_trend_weights(
         short_conviction = False
         z_short = 0.0
         if cfg.allow_short_trend:
-            r_fast = _log_return(series, SHORT_FAST_HORIZON_HOURS)
-            sigma_fast_ann = annualized_realized_vol(series, SHORT_FAST_HORIZON_HOURS)
-            sigma_fast = sigma_fast_ann * math.sqrt(SHORT_FAST_HORIZON_HOURS / YEAR_HOURS)
+            short_fast_h = (
+                SHORT_FAST_HORIZON_HOURS
+                if int(cfg.short_horizon_hours) >= 504
+                else max(72, int(round(int(cfg.short_horizon_hours) * 2.0 / 3.0)))
+            )
+            r_fast = _log_return(series, short_fast_h)
+            sigma_fast_ann = annualized_realized_vol(series, short_fast_h)
+            sigma_fast = sigma_fast_ann * math.sqrt(short_fast_h / YEAR_HOURS)
             z_fast = r_fast / sigma_fast if sigma_fast > 0.0 else 0.0
             z_short = cfg.z_short_weight * z_fast + cfg.z_long_weight * z_s
             # Pha vo cau truc: gia duoi EMA nhanh < EMA trung han VA 14d/21d deu am.
@@ -720,7 +755,7 @@ def compute_triple_confirmed_trend_weights(
             elif (bull_breadth >= 0.875) and btc_super_bull:
                 long_regime_ok = er_symbol_336 >= max(0.08, float(cfg.min_long_er))
             elif bull_breadth >= cfg.min_bull_breadth:
-                long_regime_ok = er_symbol_336 >= max(0.16, float(cfg.min_long_er))
+                long_regime_ok = er_symbol_336 >= float(cfg.min_long_er)
             else:
                 long_regime_ok = False
             if (
