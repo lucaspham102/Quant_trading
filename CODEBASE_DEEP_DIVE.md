@@ -46,6 +46,7 @@ Hệ thống không phải là một bot chỉ báo kỹ thuật đơn lẻ, mà
      - Phát hiện và giải quyết triệt để điểm nghẽn 2023–2024 của EMA nhanh thông qua **Dual-Horizon Composite Momentum** ($Z_{\text{comp}} = \max(Z_{\text{fast}}, Z_{\text{slow}})$) kết hợp bộ ba EMA $72\text{h}/336\text{h}/1440\text{h}$, khung $168\text{h}/504\text{h}$ & $504\text{h}/1440\text{h}$, và biến động $\sigma_{240\text{h}}$.
      - Chuẩn hóa tham số: `carry_min_hold_bars = 63`, `carry_buffer_rank = 3`, `overlay_rebalance_hours = 48`, `allow_short_trend = True` (`short_gross_scale = 0.75 / 0.65`).
      - Đưa 24M Pure APR lên **+18.51%** (Sharpe 1.56, MaxDD 7.10%), 3.5Y Return đạt **+77.54%** (Sharpe 1.70), PnL dương vững chắc ở cả 4 năm (2023: +$66.1, 2024: +$380.5, 2025: +$136.7, 2026: +$191.1).
+      - **Bản vá Sửa Lỗi Đồng Bộ Khối Lượng Thực Khớp (`pos.qty == leg2_hedged_qty`) & Tự Chữa Lành State (Self-Healing State Migration)**: Khắc phục triệt để hiện tượng lưu float lý thuyết chưa làm tròn lot step trong `carry_positions` và `positions_snapshot`, tự động đồng bộ hóa khớp 100% với số lượng thực tế trên sàn Binance Testnet ngay khi nạp state cũ.
    - **Chống đứt gãy 24/7**: Bổ sung ngăn Windows tự Sleep (`prevent_windows_sleep`), sao lưu & tự phục hồi trạng thái từ `.json.bak` khi sập nguồn, tự chờ mạng Wi-Fi/Internet phục hồi (`wait_for_network_connectivity`), báo cáo Telegram HTML thông minh theo 5 mốc sự kiện và bảng điểm Terminal Unicode/ANSI trực quan.
 
 ---

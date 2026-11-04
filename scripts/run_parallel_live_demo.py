@@ -728,6 +728,12 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
                 for opt_key in ("spot_qty", "perp_qty", "spot_entry", "perp_entry"):
                     if opt_key in info:
                         leg[opt_key] = _num(info.get(opt_key), 0.0)
+                # Sprint 28: If both spot_qty and perp_qty exist and match real hedge, ensure qty sync
+                if str(leg.get("kind")) == "carry" and "spot_qty" in leg and "perp_qty" in leg:
+                    sq = abs(_num(leg["spot_qty"], 0.0))
+                    pq = abs(_num(leg["perp_qty"], 0.0))
+                    if sq > 1e-12 and pq > 1e-12 and abs(sq - pq) < 1e-9:
+                        leg["qty"] = sq
                 clean_pos[str(sym)] = leg
     ledger["positions_snapshot"] = clean_pos
     return ledger
@@ -1315,6 +1321,11 @@ def refresh_position_ledger(
         # ---- carry leg (spot long + perp short: directional PnL nets out, basis remains)
         c_pos = carry_map.get(sym)
         c_qty = _num(c_pos.get("qty"), 0.0) if isinstance(c_pos, dict) else 0.0
+        if isinstance(c_pos, dict):
+            _l1 = _num(c_pos.get("leg1_filled_qty"), 0.0)
+            _l2 = _num(c_pos.get("leg2_hedged_qty"), 0.0)
+            if _l1 > 1e-12 and _l2 > 1e-12:
+                c_qty = min(_l1, _l2)
         if c_qty == 0.0 and isinstance(c_pos, dict):
             c_notional = _num(c_pos.get("notional"), 0.0)
             if c_notional != 0.0:

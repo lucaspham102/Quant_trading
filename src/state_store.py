@@ -133,7 +133,9 @@ def normalize_carry_position(
     pos: dict[str, Any],
     default_capital: float = 3000.0,
 ) -> dict[str, Any]:
-    """Bổ sung các trường Chân 1/Chân 2 còn thiếu (giữ nguyên giá trị cũ nếu có), không xóa trường lạ."""
+    """Bổ sung các trường Chân 1/Chân 2 còn thiếu (giữ nguyên giá trị cũ nếu có), không xóa trường lạ.
+    Sprint 28: Self-Healing Migration - đồng bộ pos.qty và notional_usdt theo leg2_hedged_qty thực khớp.
+    """
     out = dict(pos)
     defaults = default_leg_state(
         capital=float(out.get("capital", default_capital)),
@@ -143,6 +145,17 @@ def normalize_carry_position(
     for k, v in defaults.items():
         if k not in out:
             out[k] = v
+    # Sprint 28 Self-Healing Migration: sync pos.qty with real filled/hedged quantity
+    l1 = float(out.get("leg1_filled_qty", 0.0) or 0.0)
+    l2 = float(out.get("leg2_hedged_qty", 0.0) or 0.0)
+    if l1 > 1e-12 and l2 > 1e-12:
+        real_hedged = min(l1, l2)
+        cur_qty = float(out.get("qty", 0.0) or 0.0)
+        if abs(cur_qty - real_hedged) > 1e-9:
+            out["qty"] = float(real_hedged)
+            sp_px = float(out.get("entry_spot_price", 0.0) or out.get("entry_perp_price", 0.0) or 0.0)
+            if sp_px > 0.0:
+                out["notional_usdt"] = float(real_hedged * sp_px)
     return out
 
 

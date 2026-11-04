@@ -702,3 +702,44 @@ def test_sprint28_profile_dual_horizon_wiring():
         prof = PROFILE_REGISTRY[pname]
         assert prof.trend_enable_dual_horizon is False, pname
         assert prof.enable_trend_sleeve is False, pname
+
+
+def test_sprint28_carry_position_qty_hedged_sync():
+    """Verify Sprint 28 patch: carry position qty strictly equals hedged filled qty.
+    Also tests self-healing migration when loading unaligned legacy state.
+    """
+    from src.state_store import normalize_carry_position
+
+    # 1. Test normalize_carry_position self-healing
+    raw_pos = {
+        "symbol": "BTC/USDT:USDT",
+        "spot_symbol": "BTC/USDT",
+        "qty": 0.002725892058185676,
+        "entry_spot_price": 77467.59,
+        "entry_perp_price": 77466.6,
+        "notional_usdt": 211.16828834778408,
+        "leg1_filled_qty": 0.002,
+        "leg2_hedged_qty": 0.002,
+        "leg1_status": "FILLED",
+        "execution_state": "HEDGED",
+    }
+    healed = normalize_carry_position(raw_pos, default_capital=1000.0)
+    assert healed["qty"] == pytest.approx(0.002)
+    assert healed["notional_usdt"] == pytest.approx(0.002 * 77467.59)
+
+    # 2. Test refresh_position_ledger in live runner stamps exact filled qty
+    ledger = {
+        "positions_snapshot": {},
+        "last_prices": {"BTC/USDT:USDT": 77500.0},
+    }
+    mock_state = dataclasses.make_dataclass("MockState", [("carry_positions", dict)])(
+        carry_positions={"BTC/USDT:USDT": dict(raw_pos)}
+    )
+    snapshot = {"symbols": {"BTC/USDT:USDT": {"bid": 77490.0, "ask": 77510.0}}}
+    demo.refresh_position_ledger(ledger, mock_state, snapshot, charge_fees=False)
+
+    carry_snap = ledger["positions_snapshot"].get("BTC/USDT:USDT")
+    assert carry_snap is not None
+    assert carry_snap["qty"] == pytest.approx(0.002)
+    assert carry_snap["spot_qty"] == pytest.approx(0.002)
+    assert carry_snap["perp_qty"] == pytest.approx(-0.002)

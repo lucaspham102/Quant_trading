@@ -328,6 +328,8 @@ class CarryLiveExecutor:
                 for k, v in self.state.carry_positions.items()
                 if isinstance(v, dict)
             }
+            # Sprint 28: Self-Healing State Migration on startup
+            self._self_heal_carry_positions()
 
         self.runtime_mode: str = runtime_mode if runtime_mode is not None else str(mode)
         # Sprint 23: khi dinh tuyen lenh THAT (signed_client + execute_real_orders) thi
@@ -443,6 +445,48 @@ class CarryLiveExecutor:
             pos["leg1_filled_qty"] = float(leg1_filled_qty)
             pos["leg2_hedged_qty"] = float(leg2_hedged_qty)
             pos["execution_state"] = execution_state
+            # Sprint 28: Dong bo pos.qty va notional_usdt voi khoi luong thuc khop & hedged
+            l1 = float(leg1_filled_qty)
+            l2 = float(leg2_hedged_qty)
+            if l1 > 1e-12 and l2 > 1e-12:
+                real_hedged = min(l1, l2)
+                pos["qty"] = float(real_hedged)
+                sp_px = float(pos.get("entry_spot_price", 0.0) or pos.get("entry_perp_price", 0.0) or 0.0)
+                if sp_px > 0.0:
+                    pos["notional_usdt"] = float(real_hedged * sp_px)
+
+    def _self_heal_carry_positions(self) -> bool:
+        """Sprint 28: Self-Healing State Migration.
+        Neu phat hien vi the dang mo co leg1_filled_qty > 0 va leg2_hedged_qty > 0
+        ma abs(pos.qty - leg2_hedged_qty) > 1e-9, tu dong dong bo pos.qty = float(leg2_hedged_qty).
+        """
+        changed = False
+        if not hasattr(self.state, "carry_positions") or not isinstance(self.state.carry_positions, dict):
+            return False
+        for sym, pos in self.state.carry_positions.items():
+            if not isinstance(pos, dict):
+                continue
+            l1 = float(pos.get("leg1_filled_qty", 0.0) or 0.0)
+            l2 = float(pos.get("leg2_hedged_qty", 0.0) or 0.0)
+            if l1 > 1e-12 and l2 > 1e-12:
+                real_hedged = min(l1, l2)
+                cur_qty = float(pos.get("qty", 0.0) or 0.0)
+                if abs(cur_qty - real_hedged) > 1e-9:
+                    logger.info(
+                        "Self-healing carry position qty for %s: was %s, synced to real hedged %s",
+                        sym, cur_qty, real_hedged,
+                    )
+                    pos["qty"] = float(real_hedged)
+                    sp_entry = float(pos.get("entry_spot_price", 0.0) or pos.get("entry_perp_price", 0.0) or 0.0)
+                    if sp_entry > 0.0:
+                        pos["notional_usdt"] = float(real_hedged * sp_entry)
+                    changed = True
+        if changed:
+            try:
+                self._persist_state_now()
+            except Exception as _e:
+                logger.warning("Could not persist state after self-healing: %s", _e)
+        return changed
 
     def _lot_step_for_symbol(self, symbol: str) -> float:
         """Sprint 23: step_size cua cap giao dich (fallback 0.001)."""
@@ -3252,6 +3296,8 @@ class CarryLiveExecutor:
         aligned_universe: Optional[dict[str, pd.DataFrame]] = None,
     ) -> dict[str, Any]:
         """Thực hiện một chu kỳ đối soát hoàn chỉnh: tính điểm, kiểm tra ký quỹ, cân bằng danh mục và lưu state."""
+        # Sprint 28: State Self-Healing Migration (dong bo pos.qty == leg2_hedged_qty)
+        self._self_heal_carry_positions()
         # PR-5 & R2-1: Kiem tra Kill-Switch va xu ly vi the ket truoc moi thao tac
         if getattr(self.state, "kill_switch_pending_close", False) and not getattr(self.state, "kill_switch_triggered", False):
             self.state.kill_switch_pending_close = False
@@ -3539,6 +3585,11 @@ class CarryLiveExecutor:
                 sp_curr = float(udf["spot_close"].iloc[-1] if "spot_close" in udf.columns else udf["close"].iloc[-1])
                 pe_curr = float(udf["perp_close"].iloc[-1] if "perp_close" in udf.columns else udf["close"].iloc[-1])
                 qty = float(pos.get("qty", 0.0))
+                l1 = float(pos.get("leg1_filled_qty", 0.0) or 0.0)
+                l2 = float(pos.get("leg2_hedged_qty", 0.0) or 0.0)
+                if l1 > 1e-12 and l2 > 1e-12:
+                    qty = min(l1, l2)
+                    pos["qty"] = float(qty)
                 if qty <= 1e-12:
                     self.state.carry_positions.pop(sym, None)
                     self._persist_state_now()
@@ -3758,15 +3809,16 @@ class CarryLiveExecutor:
                         continue
                     _real_qty = float(_atomic.get("spot_filled_qty", 0.0) or 0.0)
                     _real_perp_qty = float(_atomic.get("perp_filled_qty", 0.0) or 0.0)
+                    _effective_qty = min(_real_qty, _real_perp_qty) if (_real_qty > 0 and _real_perp_qty > 0) else _real_qty
                     _fill_spot_px = float(_atomic.get("spot_avg_price", 0.0) or 0.0) or float(sp_curr)
                     _fill_perp_px = float(_atomic.get("perp_avg_price", 0.0) or 0.0) or float(pe_curr)
-                    _real_notional = _real_qty * _fill_spot_px
+                    _real_notional = _effective_qty * _fill_spot_px
                     _fee = _real_notional * self.get_one_way_fee_rate()
                     _real_allocated = _real_notional / self.carry_config.notional_eta() if self.carry_config.notional_eta() > 0 else _real_notional
                     self.state.carry_positions[sym] = {
                         "symbol": sym,
                         "spot_symbol": spot_sym,
-                        "qty": float(_real_qty),
+                        "qty": float(_effective_qty),
                         "entry_spot_price": float(_fill_spot_px),
                         "entry_perp_price": float(_fill_perp_px),
                         "notional_usdt": float(_real_notional),
