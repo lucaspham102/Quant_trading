@@ -454,6 +454,9 @@ class CarryLiveExecutor:
                 sp_px = float(pos.get("entry_spot_price", 0.0) or pos.get("entry_perp_price", 0.0) or 0.0)
                 if sp_px > 0.0:
                     pos["notional_usdt"] = float(real_hedged * sp_px)
+            elif execution_state == "CLOSED":
+                pos["qty"] = 0.0
+                pos["notional_usdt"] = 0.0
 
     def _self_heal_carry_positions(self) -> bool:
         """Sprint 28: Self-Healing State Migration.
@@ -3605,13 +3608,16 @@ class CarryLiveExecutor:
                     self.state.current_equity += _mtm - _close_fee
                     if _closed_qty >= qty - 1e-12:
                         self.state.carry_positions.pop(sym, None)
+                        self._update_leg_state(sym, "CLOSED", 0.0, 0.0, "CLOSED")
                     else:
                         _rem = max(0.0, qty - _closed_qty)
                         pos["qty"] = float(_rem)
+                        pos["leg1_filled_qty"] = float(_rem)
+                        pos["leg2_hedged_qty"] = float(_rem)
                         pos["notional_usdt"] = float(_rem * sp_curr)
                         pos["execution_state"] = "PARTIAL_CLOSE"
                         resolved_actions[sym] = "HOLD"
-                    self._update_leg_state(sym, "CLOSED", _closed_qty, _closed_qty, "CLOSED")
+                        self._update_leg_state(sym, "HEDGED", float(_rem), float(_rem), "HEDGED")
                     self._persist_state_now()
                     continue
                 logger.error("Atomic carry close NOT filled for %s: %s", sym, _atomic_close.get("reason"))
@@ -3674,14 +3680,16 @@ class CarryLiveExecutor:
 
                     if hedged >= qty - 1e-12:
                         del self.state.carry_positions[sym]
+                        self._update_leg_state(sym, "CLOSED", 0.0, 0.0, "CLOSED")
                     else:
                         rem_qty = max(0.0, qty - hedged)
                         pos["qty"] = float(rem_qty)
                         pos["notional_usdt"] = float(rem_qty * sp_curr)
                         pos["leg1_status"] = leg2_res.get("leg1_status", "PARTIAL_FILLED")
-                        pos["leg1_filled_qty"] = float(filled)
-                        pos["leg2_hedged_qty"] = float(hedged)
+                        pos["leg1_filled_qty"] = float(rem_qty)
+                        pos["leg2_hedged_qty"] = float(rem_qty)
                         pos["execution_state"] = leg2_res.get("execution_state", "MARKET_HEDGE_LEG_2")
+                        self._update_leg_state(sym, "HEDGED", float(rem_qty), float(rem_qty), "HEDGED")
                         if filled <= 1e-12:
                             self.maker_no_fill_count += 1
                 else:
@@ -3770,21 +3778,38 @@ class CarryLiveExecutor:
                         * self.get_one_way_fee_rate()
                         * delta_notional
                     )
-                    pos["qty"] = float(new_qty)
-                    pos["entry_spot_price"] = float(sp_curr)
-                    pos["entry_perp_price"] = float(pe_curr)
-                    pos["notional_usdt"] = float(new_notional)
-                    pos["margin_allocated_usdt"] = float(0.25 * v_i - reb_fee)
-                    self.state.current_equity -= reb_fee
+                    _reb_success = True
                     if self.execute_real_orders and self.signed_client is not None and delta_notional >= DEFAULT_MIN_NOTIONAL:
                         delta_q = float(new_qty - qty)
                         _reb_res = self._execute_atomic_carry_delta(sym, delta_q, -delta_q, float(pe_curr))
                         if not bool(_reb_res.get("ok", False)):
+                            _reb_success = False
                             cycle_exec_errors.append(
                                 f"CARRY_REB_FAILED:{sym}:{_reb_res.get('reason')}"
                             )
+                        else:
+                            sp_filled = float(_reb_res.get("spot_filled_qty", 0.0) or 0.0)
+                            pe_filled = float(_reb_res.get("perp_filled_qty", 0.0) or 0.0)
+                            real_delta = min(sp_filled, pe_filled) if sp_filled > 0 and pe_filled > 0 else abs(delta_q)
+                            if delta_q > 0:
+                                new_qty = qty + real_delta
+                            else:
+                                new_qty = max(0.0, qty - real_delta)
+                            new_notional = new_qty * sp_curr
+
+                    if _reb_success:
+                        pos["qty"] = float(new_qty)
+                        pos["leg1_filled_qty"] = float(new_qty)
+                        pos["leg2_hedged_qty"] = float(new_qty)
+                        pos["entry_spot_price"] = float(sp_curr)
+                        pos["entry_perp_price"] = float(pe_curr)
+                        pos["notional_usdt"] = float(new_notional)
+                        pos["margin_allocated_usdt"] = float(0.25 * v_i - reb_fee)
+                        self.state.current_equity -= reb_fee
+                        self._update_leg_state(sym, "FILLED", float(new_qty), float(new_qty), "HEDGED")
                 else:
                     del self.state.carry_positions[sym]
+                    self._update_leg_state(sym, "CLOSED", 0.0, 0.0, "CLOSED")
 
         # c) Mở vị thế OPEN_DELTA_NEUTRAL
         for sym in self.symbols:
