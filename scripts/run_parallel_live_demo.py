@@ -3266,6 +3266,7 @@ def main(argv: list[str] | None = None) -> int:
                     live_profile=display_live_profile,
                     live_ledger=curr_live_ledger,
                     reasons=tg_reasons,
+                    prev_positions=prev_live_positions,
                 )
                 reason_tag = ",".join(tg_reasons[:2])
                 tg_status_label = f"TG: SENT ({reason_tag})" if sent_ok else f"TG: SENT_FALLBACK ({reason_tag})"

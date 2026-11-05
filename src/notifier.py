@@ -71,6 +71,79 @@ def _infer_trend_direction(
     return "FLAT"
 
 
+def diff_cycle_executions(
+    prev_positions: Optional[Mapping[str, Any]],
+    curr_positions: Optional[Mapping[str, Any]],
+    mid_prices: Optional[Mapping[str, float]] = None,
+    fees_paid_delta: float = 0.0,
+) -> list[dict[str, Any]]:
+    """So sánh snapshot vị thế 2 chu kỳ liên tiếp để trích xuất danh sách lệnh đã thực thi."""
+    p_map = prev_positions if isinstance(prev_positions, Mapping) else {}
+    c_map = curr_positions if isinstance(curr_positions, Mapping) else {}
+    all_keys = set(p_map.keys()) | set(c_map.keys())
+    executions: list[dict[str, Any]] = []
+
+    for key in sorted(all_keys):
+        p = p_map.get(key, {})
+        c = c_map.get(key, {})
+        if not isinstance(p, Mapping):
+            p = {}
+        if not isinstance(c, Mapping):
+            c = {}
+
+        sym = str(c.get("symbol") or p.get("symbol") or str(key).split("|")[0]).replace("/USDT:USDT", "")
+        kind = str(c.get("kind") or p.get("kind") or "overlay").lower()
+        old_q = _num(p.get("qty"), 0.0)
+        new_q = _num(c.get("qty"), 0.0)
+        delta_q = new_q - old_q
+
+        if abs(delta_q) <= 1e-8:
+            continue
+
+        if kind == "carry":
+            sleeve = "Carry"
+            side = "SCALE_UP" if new_q > old_q else "SCALE_DOWN"
+        elif kind == "overlay":
+            sleeve = "Overlay"
+            side = "BUY" if delta_q > 0 else "SELL"
+        elif kind == "trend":
+            sleeve = "Trend"
+            side = "BUY" if delta_q > 0 else "SELL"
+        elif kind == "reversal":
+            sleeve = "Reversal"
+            side = "BUY" if delta_q > 0 else "SELL"
+        else:
+            sleeve = kind.capitalize()
+            side = "BUY" if delta_q > 0 else "SELL"
+
+        fill_px = _num(c.get("entry_price"), 0.0)
+        if fill_px <= 0.0:
+            fill_px = _num(p.get("entry_price"), 0.0)
+        if fill_px <= 0.0 and mid_prices:
+            fill_px = _num(mid_prices.get(sym), 0.0)
+
+        notional = abs(delta_q) * fill_px
+        if notional <= 0.0:
+            notional = abs(_num(c.get("signed_usd"), 0.0) - _num(p.get("signed_usd"), 0.0))
+
+        rate = 0.0008 if kind == "carry" else 0.0004
+        fee = notional * rate
+
+        executions.append({
+            "sleeve": sleeve,
+            "symbol": sym,
+            "side": side,
+            "delta_qty": float(delta_q),
+            "old_qty": float(old_q),
+            "new_qty": float(new_q),
+            "fill_price": float(fill_px),
+            "notional": float(notional),
+            "fee": float(fee),
+        })
+
+    return executions
+
+
 def format_tournament_telegram_report(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -78,8 +151,10 @@ def format_tournament_telegram_report(
     live_ledger: Optional[Mapping[str, Any]] = None,
     reasons: Optional[Sequence[str]] = None,
     capital_usd: float = 1000.0,
+    cycle_executions: Optional[Sequence[Mapping[str, Any]]] = None,
+    prev_positions: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    """Format báo cáo Telegram HTML chuyên nghiệp cho giải đấu 4 profile."""
+    """Format báo cáo Telegram HTML chuẩn Institutional Quant Desk."""
     rec_list = list(records)
     cycle = max((int(_num(r.get("cycle"), 0.0)) for r in rec_list), default=0)
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -113,10 +188,10 @@ def format_tournament_telegram_report(
     lines: list[str] = [
         f"<b>🏆 QUANT TOURNAMENT — Cycle #{cycle}</b>",
         f"⏱ <b>Time:</b> <code>{html.escape(now_str)}</code>",
-        f"🛡 <b>Reconcile:</b> {recon_badge} (<code>recon_drift_usd={html.escape(drift_str)}</code>)",
+        f"🛡 <b>Reconcile:</b> {recon_badge} (<code>drift={html.escape(drift_str)}</code>)",
         f"🔔 <b>Trigger:</b> <code>{html.escape(reason_tags)}</code>",
         "",
-        "<b>📊 Bảng xếp hạng (Pure Eq ($) | Yield Eq ($) | Total Ret (%) | MaxDD (%))</b>",
+        "<b>📊 BẢNG XẾP HẠNG TOURNAMENT</b>",
     ]
 
     sorted_recs = sorted(
@@ -126,74 +201,179 @@ def format_tournament_telegram_report(
     )
 
     table_lines = [
-        f"{'Profile':<19} {'PureEq($)':>9} {'YieldEq($)':>10} {'Ret(%)':>7} {'MaxDD':>6}",
-        "-" * 55,
+        f"{'Profile':<19} {'PureEq':>8} {'Ret%':>7} {'MaxDD':>6}",
+        "-" * 42,
     ]
     for r in sorted_recs:
         pname = str(r.get("profile", "unknown"))
         pure_eq = _num(r.get("pure_trading_equity_usd"), capital_usd)
-        yield_eq = _num(r.get("yield_stacked_equity_usd"), pure_eq)
         ret_pct = ((pure_eq - capital_usd) / capital_usd * 100.0) if capital_usd > 0 else 0.0
         max_dd = _num(r.get("max_dd_pct"), 0.0)
-        short_name = pname[:19]
+        is_live = pname == live_profile
+        tag = "*" if is_live else " "
+        short_name = (pname + tag)[:19]
         table_lines.append(
-            f"{short_name:<19} {pure_eq:>9.2f} {yield_eq:>10.2f} {ret_pct:>+6.2f}% {max_dd:>5.2f}%"
+            f"{short_name:<19} {pure_eq:>8.2f} {ret_pct:>+6.2f}% {max_dd:>5.2f}%"
         )
     lines.append("<pre>" + html.escape("\n".join(table_lines)) + "</pre>")
 
+    # ---- KHỐI 2: ⚡ KHỚP LỆNH TRONG CHU KỲ (CYCLE EXECUTIONS)
     src_detail: Mapping[str, Any] = live_rec or live_ledger or {}
+    curr_pos_map = (
+        live_ledger.get("positions_snapshot", {})
+        if isinstance(live_ledger, Mapping)
+        else (live_rec.get("positions_snapshot", {}) if isinstance(live_rec, Mapping) else {})
+    )
+    last_prices = dict(src_detail.get("last_prices") or {})
+
+    # Xác định danh sách lệnh khớp
+    executions: list[dict[str, Any]] = []
+    if cycle_executions is not None:
+        executions = [dict(x) for x in cycle_executions if isinstance(x, Mapping)]
+    elif isinstance(src_detail.get("cycle_executions"), Sequence):
+        executions = [dict(x) for x in src_detail["cycle_executions"] if isinstance(x, Mapping)]
+    elif prev_positions is not None:
+        executions = diff_cycle_executions(prev_positions, curr_pos_map, mid_prices=last_prices)
+    elif isinstance(src_detail.get("prev_positions_snapshot"), Mapping):
+        executions = diff_cycle_executions(
+            src_detail["prev_positions_snapshot"], curr_pos_map, mid_prices=last_prices
+        )
+
+    lines.append("")
+    if executions:
+        lines.append("<b>⚡ KHỚP LỆNH TRONG CHU KỲ (CYCLE EXECUTIONS)</b>")
+        for ex in executions:
+            slv = str(ex.get("sleeve", "Trade"))
+            side = str(ex.get("side", "ORDER")).upper()
+            sym = str(ex.get("symbol", "")).replace("/USDT:USDT", "")
+            dq = _num(ex.get("delta_qty"), 0.0)
+            oq = _num(ex.get("old_qty"), 0.0)
+            nq = _num(ex.get("new_qty"), 0.0)
+            px = _num(ex.get("fill_price"), 0.0)
+            notional = _num(ex.get("notional"), 0.0)
+            fee = _num(ex.get("fee"), 0.0)
+            lines.append(
+                f"• <b>[{html.escape(slv)}]</b> <code>{side} {html.escape(sym)} | "
+                f"Δ{dq:+.4f} ({oq:+.4f} -> {nq:+.4f}) @ ${px:.2f} (${notional:.1f}) | Fee: ${fee:.2f}</code>"
+            )
+    else:
+        lines.append("⚡ <b>Executions:</b> <code>NONE (Hold Positions)</code>")
+
+    # ---- KHỐI 3: 🔍 CHI TIẾT LIVE PROFILE
+    pure_eq = _num(src_detail.get("pure_trading_equity_usd"), capital_usd)
+    yield_eq = _num(src_detail.get("yield_stacked_equity_usd"), pure_eq)
+    exch_eq = live_rec.get("exchange_recon_equity_usd") if live_rec else None
+    if exch_eq is None and live_ledger:
+        exch_eq = live_ledger.get("exchange_recon_equity_usd")
+    exch_str = f"${_num(exch_eq):.2f}" if exch_eq is not None else "n/a"
+
+    if drift_raw is not None:
+        d_val = _num(drift_raw, 0.0)
+        d_bps = (d_val / capital_usd * 10000.0) if capital_usd > 0 else 0.0
+        drift_text = f"{d_val:+.2f}$ ({d_bps:+.1f} bps)"
+    else:
+        drift_text = "n/a"
+
     funding_pnl = _num(src_detail.get("funding_pnl_usd"), 0.0)
     basis_pnl = _num(src_detail.get("basis_pnl_usd"), 0.0)
+    carry_net = funding_pnl + basis_pnl
     overlay_pnl = _num(src_detail.get("overlay_pnl_usd"), 0.0)
     trend_pnl = _num(src_detail.get("trend_pnl_usd"), 0.0)
     fees_paid = _num(src_detail.get("fees_paid_usd"), 0.0)
     fut_lev = _num(src_detail.get("futures_leverage"), 0.0)
     trend_dir = _infer_trend_direction(live_ledger, live_rec)
 
+    # Risk & exposure calculation
+    carry_gross = 0.0
+    trend_gross_pos = 0.0
+    for p in curr_pos_map.values():
+        if isinstance(p, Mapping):
+            k = str(p.get("kind", "")).lower()
+            mag = abs(_num(p.get("signed_usd"), 0.0))
+            if k == "carry":
+                carry_gross += mag
+            elif k == "trend":
+                trend_gross_pos += mag
+
+    overlay_l = _num(src_detail.get("overlay_long_usd"), 0.0)
+    overlay_s = _num(src_detail.get("overlay_short_usd"), 0.0)
+    ovly_gross = overlay_l + overlay_s
+    if ovly_gross <= 0.0:
+        ovly_gross = sum(
+            abs(_num(p.get("signed_usd"), 0.0))
+            for p in curr_pos_map.values()
+            if isinstance(p, Mapping) and str(p.get("kind", "")).lower() == "overlay"
+        )
+    t_gross = _num(src_detail.get("trend_gross_usd"), trend_gross_pos)
+    gross_exp = carry_gross + ovly_gross + t_gross
+
+    # Net delta: overlay net + trend net
+    trend_net = sum(
+        _num(p.get("signed_usd"), 0.0)
+        for p in curr_pos_map.values()
+        if isinstance(p, Mapping) and str(p.get("kind", "")).lower() == "trend"
+    )
+    net_delta = (overlay_l - overlay_s) + trend_net
+    if overlay_l == 0.0 and overlay_s == 0.0:
+        net_delta += sum(
+            _num(p.get("signed_usd"), 0.0)
+            for p in curr_pos_map.values()
+            if isinstance(p, Mapping) and str(p.get("kind", "")).lower() == "overlay"
+        )
+    net_delta_pct = (net_delta / pure_eq * 100.0) if pure_eq > 0 else 0.0
+    net_delta_sign = "+" if net_delta >= 0 else "-"
+
     lines.extend(
         [
             "",
-            f"<b>🔍 Chi tiết Live Profile (<code>{html.escape(live_profile)}</code>)</b>",
-            f"• <b>Funding:</b> <code>{funding_pnl:+.2f} $</code> | <b>Basis:</b> <code>{basis_pnl:+.2f} $</code>",
-            f"• <b>Overlay:</b> <code>{overlay_pnl:+.2f} $</code> | <b>Trend:</b> <code>{trend_pnl:+.2f} $ ({trend_dir})</code>",
-            f"• <b>Fees:</b> <code>{fees_paid:.2f} $</code> | <b>Fut Leverage:</b> <code>{fut_lev:.2f}x</code>",
+            f"<b>🔍 CHI TIẾT LIVE PROFILE (<code>{html.escape(live_profile)}</code>)</b>",
+            f"• <b>Vốn & Đối soát:</b> <code>Pure Eq: ${pure_eq:.2f} | Yield Eq: ${yield_eq:.2f} | Exch Eq: {exch_str} | Drift: {drift_text}</code>",
+            f"• <b>Net PnL Attribution:</b> <code>Carry Net: {carry_net:+.2f}$ (Funding: {funding_pnl:+.2f}$ | Basis: {basis_pnl:+.2f}$) | Overlay: {overlay_pnl:+.2f}$ | Trend: {trend_pnl:+.2f}$ ({trend_dir}) | Fees: -${abs(fees_paid):.2f}</code>",
+            f"• <b>Risk & Margin Telemetry:</b> <code>Fut Leverage: {fut_lev:.2f}x / 3.0x | Net Delta: {net_delta_sign}${abs(net_delta):.1f} ({net_delta_pct:+.1f}%) | Gross Exp: ${gross_exp:.1f} (Carry ${carry_gross:.1f} / Ovly ${ovly_gross:.1f} / Trend ${t_gross:.1f})</code>",
+            "",
+            "<b>📌 DANH MỤC ĐANG MỞ (ACTIVE POSITIONS)</b>",
         ]
     )
 
-    pos_map = (
-        live_ledger.get("positions_snapshot", {})
-        if isinstance(live_ledger, Mapping)
-        else (live_rec.get("positions_snapshot", {}) if isinstance(live_rec, Mapping) else {})
-    )
+    # ---- KHỐI 4: 📌 DANH MỤC ĐANG MỞ
     pos_lines: list[str] = []
-    if isinstance(pos_map, Mapping):
-        for key in sorted(pos_map.keys()):
-            pos = pos_map[key]
+    if isinstance(curr_pos_map, Mapping):
+        for key in sorted(curr_pos_map.keys()):
+            pos = curr_pos_map[key]
             if not isinstance(pos, Mapping):
                 continue
             sym = str(pos.get("symbol") or str(key).split("|")[0]).replace("/USDT:USDT", "")
-            kind = str(pos.get("kind", "carry"))
+            kind = str(pos.get("kind", "carry")).lower()
             qty = _num(pos.get("qty"), 0.0)
             entry = _num(pos.get("entry_price"), 0.0)
             signed_usd = _num(pos.get("signed_usd"), qty * entry)
             if abs(qty) <= 1e-12 and abs(signed_usd) <= 1e-9:
                 continue
+
             if kind == "carry":
-                perp_q = _num(pos.get("perp_qty"), -abs(qty))
+                spot_q = abs(_num(pos.get("spot_qty"), abs(qty)))
+                perp_q = -abs(_num(pos.get("perp_qty"), abs(qty)))
+                notional = abs(signed_usd)
                 pos_lines.append(
-                    f"• <code>{html.escape(sym):<5}</code> [Carry]   Perp SHORT <code>{perp_q:+.4f}</code> (<code>${abs(signed_usd):.1f}</code>)"
+                    f"• <code>{html.escape(sym):<5} [Carry] Spot {spot_q:+.4f} / Perp {perp_q:+.4f} (${notional:.1f}) | Net Δ: $0.0</code>"
                 )
             else:
-                side_lbl = "LONG" if (qty > 0 or signed_usd > 0) else "SHORT"
+                sleeve_lbl = "Ovly" if kind == "overlay" else (kind[:5].capitalize())
+                side_lbl = "LONG " if (qty > 0 or signed_usd > 0) else "SHORT"
+                notional = abs(signed_usd)
+                upnl = _num(pos.get("unrealized_pnl_usd"), 0.0)
+                if upnl == 0.0 and entry > 0.0 and last_prices and sym in last_prices:
+                    mid = _num(last_prices[sym], entry)
+                    upnl = qty * (mid - entry)
+                upnl_str = f"{upnl:+.2f}$"
                 pos_lines.append(
-                    f"• <code>{html.escape(sym):<5}</code> [{html.escape(kind.capitalize()):<7}] Perp {side_lbl:<5} <code>{qty:+.4f}</code> (<code>${abs(signed_usd):.1f}</code>)"
+                    f"• <code>{html.escape(sym):<5} [{sleeve_lbl:<5}] Perp {side_lbl} {qty:+.4f} (${notional:.1f}) | Entry: ${entry:.2f} | uPnL: {upnl_str}</code>"
                 )
 
-    lines.append("<b>📌 Vị thế Perp đang mở:</b>")
     if pos_lines:
         lines.extend(pos_lines)
     else:
-        lines.append("• <code>FLAT (Không có vị thế Perp đang mở)</code>")
+        lines.append("• <code>FLAT (Không có vị thế đang mở)</code>")
 
     return "\n".join(lines)
 
@@ -398,6 +578,8 @@ class TelegramNotifier:
         live_ledger: Optional[Mapping[str, Any]] = None,
         reasons: Optional[Sequence[str]] = None,
         capital_usd: float = 1000.0,
+        cycle_executions: Optional[Sequence[Mapping[str, Any]]] = None,
+        prev_positions: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         """Định dạng và gửi báo cáo giải đấu qua Telegram với parse_mode='HTML'."""
         try:
@@ -407,6 +589,8 @@ class TelegramNotifier:
                 live_ledger=live_ledger,
                 reasons=reasons,
                 capital_usd=capital_usd,
+                cycle_executions=cycle_executions,
+                prev_positions=prev_positions,
             )
             return self.send_message(msg, parse_mode="HTML")
         except Exception as exc:  # noqa: BLE001
