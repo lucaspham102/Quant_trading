@@ -1873,17 +1873,6 @@ class CarryLiveExecutor:
         active_targets = {sym: q for sym, q in targets.items() if abs(q) > 1e-12}
         active_current = {sym: q for sym, q in current.items() if abs(q) > 1e-12}
 
-        # Stable composition: non-empty, identical symbols, identical direction (sign)
-        is_stable_composition = (
-            bool(active_targets)
-            and bool(active_current)
-            and set(active_targets.keys()) == set(active_current.keys())
-            and all(
-                (active_targets[s] > 0) == (active_current[s] > 0)
-                for s in active_targets
-            )
-        )
-
         if timestamp:
             try:
                 ts_now = pd.to_datetime(timestamp, utc=True)
@@ -1896,7 +1885,14 @@ class CarryLiveExecutor:
         epoch_hours = unix_ts // 3600
         rebalance_hours = int(getattr(self.overlay_config, "overlay_rebalance_hours", 48) or 48)
 
-        if is_stable_composition:
+        # Non-boundary rebalance exceptions:
+        # (a) Initial entry when overlay_positions is empty: allowed at any time.
+        # (b) Emergency liquidation to flat (targets are empty): allowed at any time.
+        is_initial_entry = (not bool(active_current)) and bool(active_targets)
+        is_liquidation_to_flat = bool(active_current) and (not bool(active_targets))
+
+        # When active positions exist and targets exist, we MUST lock the 48h gate (no flip-flop, no micro-churning)
+        if bool(active_current) and bool(active_targets):
             is_epoch_boundary = (epoch_hours % rebalance_hours == 0)
 
             last_reb_str = getattr(self.state, "overlay_last_rebalance_ts", None)
@@ -1914,7 +1910,7 @@ class CarryLiveExecutor:
 
             if not (is_epoch_boundary or is_bucket_crossing):
                 logger.info(
-                    "Overlay Epoch Rebalance Gate: HOLD (cycle hour %d is not a %dh boundary; holding current positions)",
+                    "Overlay Epoch Rebalance Gate: HOLD (cycle hour %d is not a %dh boundary; holding current composition and qty)",
                     epoch_hours % rebalance_hours,
                     rebalance_hours,
                 )
@@ -1927,6 +1923,9 @@ class CarryLiveExecutor:
                     "status": "HOLD_48H",
                     "reason": "EPOCH_GATE_HOLD",
                 }
+            self.state.overlay_last_rebalance_ts = ts_now.isoformat()
+        elif is_initial_entry:
+            self.state.overlay_last_rebalance_ts = ts_now.isoformat()
 
         orders: list[dict[str, Any]] = []
         skipped = 0

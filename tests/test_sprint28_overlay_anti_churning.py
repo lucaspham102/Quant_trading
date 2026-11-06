@@ -123,6 +123,59 @@ class TestOverlayAntiChurning(unittest.TestCase):
         self.assertEqual(res_boundary.get("status"), "OK")
         self.assertEqual(len(res_boundary["orders"]), 1)
 
+    def test_overlay_epoch_gate_prevents_mid_cycle_flip_flop_bnb_sol_avax(self):
+        """Holding BNB Long + SOL Short mid-cycle must return HOLD_48H and NOT flip to AVAX despite 1h signal."""
+        self.executor.state.overlay_positions = {
+            "BNB/USDT:USDT": {"qty": 0.14, "side": "long", "entry_price": 700.0},
+            "SOL/USDT:USDT": {"qty": 1.30, "side": "short", "entry_price": 90.38},
+        }
+        # Mid-cycle: Hour 17 is not divisible by 48
+        epoch_h_mid = 498336 + 17
+        ts_mid = pd.Timestamp(epoch_h_mid * 3600, unit="s", tz="UTC").isoformat()
+        self.executor.state.overlay_last_rebalance_ts = pd.Timestamp(498336 * 3600, unit="s", tz="UTC").isoformat()
+
+        # 1-hour noise ranks AVAX below SOL -> target wants to swap SOL for AVAX
+        allocations_flip_noise = {
+            "overlay_active": True,
+            "allocations": [
+                {"symbol": "BNB/USDT:USDT", "qty": 0.14, "side": "long"},
+                {"symbol": "AVAX/USDT:USDT", "qty": 11.0, "side": "short"},  # 1h signal switched SOL to AVAX
+            ],
+        }
+        aligned_universe = {
+            "BNB/USDT:USDT": pd.DataFrame({"close": [700.0]}),
+            "SOL/USDT:USDT": pd.DataFrame({"close": [90.38]}),
+            "AVAX/USDT:USDT": pd.DataFrame({"close": [25.0]}),
+        }
+
+        # 1. At mid-cycle (hour 17): Must HOLD, zero orders, no flip to AVAX
+        res_mid = self.executor.execute_overlay_rebalance(
+            allocations_flip_noise,
+            aligned_universe,
+            timestamp=ts_mid,
+        )
+        self.assertEqual(res_mid["status"], "HOLD_48H")
+        self.assertEqual(res_mid["reason"], "EPOCH_GATE_HOLD")
+        self.assertEqual(len(res_mid["orders"]), 0)
+        # Positions must remain BNB Long + SOL Short
+        self.assertIn("BNB/USDT:USDT", self.executor.state.overlay_positions)
+        self.assertIn("SOL/USDT:USDT", self.executor.state.overlay_positions)
+        self.assertNotIn("AVAX/USDT:USDT", self.executor.state.overlay_positions)
+
+        # 2. At next 48h boundary (Hour 48 = 498336 + 48): Rebalance is now permitted
+        epoch_h_next_boundary = 498336 + 48
+        ts_boundary = pd.Timestamp(epoch_h_next_boundary * 3600, unit="s", tz="UTC").isoformat()
+        res_boundary = self.executor.execute_overlay_rebalance(
+            allocations_flip_noise,
+            aligned_universe,
+            timestamp=ts_boundary,
+        )
+        self.assertNotEqual(res_boundary.get("status"), "HOLD_48H")
+        self.assertEqual(res_boundary.get("status"), "OK")
+        executed_symbols = {o["symbol"] for o in res_boundary.get("orders", [])}
+        self.assertIn("SOL/USDT:USDT", executed_symbols)
+        self.assertIn("AVAX/USDT:USDT", executed_symbols)
+
     def test_min_overlay_delta_notional_skips_micro_orders(self):
         """Delta notional < $10.0 must be skipped to avoid Binance -4164 MIN_NOTIONAL error."""
         client_mock = MagicMock()

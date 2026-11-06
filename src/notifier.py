@@ -353,9 +353,9 @@ def format_tournament_telegram_report(
         [
             "",
             f"<b>🔍 CHI TIẾT LIVE PROFILE (<code>{html.escape(live_profile)}</code>)</b>",
-            f"- <b>Vốn & Đối soát:</b> <code>Pure Eq: ${pure_eq:.2f} | Yield Eq: ${yield_eq:.2f} | Exch Eq: {exch_str} | Drift: {drift_text}</code>",
-            f"- <b>Net PnL Attribution:</b> <code>Carry Net: {carry_net:+.2f}$ (Funding: {funding_pnl:+.2f}$ | Basis: {basis_pnl:+.2f}$) | Overlay: {overlay_pnl:+.2f}$ | Trend: {trend_pnl:+.2f}$ ({trend_dir}) | Fees: -${abs(fees_paid):.2f}</code>",
-            f"- <b>Risk & Margin Telemetry:</b> <code>Fut Leverage: {fut_lev:.2f}x / 3.0x | Net Delta: {net_delta_sign}${abs(net_delta):.1f} ({net_delta_pct:+.1f}%) | Gross Exp: ${gross_exp:.1f} (Carry ${carry_gross:.1f} / Ovly ${ovly_gross:.1f} / Trend ${t_gross:.1f})</code>",
+            f"<code>- Vốn & Đối soát: Pure Eq: ${pure_eq:.2f} | Yield Eq: ${yield_eq:.2f} | Exch Eq: {exch_str} | Drift: {drift_text}</code>",
+            f"<code>- Net PnL Attribution: Carry Net: {carry_net:+.2f}$ (Funding: {funding_pnl:+.2f}$ | Basis: {basis_pnl:+.2f}$) | Overlay: {overlay_pnl:+.2f}$ | Trend: {trend_pnl:+.2f}$ ({trend_dir}) | Fees: -${abs(fees_paid):.2f}</code>",
+            f"<code>- Risk & Margin Telemetry: Fut Leverage: {fut_lev:.2f}x / 3.0x | Net Delta: {net_delta_sign}${abs(net_delta):.1f} ({net_delta_pct:+.1f}%) | Gross Exp: ${gross_exp:.1f} (Carry ${carry_gross:.1f} / Ovly ${ovly_gross:.1f} / Trend ${t_gross:.1f})</code>",
             "",
             "<b>📌 DANH MỤC ĐANG MỞ (ACTIVE POSITIONS)</b>",
         ]
