@@ -71,6 +71,17 @@ def _infer_trend_direction(
     return "FLAT"
 
 
+def _lookup_price(prices_map: Optional[Mapping[str, float]], symbol: str) -> float:
+    """Tra cứu giá an toàn hỗ trợ cả key ngắn (SOL) và key sàn (SOL/USDT:USDT)."""
+    if not prices_map:
+        return 0.0
+    s_clean = symbol.replace("/USDT:USDT", "").replace(":USDT", "").replace("/USDT", "").strip()
+    for k in (symbol, f"{s_clean}/USDT:USDT", f"{s_clean}/USDT", f"{s_clean}:USDT", s_clean):
+        if k in prices_map and _num(prices_map.get(k), 0.0) > 0.0:
+            return float(prices_map[k])
+    return 0.0
+
+
 def diff_cycle_executions(
     prev_positions: Optional[Mapping[str, Any]],
     curr_positions: Optional[Mapping[str, Any]],
@@ -116,11 +127,17 @@ def diff_cycle_executions(
             sleeve = kind.capitalize()
             side = "BUY" if delta_q > 0 else "SELL"
 
-        fill_px = _num(c.get("entry_price"), 0.0)
-        if fill_px <= 0.0:
-            fill_px = _num(p.get("entry_price"), 0.0)
-        if fill_px <= 0.0 and mid_prices:
-            fill_px = _num(mid_prices.get(sym), 0.0)
+        # Ưu tiên giá thị trường thực tế (current mark/mid price) lúc khớp lệnh trong chu kỳ
+        market_px = _lookup_price(mid_prices, sym)
+        if market_px <= 0.0:
+            market_px = _num(c.get("mark_price"), 0.0)
+
+        if market_px > 0.0:
+            fill_px = market_px
+        else:
+            fill_px = _num(c.get("entry_price"), 0.0)
+            if fill_px <= 0.0:
+                fill_px = _num(p.get("entry_price"), 0.0)
 
         notional = abs(delta_q) * fill_px
         if notional <= 0.0:
@@ -218,13 +235,24 @@ def format_tournament_telegram_report(
     lines.append("<pre>" + html.escape("\n".join(table_lines)) + "</pre>")
 
     # ---- KHỐI 2: ⚡ KHỚP LỆNH TRONG CHU KỲ (CYCLE EXECUTIONS)
+    def _val(k: str, default: Any = None) -> Any:
+        if isinstance(live_rec, Mapping) and live_rec.get(k) is not None:
+            return live_rec.get(k)
+        if isinstance(live_ledger, Mapping) and live_ledger.get(k) is not None:
+            return live_ledger.get(k)
+        return default
+
     src_detail: Mapping[str, Any] = live_rec or live_ledger or {}
     curr_pos_map = (
         live_ledger.get("positions_snapshot", {})
         if isinstance(live_ledger, Mapping)
         else (live_rec.get("positions_snapshot", {}) if isinstance(live_rec, Mapping) else {})
     )
-    last_prices = dict(src_detail.get("last_prices") or {})
+    last_prices = dict(
+        (live_ledger.get("last_prices") if isinstance(live_ledger, Mapping) else None)
+        or (live_rec.get("last_prices") if isinstance(live_rec, Mapping) else None)
+        or {}
+    )
 
     # Xác định danh sách lệnh khớp
     executions: list[dict[str, Any]] = []
@@ -253,18 +281,16 @@ def format_tournament_telegram_report(
             notional = _num(ex.get("notional"), 0.0)
             fee = _num(ex.get("fee"), 0.0)
             lines.append(
-                f"• <b>[{html.escape(slv)}]</b> <code>{side} {html.escape(sym)} | "
+                f"<code>- [{html.escape(slv)}] {side} {html.escape(sym)} | "
                 f"Δ{dq:+.4f} ({oq:+.4f} -> {nq:+.4f}) @ ${px:.2f} (${notional:.1f}) | Fee: ${fee:.2f}</code>"
             )
     else:
         lines.append("⚡ <b>Executions:</b> <code>NONE (Hold Positions)</code>")
 
     # ---- KHỐI 3: 🔍 CHI TIẾT LIVE PROFILE
-    pure_eq = _num(src_detail.get("pure_trading_equity_usd"), capital_usd)
-    yield_eq = _num(src_detail.get("yield_stacked_equity_usd"), pure_eq)
-    exch_eq = live_rec.get("exchange_recon_equity_usd") if live_rec else None
-    if exch_eq is None and live_ledger:
-        exch_eq = live_ledger.get("exchange_recon_equity_usd")
+    pure_eq = _num(_val("pure_trading_equity_usd"), capital_usd)
+    yield_eq = _num(_val("yield_stacked_equity_usd"), pure_eq)
+    exch_eq = _val("exchange_recon_equity_usd")
     exch_str = f"${_num(exch_eq):.2f}" if exch_eq is not None else "n/a"
 
     if drift_raw is not None:
@@ -274,13 +300,13 @@ def format_tournament_telegram_report(
     else:
         drift_text = "n/a"
 
-    funding_pnl = _num(src_detail.get("funding_pnl_usd"), 0.0)
-    basis_pnl = _num(src_detail.get("basis_pnl_usd"), 0.0)
+    funding_pnl = _num(_val("funding_pnl_usd"), 0.0)
+    basis_pnl = _num(_val("basis_pnl_usd"), 0.0)
     carry_net = funding_pnl + basis_pnl
-    overlay_pnl = _num(src_detail.get("overlay_pnl_usd"), 0.0)
-    trend_pnl = _num(src_detail.get("trend_pnl_usd"), 0.0)
-    fees_paid = _num(src_detail.get("fees_paid_usd"), 0.0)
-    fut_lev = _num(src_detail.get("futures_leverage"), 0.0)
+    overlay_pnl = _num(_val("overlay_pnl_usd"), 0.0)
+    trend_pnl = _num(_val("trend_pnl_usd"), 0.0)
+    fees_paid = _num(_val("fees_paid_usd"), 0.0)
+    fut_lev = _num(_val("futures_leverage"), 0.0)
     trend_dir = _infer_trend_direction(live_ledger, live_rec)
 
     # Risk & exposure calculation
@@ -295,8 +321,8 @@ def format_tournament_telegram_report(
             elif k == "trend":
                 trend_gross_pos += mag
 
-    overlay_l = _num(src_detail.get("overlay_long_usd"), 0.0)
-    overlay_s = _num(src_detail.get("overlay_short_usd"), 0.0)
+    overlay_l = _num(_val("overlay_long_usd"), 0.0)
+    overlay_s = _num(_val("overlay_short_usd"), 0.0)
     ovly_gross = overlay_l + overlay_s
     if ovly_gross <= 0.0:
         ovly_gross = sum(
@@ -304,7 +330,7 @@ def format_tournament_telegram_report(
             for p in curr_pos_map.values()
             if isinstance(p, Mapping) and str(p.get("kind", "")).lower() == "overlay"
         )
-    t_gross = _num(src_detail.get("trend_gross_usd"), trend_gross_pos)
+    t_gross = _num(_val("trend_gross_usd"), trend_gross_pos)
     gross_exp = carry_gross + ovly_gross + t_gross
 
     # Net delta: overlay net + trend net
@@ -327,9 +353,9 @@ def format_tournament_telegram_report(
         [
             "",
             f"<b>🔍 CHI TIẾT LIVE PROFILE (<code>{html.escape(live_profile)}</code>)</b>",
-            f"• <b>Vốn & Đối soát:</b> <code>Pure Eq: ${pure_eq:.2f} | Yield Eq: ${yield_eq:.2f} | Exch Eq: {exch_str} | Drift: {drift_text}</code>",
-            f"• <b>Net PnL Attribution:</b> <code>Carry Net: {carry_net:+.2f}$ (Funding: {funding_pnl:+.2f}$ | Basis: {basis_pnl:+.2f}$) | Overlay: {overlay_pnl:+.2f}$ | Trend: {trend_pnl:+.2f}$ ({trend_dir}) | Fees: -${abs(fees_paid):.2f}</code>",
-            f"• <b>Risk & Margin Telemetry:</b> <code>Fut Leverage: {fut_lev:.2f}x / 3.0x | Net Delta: {net_delta_sign}${abs(net_delta):.1f} ({net_delta_pct:+.1f}%) | Gross Exp: ${gross_exp:.1f} (Carry ${carry_gross:.1f} / Ovly ${ovly_gross:.1f} / Trend ${t_gross:.1f})</code>",
+            f"- <b>Vốn & Đối soát:</b> <code>Pure Eq: ${pure_eq:.2f} | Yield Eq: ${yield_eq:.2f} | Exch Eq: {exch_str} | Drift: {drift_text}</code>",
+            f"- <b>Net PnL Attribution:</b> <code>Carry Net: {carry_net:+.2f}$ (Funding: {funding_pnl:+.2f}$ | Basis: {basis_pnl:+.2f}$) | Overlay: {overlay_pnl:+.2f}$ | Trend: {trend_pnl:+.2f}$ ({trend_dir}) | Fees: -${abs(fees_paid):.2f}</code>",
+            f"- <b>Risk & Margin Telemetry:</b> <code>Fut Leverage: {fut_lev:.2f}x / 3.0x | Net Delta: {net_delta_sign}${abs(net_delta):.1f} ({net_delta_pct:+.1f}%) | Gross Exp: ${gross_exp:.1f} (Carry ${carry_gross:.1f} / Ovly ${ovly_gross:.1f} / Trend ${t_gross:.1f})</code>",
             "",
             "<b>📌 DANH MỤC ĐANG MỞ (ACTIVE POSITIONS)</b>",
         ]
@@ -355,25 +381,29 @@ def format_tournament_telegram_report(
                 perp_q = -abs(_num(pos.get("perp_qty"), abs(qty)))
                 notional = abs(signed_usd)
                 pos_lines.append(
-                    f"• <code>{html.escape(sym):<5} [Carry] Spot {spot_q:+.4f} / Perp {perp_q:+.4f} (${notional:.1f}) | Net Δ: $0.0</code>"
+                    f"<code>- {html.escape(sym):<5} [Carry] Spot {spot_q:+.4f} / Perp {perp_q:+.4f} (${notional:.1f}) | Net Δ: $0.0</code>"
                 )
             else:
                 sleeve_lbl = "Ovly" if kind == "overlay" else (kind[:5].capitalize())
                 side_lbl = "LONG " if (qty > 0 or signed_usd > 0) else "SHORT"
                 notional = abs(signed_usd)
                 upnl = _num(pos.get("unrealized_pnl_usd"), 0.0)
-                if upnl == 0.0 and entry > 0.0 and last_prices and sym in last_prices:
-                    mid = _num(last_prices[sym], entry)
-                    upnl = qty * (mid - entry)
+                if upnl == 0.0 and entry > 0.0:
+                    mid = _lookup_price(last_prices, sym)
+                    if mid <= 0.0:
+                        mid = _num(pos.get("mark_price"), entry)
+                    if mid > 0.0:
+                        signed_q = -abs(qty) if (side_lbl == "SHORT" or signed_usd < 0.0) else abs(qty)
+                        upnl = signed_q * (mid - entry)
                 upnl_str = f"{upnl:+.2f}$"
                 pos_lines.append(
-                    f"• <code>{html.escape(sym):<5} [{sleeve_lbl:<5}] Perp {side_lbl} {qty:+.4f} (${notional:.1f}) | Entry: ${entry:.2f} | uPnL: {upnl_str}</code>"
+                    f"<code>- {html.escape(sym):<5} [{sleeve_lbl:<5}] Perp {side_lbl} {qty:+.4f} (${notional:.1f}) | Entry: ${entry:.2f} | uPnL: {upnl_str}</code>"
                 )
 
     if pos_lines:
         lines.extend(pos_lines)
     else:
-        lines.append("• <code>FLAT (Không có vị thế đang mở)</code>")
+        lines.append("<code>- FLAT (Không có vị thế đang mở)</code>")
 
     return "\n".join(lines)
 

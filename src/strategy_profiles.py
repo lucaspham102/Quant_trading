@@ -300,7 +300,7 @@ PROFILE_REGISTRY: dict[str, StrategyProfileConfig] = {
         carry_tilt_alpha=0.0,
         carry_max_single_weight=0.55,
         overlay_target_vol_ann=0.075,
-        overlay_gross_pct=0.15,
+        overlay_gross_pct=0.10,
         max_futures_leverage=3.0,
         enable_yield_stacking=True,
     ),

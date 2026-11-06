@@ -611,7 +611,11 @@ def _default_ledger(profile: str | StrategyProfileConfig) -> dict[str, Any]:
         "fees_paid_usd": 0.0,
         "funding_pnl_usd": 0.0,
         "overlay_pnl_usd": 0.0,
+        "overlay_realized_pnl_usd": 0.0,
+        "overlay_unrealized_pnl_usd": 0.0,
         "trend_pnl_usd": 0.0,
+        "trend_realized_pnl_usd": 0.0,
+        "trend_unrealized_pnl_usd": 0.0,
         "reversal_pnl_usd": 0.0,
         "basis_pnl_usd": 0.0,
         "spot_unrealized_pnl_usd": 0.0,
@@ -649,7 +653,11 @@ def _sanitize_ledger(ledger: dict[str, Any], default_capital: float = 1000.0) ->
         "fees_paid_usd",
         "funding_pnl_usd",
         "overlay_pnl_usd",
+        "overlay_realized_pnl_usd",
+        "overlay_unrealized_pnl_usd",
         "trend_pnl_usd",
+        "trend_realized_pnl_usd",
+        "trend_unrealized_pnl_usd",
         "reversal_pnl_usd",
         "basis_pnl_usd",
         "spot_unrealized_pnl_usd",
@@ -1315,12 +1323,15 @@ def refresh_position_ledger(
                     realized_overlay += old_signed * (mid / old_ov_entry - 1.0)
                 exec_entry = _num(o_pos.get("entry_price"), 0.0) if isinstance(o_pos, dict) else 0.0
                 entry_px = exec_entry if exec_entry > 0.0 else mid
+            u_pnl = new_signed * (mid / entry_px - 1.0) if (entry_px > 0.0 and mid > 0.0) else 0.0
             new_snapshot[_snapshot_key(sym, "overlay")] = {
                 "symbol": sym,
                 "qty": _num(new_signed / mid, 0.0),
                 "entry_price": _num(entry_px, 0.0),
                 "kind": "overlay",
                 "signed_usd": _num(new_signed, 0.0),
+                "mark_price": _num(mid, 0.0),
+                "unrealized_pnl_usd": _num(u_pnl, 0.0),
             }
         elif old_signed != 0.0 and old_ov_entry > 0.0:
             realized_overlay += old_signed * (mid / old_ov_entry - 1.0)
@@ -1391,7 +1402,11 @@ def refresh_position_ledger(
         ledger["fees_paid_usd"] = _num(ledger.get("fees_paid_usd"), 0.0) + fees
         ledger["realized_pnl_usd"] = _num(ledger.get("realized_pnl_usd"), 0.0) - fees
     ledger["realized_pnl_usd"] = _num(ledger.get("realized_pnl_usd"), 0.0) + realized_overlay
-    ledger["overlay_pnl_usd"] = _num(ledger.get("overlay_pnl_usd"), 0.0) + realized_overlay
+    ledger["overlay_realized_pnl_usd"] = (
+        _num(ledger.get("overlay_realized_pnl_usd", ledger.get("overlay_pnl_usd")), 0.0)
+        + realized_overlay
+    )
+    ledger["overlay_pnl_usd"] = _num(ledger["overlay_realized_pnl_usd"], 0.0) + _num(ledger.get("overlay_unrealized_pnl_usd"), 0.0)
     return _num(fees, 0.0), 0.0, _num(realized_overlay, 0.0)
 
 
@@ -1477,6 +1492,28 @@ def _mark_to_market(
     ledger["basis_pnl_usd"] = basis_total
     ledger["spot_unrealized_pnl_usd"] = spot_unreal_total
     ledger["perp_unrealized_pnl_usd"] = perp_unreal_total
+    ledger["overlay_unrealized_pnl_usd"] = _num(unreal_overlay, 0.0)
+    ledger["trend_unrealized_pnl_usd"] = _num(unreal_trend, 0.0)
+    if "overlay_realized_pnl_usd" not in ledger:
+        ledger["overlay_realized_pnl_usd"] = _num(ledger.get("overlay_pnl_usd"), 0.0)
+    ledger["overlay_pnl_usd"] = _num(ledger["overlay_realized_pnl_usd"], 0.0) + unreal_overlay
+    if "trend_realized_pnl_usd" not in ledger:
+        ledger["trend_realized_pnl_usd"] = _num(ledger.get("trend_pnl_usd"), 0.0)
+    ledger["trend_pnl_usd"] = _num(ledger["trend_realized_pnl_usd"], 0.0) + unreal_trend
+    if isinstance(positions, dict):
+        for key, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            p_sym = _pos_symbol(str(key), pos)
+            p_kind = str(pos.get("kind", "carry"))
+            p_mid = _extract_mid_price(p_sym, sym_map, last_prices, _num(pos.get("entry_price"), 0.0))
+            if p_mid > 0.0:
+                pos["mark_price"] = p_mid
+                if p_kind in ("overlay", "trend", "reversal"):
+                    p_ent = _num(pos.get("entry_price"), 0.0)
+                    p_usd = _num(pos.get("signed_usd"), 0.0)
+                    if p_ent > 0.0:
+                        pos["unrealized_pnl_usd"] = p_usd * (p_mid / p_ent - 1.0)
     pure_eq = (
         _num(profile.capital_usd, 1000.0)
         + _num(ledger.get("realized_pnl_usd"), 0.0)
@@ -2025,11 +2062,12 @@ def apply_trend_sleeve(
     )
     # Attribution: trend_pnl_usd must carry its own realised closes and its own fees,
     # otherwise the scoreboard column silently under-reports the sleeve.
-    ledger["trend_pnl_usd"] = (
-        _num(ledger.get("trend_pnl_usd"), 0.0)
+    ledger["trend_realized_pnl_usd"] = (
+        _num(ledger.get("trend_realized_pnl_usd", ledger.get("trend_pnl_usd")), 0.0)
         + res["realized_closed"]
         - (res["fees"] if charge_fees else 0.0)
     )
+    ledger["trend_pnl_usd"] = _num(ledger["trend_realized_pnl_usd"], 0.0) + _num(ledger.get("trend_unrealized_pnl_usd"), 0.0)
     ledger["trend_sleeve_state"] = state.snapshot()
     ledger["trend_active_symbols"] = sorted(
         s for s, is_on in (state.active or {}).items() if bool(is_on)
