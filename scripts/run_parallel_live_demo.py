@@ -1291,7 +1291,14 @@ def refresh_position_ledger(
         old_ov = prev.get(_snapshot_key(sym, "overlay")) or {}
         old_signed = _num(old_ov.get("signed_usd"), 0.0)
         old_ov_entry = _num(old_ov.get("entry_price"), 0.0)
-        if charge_fees:
+        old_ov_qty = _num(old_ov.get("qty"), 0.0)
+        old_sign = -1.0 if (old_signed < 0.0) else 1.0
+        old_signed_qty = old_sign * abs(old_ov_qty)
+        o_side = str(o_pos.get("side", o_pos.get("direction", ""))).lower() if isinstance(o_pos, dict) else ""
+        o_sign = -1.0 if (o_side in ("short", "sell", "-1") or o_qty < 0.0) else 1.0
+        o_signed_qty = o_sign * abs(o_qty)
+        qty_changed = abs(o_signed_qty - old_signed_qty) > 1e-8
+        if charge_fees and qty_changed:
             fees += abs(new_signed - old_signed) * OVERLAY_FEE_RATE
 
         if abs(new_signed) > 1e-9:

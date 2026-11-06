@@ -96,6 +96,9 @@ WARMUP_MIN_HOURS: int = 720
 WARMUP_MIN_FUNDING_PERIODS_8H: int = 90
 WARMUP_BLOCK_REASON: str = "WARMUP_INSUFFICIENT_BELOW_720H"
 
+# Sprint 28: Rao chan delta notional overlay
+MIN_OVERLAY_DELTA_NOTIONAL_USD: float = 10.0
+
 
 def append_audit_record(
     path: Optional[str | Path], record: dict[str, Any]
@@ -212,7 +215,7 @@ class CarryLiveExecutor:
         strategy: Optional[str] = None,
         max_allowed_spread_bps: float = 10.0,
         max_live_drawdown_pct: float = 0.06,
-        min_notional_usd: float = 10.0,
+        min_notional_usd: float = MIN_OVERLAY_DELTA_NOTIONAL_USD,
         tier1b_gate: bool = False,
         runtime_mode: Optional[str] = None,
         testnet_dry_state: bool = False,
@@ -1807,7 +1810,7 @@ class CarryLiveExecutor:
         self,
         overlay_allocations: dict[str, Any],
         aligned_universe: dict[str, pd.DataFrame],
-        min_notional_usd: float = 10.0,
+        min_notional_usd: float = MIN_OVERLAY_DELTA_NOTIONAL_USD,
         min_weight_change: float = 0.08,
         timestamp: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -1866,6 +1869,65 @@ class CarryLiveExecutor:
             else:
                 current[sym] = 0.0
 
+        # Sprint 28: Epoch Rebalance Gate for XS Overlay (Anti-Churning 48h Lock)
+        active_targets = {sym: q for sym, q in targets.items() if abs(q) > 1e-12}
+        active_current = {sym: q for sym, q in current.items() if abs(q) > 1e-12}
+
+        # Stable composition: non-empty, identical symbols, identical direction (sign)
+        is_stable_composition = (
+            bool(active_targets)
+            and bool(active_current)
+            and set(active_targets.keys()) == set(active_current.keys())
+            and all(
+                (active_targets[s] > 0) == (active_current[s] > 0)
+                for s in active_targets
+            )
+        )
+
+        if timestamp:
+            try:
+                ts_now = pd.to_datetime(timestamp, utc=True)
+            except Exception:
+                ts_now = pd.Timestamp.now(tz="UTC")
+        else:
+            ts_now = pd.Timestamp.now(tz="UTC")
+
+        unix_ts = int(ts_now.timestamp())
+        epoch_hours = unix_ts // 3600
+        rebalance_hours = int(getattr(self.overlay_config, "overlay_rebalance_hours", 48) or 48)
+
+        if is_stable_composition:
+            is_epoch_boundary = (epoch_hours % rebalance_hours == 0)
+
+            last_reb_str = getattr(self.state, "overlay_last_rebalance_ts", None)
+            is_bucket_crossing = False
+            if last_reb_str:
+                try:
+                    last_reb_dt = pd.to_datetime(last_reb_str, utc=True)
+                    last_epoch_h = int(last_reb_dt.timestamp()) // 3600
+                    if (epoch_hours // rebalance_hours) > (last_epoch_h // rebalance_hours):
+                        is_bucket_crossing = True
+                except Exception:
+                    pass
+            else:
+                self.state.overlay_last_rebalance_ts = ts_now.isoformat()
+
+            if not (is_epoch_boundary or is_bucket_crossing):
+                logger.info(
+                    "Overlay Epoch Rebalance Gate: HOLD (cycle hour %d is not a %dh boundary; holding current positions)",
+                    epoch_hours % rebalance_hours,
+                    rebalance_hours,
+                )
+                return {
+                    "orders": [],
+                    "n_orders": 0,
+                    "skipped": len(targets),
+                    "turnover_notional": 0.0,
+                    "functional": bool(self.executor_functional),
+                    "status": "HOLD_48H",
+                    "reason": "EPOCH_GATE_HOLD",
+                }
+
         orders: list[dict[str, Any]] = []
         skipped = 0
         turnover_notional = 0.0
@@ -1923,7 +1985,7 @@ class CarryLiveExecutor:
 
             delta_notional = abs(delta) * price
             is_full_close = abs(target) <= 1e-12
-            if delta_notional < min_notional_usd and not (is_full_close and self.mode == "paper"):
+            if not is_full_close and delta_notional < min_notional_usd:
                 skipped += 1
                 continue
 
@@ -2012,6 +2074,7 @@ class CarryLiveExecutor:
         if any(o.get("status") in ("filled", "paper_filled") for o in orders):
             self.executor_functional = True
             self.state.executor_functional = True
+            self.state.overlay_last_rebalance_ts = str(timestamp or ts_now.isoformat())
 
         return {
             "orders": orders,
@@ -2019,6 +2082,7 @@ class CarryLiveExecutor:
             "skipped": int(skipped),
             "turnover_notional": float(turnover_notional),
             "functional": bool(self.executor_functional),
+            "status": "OK",
         }
 
     def _execute_atomic_carry_delta(
@@ -2416,6 +2480,11 @@ class CarryLiveExecutor:
                 if qty_q <= 0.0:
                     skipped += 1
                     continue
+                is_full_close = abs(target) <= 1e-12
+                delta_notional = float(qty_q) * price
+                if not is_full_close and delta_notional < MIN_OVERLAY_DELTA_NOTIONAL_USD:
+                    skipped += 1
+                    continue
                 planned.append((symbol, target, cur, float(qty_q)))
             planned.sort(key=lambda t: 0 if abs(t[1]) <= 1e-12 else 1)
 
@@ -2609,6 +2678,8 @@ class CarryLiveExecutor:
                         self.state.overlay_orders.append({**o, "timestamp": timestamp})
                 self.executor_functional = True
                 self.state.executor_functional = True
+                ts_rec = timestamp or pd.Timestamp.now(tz="UTC").isoformat()
+                self.state.overlay_last_rebalance_ts = str(ts_rec)
                 self._persist_state_now()
             return {
                 "orders": orders,

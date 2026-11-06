@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -149,6 +150,28 @@ def _default_exchanges() -> tuple[Any, Any]:
     )
 
 
+def _fetch_with_retry(
+    fn: Callable[[], Any],
+    max_retries: int = 3,
+    backoff_sec: float = 2.0,
+    tag: str = "",
+) -> Any:
+    """Execute fn with retry backoff for transient network/API timeouts."""
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "Retryable error during %s (attempt %d/%d): %s. Backing off %.1fs...",
+                    tag, attempt, max_retries, exc, backoff_sec,
+                )
+                time.sleep(backoff_sec)
+    raise last_exc
+
+
 def refresh_raw_data(
     symbols: Sequence[str],
     raw_dir: str | Path = "data/raw",
@@ -160,6 +183,8 @@ def refresh_raw_data(
     spot_exchange: Any = None,
     now_ms: Optional[int] = None,
     on_progress: Optional[Callable[[str], None]] = None,
+    max_retries: int = 3,
+    retry_backoff_sec: float = 2.0,
 ) -> dict[str, Any]:
     """Pull the missing 1h Perp / Spot candles and funding events into ``raw_dir``.
 
@@ -212,7 +237,12 @@ def refresh_raw_data(
                 cfg = TradingConfig(symbol=sym, timeframe=timeframe, raw_data_dir=str(stage))
                 loader = DataLoader(cfg, exchange=perp_exchange)
                 default_start = now_ms - 1600 * HOUR_MS
-                loader.update_incremental(file_path=staged_perp, default_start_ms=default_start)
+                _fetch_with_retry(
+                    lambda: loader.update_incremental(file_path=staged_perp, default_start_ms=default_start),
+                    max_retries=max_retries,
+                    backoff_sec=retry_backoff_sec,
+                    tag=f"{sym}:perp",
+                )
                 _atomic_install(staged_perp, paths["perp"])
                 say(f"[REFRESH] {sym} perp ok")
             except Exception as exc:  # noqa: BLE001
@@ -224,12 +254,17 @@ def refresh_raw_data(
                 start_ms = first if first is not None else now_ms - 1600 * HOUR_MS
                 if paths["spot"].exists():
                     shutil.copy2(paths["spot"], stage / paths["spot"].name)
-                fetch_spot_ohlcv(
-                    sym.split(":")[0],
-                    timeframe=timeframe,
-                    start_date=pd.Timestamp(start_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d"),
-                    data_dir=str(stage),
-                    exchange=spot_exchange,
+                _fetch_with_retry(
+                    lambda: fetch_spot_ohlcv(
+                        sym.split(":")[0],
+                        timeframe=timeframe,
+                        start_date=pd.Timestamp(start_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d"),
+                        data_dir=str(stage),
+                        exchange=spot_exchange,
+                    ),
+                    max_retries=max_retries,
+                    backoff_sec=retry_backoff_sec,
+                    tag=f"{sym}:spot",
                 )
                 staged_spot = stage / paths["spot"].name
                 if staged_spot.exists():
@@ -244,11 +279,16 @@ def refresh_raw_data(
                 start_f = first_f if first_f is not None else now_ms - 1600 * HOUR_MS
                 if paths["funding"].exists():
                     shutil.copy2(paths["funding"], stage / paths["funding"].name)
-                fetch_funding_history(
-                    sym,
-                    start_date=pd.Timestamp(start_f, unit="ms", tz="UTC").strftime("%Y-%m-%d"),
-                    data_dir=str(stage),
-                    exchange=perp_exchange,
+                _fetch_with_retry(
+                    lambda: fetch_funding_history(
+                        sym,
+                        start_date=pd.Timestamp(start_f, unit="ms", tz="UTC").strftime("%Y-%m-%d"),
+                        data_dir=str(stage),
+                        exchange=perp_exchange,
+                    ),
+                    max_retries=max_retries,
+                    backoff_sec=retry_backoff_sec,
+                    tag=f"{sym}:funding",
                 )
                 staged_fund = stage / paths["funding"].name
                 if staged_fund.exists():

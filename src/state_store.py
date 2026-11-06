@@ -172,6 +172,7 @@ class BotState:
     trade_history: list[dict[str, Any]] = field(default_factory=list)
     carry_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     carry_last_reconcile_ts: Optional[str] = None
+    overlay_last_rebalance_ts: Optional[str] = None
     carry_sleeve: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh yield sleeve
     momentum_overlay: dict[str, Any] = field(default_factory=dict)  # Phân bổ nhánh alpha momentum overlay
     carry_orders: list[dict[str, Any]] = field(default_factory=list)
@@ -380,6 +381,8 @@ class StateStore:
                     carry_positions[str(k)] = pos_dict
         raw_carry_ts = raw.get("carry_last_reconcile_ts")
         carry_last_reconcile_ts = str(raw_carry_ts) if raw_carry_ts is not None else None
+        raw_overlay_ts = raw.get("overlay_last_rebalance_ts")
+        overlay_last_rebalance_ts = str(raw_overlay_ts) if raw_overlay_ts is not None else None
 
         raw_carry_sleeve = raw.get("carry_sleeve") or {}
         carry_sleeve: dict[str, Any] = dict(raw_carry_sleeve) if isinstance(raw_carry_sleeve, dict) else {}
@@ -428,6 +431,7 @@ class StateStore:
             trade_history=[trade_record_to_dict(item) for item in raw_history],
             carry_positions=carry_positions,
             carry_last_reconcile_ts=carry_last_reconcile_ts,
+            overlay_last_rebalance_ts=overlay_last_rebalance_ts,
             carry_sleeve=carry_sleeve,
             momentum_overlay=momentum_overlay,
             carry_orders=carry_orders,
